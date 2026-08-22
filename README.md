@@ -61,6 +61,8 @@ Output layout:
   network_functions.json
   network_function_by_id.json
   fqdn_to_ip_map.json
+  port_set_list.json          # atlas_cli -o json port_set.list
+  port_set_get.json           # atlas_cli -o json port_set.get <uuid> (keyed by uuid)
   dump_errors.json
 ```
 
@@ -91,6 +93,10 @@ Flags are parsed **before** `FlowInterfaces()` is created. That is required on P
 | `--workers` | `12` | Parallel workers for fetch + conversion + writes |
 | `--dataset_timeout_secs` | `90` | Per-batch timeout; hung datasets are skipped |
 | `--fail_on_error` | off | Exit non-zero if any dataset fails |
+| `--skip_atlas` | off | Skip `atlas_cli port_set.list` / `port_set.get` |
+| `--atlas_timeout_secs` | `300` | Timeout for `port_set.list` and the `port_set.get` batch |
+
+**SMSP vs CMSP (auto-detected, no flag):** `mspctl cluster list` / `mspctl cluster get flow --verbose`. A cluster named `flow` with a UUID is SMSP → every `atlas_cli` uses `-u ws://smsp-<uuid>.ntnx-ikat.svc:2060/atlas_cli`. No `flow` cluster (404 / only `controller_msp`) plus a local `genesis status` Atlas process is CMSP → `atlas_cli` on the PCVM. `port_set.list` → `port_set_list.json`; each `port_set.get <uuid>` → `port_set_get.json`.
 
 Help:
 
@@ -118,6 +124,8 @@ Logged as `DUMP start` / `DUMP done` / `DATASET … dumped N records`, then `===
 | `network_functions` | `idfcli` `network_function` | `load_network_functions_data` |
 | `vlan_unique_uuid` / `global_unique_uuid` | `zkcat` Flow ZK paths | `get_flow_unique_uuid` |
 | `fqdn_to_ip_map` | `fqdn_resolution_manager` or `idfcli` `fns_fqdn_to_ip_info` | EG FQDN expansion |
+| `port_set_list` | `atlas_cli -o json port_set.list` (SMSP/CMSP wrapped) | Atlas port-set inventory |
+| `port_set_get` | `atlas_cli -o json port_set.get <uuid>` for each listed UUID | Atlas port-set details (`virtual_nic_uuid_list`, …) |
 
 Two parallel batches:
 

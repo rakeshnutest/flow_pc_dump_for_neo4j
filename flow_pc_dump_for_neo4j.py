@@ -59,6 +59,12 @@ gflags.DEFINE_integer(
 gflags.DEFINE_boolean(
     "fail_on_error", False,
     "If true, exit non-zero when any dataset fetch fails.")
+gflags.DEFINE_boolean(
+    "skip_atlas", False,
+    "Skip atlas_cli port_set.list / port_set.get dumps.")
+gflags.DEFINE_integer(
+    "atlas_timeout_secs", 300,
+    "Timeout for atlas_cli port_set.list and the port_set.get batch.")
 
 LOG = logging.getLogger("flow_pc_dump")
 
@@ -1225,11 +1231,340 @@ def fetch_fqdn_map(interfaces):
   return mapping
 
 
+def _atlas_cli_bin():
+  for path in (
+      "/usr/local/nutanix/bin/atlas_cli",
+      "/home/nutanix/bin/atlas_cli",
+      "/home/nutanix/atlas/bin/atlas_cli"):
+    if os.path.exists(path) and os.access(path, os.X_OK):
+      return path
+  return "atlas_cli"
+
+
+def _safe_json_loads(text):
+  if not text or not str(text).strip():
+    return None
+  text = str(text).strip()
+  try:
+    return json.loads(text)
+  except Exception:
+    pass
+  start = text.find("{")
+  end = text.rfind("}")
+  if start >= 0 and end > start:
+    try:
+      return json.loads(text[start:end + 1])
+    except Exception:
+      pass
+  start = text.find("[")
+  end = text.rfind("]")
+  if start >= 0 and end > start:
+    try:
+      return json.loads(text[start:end + 1])
+    except Exception:
+      pass
+  return None
+
+
+def _run_profile_cmd(cmd, timeout=30):
+  full = "source /etc/profile >/dev/null 2>&1; %s" % cmd
+  try:
+    proc = subprocess.run(
+        full, shell=True, executable="/bin/bash",
+        capture_output=True, text=True, check=False, timeout=timeout)
+  except Exception as err:
+    LOG.debug("cmd failed (%s): %s", cmd, err)
+    return "", str(err), 1
+  return proc.stdout or "", proc.stderr or "", proc.returncode
+
+
+def _mspctl_cluster_list():
+  out, err, _rc = _run_profile_cmd("mspctl cluster list --output json")
+  parsed = _safe_json_loads(out)
+  if isinstance(parsed, list):
+    return parsed
+  if isinstance(parsed, dict):
+    for key in ("clusters", "data", "ClusterList", "items"):
+      if isinstance(parsed.get(key), list):
+        return parsed[key]
+  LOG.debug("mspctl cluster list not JSON: %s", (out or err)[:300])
+  return []
+
+
+def _mspctl_flow_cluster():
+  out, err, _rc = _run_profile_cmd("mspctl cluster get flow --verbose")
+  parsed = _safe_json_loads(out)
+  if isinstance(parsed, dict) and parsed.get("ClusterUUID"):
+    return parsed
+  text = "%s\n%s" % (out, err)
+  if re.search(r"msp cluster not found|getClusterStatusV2NotFound|\b404\b",
+               text, re.I):
+    return {"_not_found": True, "_raw": text[:300]}
+  return None
+
+
+def _flow_cluster_from_list(clusters):
+  for cluster in clusters or []:
+    if not isinstance(cluster, dict):
+      continue
+    name = str(cluster.get("cluster_name") or cluster.get("name") or "")
+    if name.strip().lower() == "flow":
+      return cluster
+  return None
+
+
+def _cluster_uuid(cluster):
+  if not isinstance(cluster, dict):
+    return ""
+  return str(
+      cluster.get("cluster_uuid") or cluster.get("ClusterUUID") or
+      cluster.get("uuid") or "")
+
+
+def _zk_node_exists(zk_path):
+  for zkcat in (
+      "/home/nutanix/cluster/bin/zkcat",
+      "/usr/local/nutanix/cluster/bin/zkcat"):
+    if not (os.path.exists(zkcat) and os.access(zkcat, os.X_OK)):
+      continue
+    try:
+      proc = subprocess.run(
+          [zkcat, zk_path], capture_output=True, text=True, check=False,
+          timeout=15)
+    except Exception:
+      continue
+    text = "%s%s" % (proc.stdout or "", proc.stderr or "")
+    if "no node" in text.lower():
+      return False
+    if proc.returncode == 0:
+      return True
+  return False
+
+
+def _genesis_atlas_pids():
+  out, err, _rc = _run_profile_cmd("genesis status", timeout=45)
+  text = out or err
+  for line in text.splitlines():
+    stripped = line.strip().lower()
+    if not stripped.startswith("atlas:"):
+      continue
+    if "[" not in line:
+      return []
+    inner = line.split("[", 1)[1].split("]", 1)[0]
+    return [part.strip() for part in inner.split(",") if part.strip().isdigit()]
+  return []
+
+
+def detect_msp_platform():
+  """Detect Flow SMSP vs CMSP from the PC itself (no --platform flag).
+
+  SMSP: mspctl has a cluster named flow (service MSP). atlas_cli needs
+        -u ws://smsp-<uuid>.ntnx-ikat.svc:2060/atlas_cli
+  CMSP: only the controller MSP (prism-central/msp); Atlas runs on the PCVM.
+  """
+  info = {
+      "platform": "cmsp",
+      "detection_method": "no_flow_smsp_signals",
+      "smsp_cluster_uuid": "",
+  }
+  clusters = _mspctl_cluster_list()
+  names = [
+      str(item.get("cluster_name") or item.get("name") or "")
+      for item in clusters if isinstance(item, dict)]
+  LOG.info("mspctl clusters: %s", names or "<none>")
+  flow = _flow_cluster_from_list(clusters)
+  flow_get = _mspctl_flow_cluster()
+  smsp_uuid = _cluster_uuid(flow)
+  if not smsp_uuid and isinstance(flow_get, dict):
+    smsp_uuid = _cluster_uuid(flow_get)
+
+  if smsp_uuid:
+    info["platform"] = "smsp"
+    info["smsp_cluster_uuid"] = smsp_uuid
+    info["detection_method"] = (
+        "mspctl_cluster_list_flow" if flow else "mspctl_cluster_get_flow")
+    LOG.info(
+        "Detected SMSP via %s uuid=%s", info["detection_method"], smsp_uuid)
+    return info
+
+  not_found = isinstance(flow_get, dict) and flow_get.get("_not_found")
+  atlas_pids = _genesis_atlas_pids()
+  zk_smsp = _zk_node_exists("/appliance/logical/flow_smsp")
+  LOG.info(
+      "SMSP probes: flow_cluster=%s flow_404=%s genesis_atlas_pids=%s "
+      "zk_flow_smsp=%s",
+      bool(flow), bool(not_found), len(atlas_pids), zk_smsp)
+
+  if zk_smsp and not not_found:
+    info["platform"] = "smsp"
+    info["detection_method"] = "zk_flow_smsp"
+    LOG.warning(
+        "ZK /appliance/logical/flow_smsp exists but no flow MSP UUID; "
+        "atlas_cli -u cannot be formed")
+    return info
+
+  if (not_found or (clusters and not flow)) and atlas_pids:
+    info["detection_method"] = "mspctl_no_flow_cluster+genesis_atlas"
+  elif not_found or (clusters and not flow):
+    info["detection_method"] = "mspctl_no_flow_cluster"
+  elif atlas_pids:
+    info["detection_method"] = "genesis_atlas"
+  info["platform"] = "cmsp"
+  LOG.info("Detected CMSP via %s", info["detection_method"])
+  return info
+
+
+def _atlas_cli_argv(platform_info):
+  argv = [_atlas_cli_bin()]
+  if (platform_info.get("platform") == "smsp" and
+      platform_info.get("smsp_cluster_uuid")):
+    argv.extend([
+        "-u",
+        "ws://smsp-%s.ntnx-ikat.svc:2060/atlas_cli" % (
+            platform_info["smsp_cluster_uuid"]),
+    ])
+  argv.extend(["-o", "json"])
+  return argv
+
+
+def _run_atlas_cli(platform_info, args, timeout_secs, log_cmd=True):
+  cmd = _atlas_cli_argv(platform_info) + list(args)
+  if log_cmd:
+    LOG.info("DUMP atlas_cli: %s", " ".join(cmd))
+  try:
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True, check=False,
+        timeout=timeout_secs)
+  except subprocess.TimeoutExpired:
+    raise RuntimeError(
+        "atlas_cli %s timed out after %ss" % (" ".join(args), timeout_secs))
+  parsed = _safe_json_loads(proc.stdout or "")
+  if parsed is None:
+    err = (proc.stderr or proc.stdout or "").strip()[:500]
+    raise RuntimeError(
+        "atlas_cli %s failed rc=%s: %s" % (
+            " ".join(args), proc.returncode, err or "no JSON output"))
+  return parsed, proc.returncode, cmd
+
+
+def _port_set_list_rows(parsed):
+  if isinstance(parsed, list):
+    return parsed
+  if not isinstance(parsed, dict):
+    return []
+  data = parsed.get("data")
+  if isinstance(data, list):
+    return data
+  if isinstance(data, dict):
+    rows = []
+    for key, value in data.items():
+      if isinstance(value, dict):
+        row = dict(value)
+        row.setdefault("uuid", key)
+        rows.append(row)
+      else:
+        rows.append({"uuid": key, "value": value})
+    return rows
+  for key in ("entities", "items", "value", "results"):
+    if isinstance(parsed.get(key), list):
+      return parsed[key]
+  return []
+
+
+def _port_set_uuid(item):
+  if isinstance(item, str):
+    return _uuid_str(item)
+  if not isinstance(item, dict):
+    return None
+  return _uuid_str(
+      item.get("uuid") or item.get("ext_id") or item.get("UUID") or
+      item.get("id"))
+
+
+def fetch_port_set_list(platform_info, timeout_secs):
+  LOG.info(
+      "DUMP start port_set_list platform=%s method=%s smsp_uuid=%s",
+      platform_info.get("platform"),
+      platform_info.get("detection_method"),
+      platform_info.get("smsp_cluster_uuid") or "<none>")
+  parsed, _status, cmd = _run_atlas_cli(
+      platform_info, ["port_set.list"], timeout_secs)
+  if isinstance(parsed, dict) and parsed.get("status") not in (None, 0, "0"):
+    raise RuntimeError(
+        "atlas_cli port_set.list status=%s cmd=%s" % (
+            parsed.get("status"), " ".join(cmd)))
+  rows = _port_set_list_rows(parsed)
+  LOG.info("DUMP done port_set_list count=%s", len(rows))
+  return rows
+
+
+def _port_set_get_record(parsed, ps_uuid):
+  if not isinstance(parsed, dict):
+    return parsed if parsed is not None else {}
+  data = parsed.get("data", parsed)
+  if isinstance(data, dict):
+    if ps_uuid in data and isinstance(data[ps_uuid], dict):
+      return data[ps_uuid]
+    if data.get("uuid") == ps_uuid or data.get("ext_id") == ps_uuid:
+      return data
+    if "data" in parsed and isinstance(parsed["data"], dict):
+      inner = parsed["data"]
+      if ps_uuid in inner:
+        return inner[ps_uuid]
+      if len(inner) == 1:
+        only = list(inner.values())[0]
+        if isinstance(only, dict):
+          return only
+    return data
+  if isinstance(data, list) and data and isinstance(data[0], dict):
+    return data[0]
+  return parsed
+
+
+def fetch_port_set_get(platform_info, uuids, workers, timeout_secs, errors):
+  gets = {}
+  if not uuids:
+    LOG.info("DUMP skip port_set_get (no UUIDs from port_set.list)")
+    return gets
+  per_timeout = max(30, min(90, int(timeout_secs)))
+  LOG.info("DUMP start port_set_get count=%s workers=%s", len(uuids), workers)
+
+  def _one(ps_uuid):
+    parsed, _status, _cmd = _run_atlas_cli(
+        platform_info, ["port_set.get", ps_uuid], per_timeout, log_cmd=False)
+    if isinstance(parsed, dict) and parsed.get("status") not in (None, 0, "0"):
+      raise RuntimeError("status=%s" % parsed.get("status"))
+    return _port_set_get_record(parsed, ps_uuid)
+
+  failed = []
+  with ThreadPoolExecutor(max_workers=max(1, min(workers, len(uuids)))) as pool:
+    future_map = {pool.submit(_one, ps_uuid): ps_uuid for ps_uuid in uuids}
+    done, pending = wait(future_map.keys(), timeout=timeout_secs)
+    for future in done:
+      ps_uuid = future_map[future]
+      try:
+        gets[ps_uuid] = future.result(timeout=1)
+      except Exception as err:
+        failed.append(ps_uuid)
+        LOG.error("DUMP port_set.get %s FAILED: %s", ps_uuid, err)
+    for future in pending:
+      ps_uuid = future_map[future]
+      future.cancel()
+      failed.append(ps_uuid)
+      LOG.error("DUMP port_set.get %s TIMEOUT after %ss", ps_uuid, timeout_secs)
+  if failed:
+    errors["port_set_get"] = "failed %s of %s: %s" % (
+        len(failed), len(uuids), ",".join(failed[:20]))
+  LOG.info(
+      "DUMP done port_set_get got=%s failed=%s", len(gets), len(failed))
+  return gets
+
+
 DATASET_FILES = (
     "address_groups", "service_groups", "entity_groups", "policies",
     "vms", "subnets", "vpcs", "hosts", "clusters", "projects",
     "categories", "network_functions", "network_function_by_id",
-    "fqdn_to_ip_map", "dump_errors")
+    "fqdn_to_ip_map", "port_set_list", "port_set_get", "dump_errors")
 
 
 def _json_default(value):
@@ -1260,6 +1595,9 @@ def _write_outputs(payload, output_dir, combined_path, workers):
       "dumped_at": payload.get("dumped_at"),
       "vlan_unique_uuid": payload.get("vlan_unique_uuid", ""),
       "global_unique_uuid": payload.get("global_unique_uuid", ""),
+      "platform": payload.get("platform"),
+      "platform_detection_method": payload.get("platform_detection_method"),
+      "smsp_cluster_uuid": payload.get("smsp_cluster_uuid", ""),
   }
   jobs = [(os.path.join(output_dir, "meta.json"), scalar)]
   for key in DATASET_FILES:
@@ -1276,7 +1614,7 @@ def _write_outputs(payload, output_dir, combined_path, workers):
 def _empty_for(name):
   if name == "unique_uuids":
     return {"vlan_unique_uuid": "", "global_unique_uuid": ""}
-  if name in ("fqdn_to_ip_map", "network_function_by_id"):
+  if name in ("fqdn_to_ip_map", "network_function_by_id", "port_set_get"):
     return {}
   return []
 
@@ -1338,13 +1676,23 @@ def main(argv):
     LOG.info("Split complete under %s", output_dir)
     return 0
 
+  platform_info = detect_msp_platform()
+  LOG.info(
+      "Platform %s (method=%s smsp_uuid=%s)",
+      platform_info.get("platform"),
+      platform_info.get("detection_method"),
+      platform_info.get("smsp_cluster_uuid") or "<none>")
+
   LOG.info("FlowInterfaces managers + parallel idfcli infra (no v4_client)")
-  LOG.info("workers=%s timeout=%ss", workers, FLAGS.dataset_timeout_secs)
+  LOG.info("workers=%s timeout=%ss atlas_timeout=%ss skip_atlas=%s",
+           workers, FLAGS.dataset_timeout_secs, FLAGS.atlas_timeout_secs,
+           FLAGS.skip_atlas)
   interfaces = FlowInterfaces()
   LOG.info("FlowInterfaces ready")
 
   errors = {}
   timeout_secs = max(15, int(FLAGS.dataset_timeout_secs))
+  atlas_timeout_secs = max(30, int(FLAGS.atlas_timeout_secs))
   workers = max(1, int(FLAGS.workers))
 
   flow_jobs = [
@@ -1369,6 +1717,9 @@ def main(argv):
   payload = {
       "source": "flow_pc_dump_for_neo4j",
       "dumped_at": datetime.utcnow().isoformat() + "Z",
+      "platform": platform_info.get("platform"),
+      "platform_detection_method": platform_info.get("detection_method"),
+      "smsp_cluster_uuid": platform_info.get("smsp_cluster_uuid") or "",
   }
   payload.update(_run_jobs_parallel(flow_jobs, workers, timeout_secs, errors))
   payload.update(_run_jobs_parallel(infra_jobs, workers, timeout_secs, errors))
@@ -1378,6 +1729,32 @@ def main(argv):
   payload["global_unique_uuid"] = unique.get("global_unique_uuid", "")
   payload["network_function_by_id"] = fetch_network_function_by_id(
       interfaces, payload.get("network_functions") or [])
+
+  payload["port_set_list"] = []
+  payload["port_set_get"] = {}
+  if FLAGS.skip_atlas:
+    LOG.info("Skipping atlas_cli port_set dumps (--skip_atlas)")
+  else:
+    try:
+      payload["port_set_list"] = fetch_port_set_list(
+          platform_info, atlas_timeout_secs)
+    except Exception as err:
+      errors["port_set_list"] = str(err)
+      LOG.error("DATASET port_set_list FAILED: %s", err)
+    uuids = []
+    seen = set()
+    for item in payload.get("port_set_list") or []:
+      ps_uuid = _port_set_uuid(item)
+      if ps_uuid and ps_uuid not in seen:
+        seen.add(ps_uuid)
+        uuids.append(ps_uuid)
+    try:
+      payload["port_set_get"] = fetch_port_set_get(
+          platform_info, uuids, workers, atlas_timeout_secs, errors)
+    except Exception as err:
+      errors["port_set_get"] = str(err)
+      LOG.error("DATASET port_set_get FAILED: %s", err)
+
   payload["dump_errors"] = errors
 
   _write_outputs(payload, output_dir, combined_path, workers)
@@ -1394,6 +1771,9 @@ def main(argv):
   LOG.info("  %-22s %s", "fqdn_to_ip_map", len(payload.get("fqdn_to_ip_map") or {}))
   LOG.info("  %-22s %s", "network_function_by_id",
            len(payload.get("network_function_by_id") or {}))
+  LOG.info("  %-22s %s", "platform", payload.get("platform") or "<empty>")
+  LOG.info("  %-22s %s", "port_set_list", len(payload.get("port_set_list") or []))
+  LOG.info("  %-22s %s", "port_set_get", len(payload.get("port_set_get") or {}))
   if errors:
     LOG.warning("Failed datasets: %s", ", ".join(sorted(errors)))
     if FLAGS.fail_on_error:
