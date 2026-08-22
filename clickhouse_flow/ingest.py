@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """Ingest dump JSON into the flat flow_policy.portset table.
 
-computed_port_set_uuid uses neo4j_db_insert.generate_port_set_id /
-compute_hash_value (see portset_hash.py). Every policy is ingested
-(APPLICATION, FLEX, kube/Cilium included). Address-set hashes are not
-inserted as port-sets. Compare keeps Atlas-only leftovers as mismatches;
-leftover analysis is a separate skill that ignores kube.
+Self-contained: stdlib + clickhouse-client. No nutest, no neo4j, no pip.
+Hash is in this file (uuid5 for APPLICATION, MD5 salus+scope for FLEX).
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import ipaddress
 import json
 import os
@@ -19,20 +17,110 @@ import subprocess
 import uuid as uuid_lib
 from collections import defaultdict
 
-from portset_hash import (
-    DEFAULT_PROJECT_EXT_ID,
-    compute_hash_value,
-)
-
 CH_HOST = "127.0.0.1"
 CH_NATIVE = "19000"
 BATCH = 10_000
 ZERO = "00000000-0000-0000-0000-000000000000"
 ALL_VLAN_VPC = "00000000-0000-0000-0000-000000000001"
+DEFAULT_PROJECT_EXT_ID = ZERO
+ISOLATION_RULE_TYPES = frozenset(("TWO_ENV_ISOLATION", "MULTI_ENV_ISOLATION"))
+ALLOW_ANY_SPECS = frozenset(("ALL", "NONE"))
+GLOBAL_SCOPE_UNIQUE_ID = "global-scope-unique-id"
+VLAN_SCOPE_UNIQUE_ID = "vlan-scope-unique-id"
+SALUS_SERVICE_NAME = "salus"
+ATLAS_ALLOW_ANY = "all"
+CATEGORY_SELECTION_TYPE_MAP = {"VM": "kVM", "SUBNET": "kSubnet", "VPC": "kVPC"}
 UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 CAT_TYPE_MAP = {"VM": "kVM", "VPC": "kVPC", "SUBNET": "kSubnet"}
+_U_QUOTE = re.compile(r"'[a-z0-9A-Z\-]+'")
+
+SCHEMA_SQL = """
+CREATE DATABASE IF NOT EXISTS flow_policy;
+DROP VIEW IF EXISTS flow_policy.v_port_set_nic_diff;
+DROP TABLE IF EXISTS flow_policy.atlas_port_set;
+DROP TABLE IF EXISTS flow_policy.computed_port_set;
+DROP TABLE IF EXISTS flow_policy.portset;
+DROP TABLE IF EXISTS flow_policy.vm_nic;
+DROP TABLE IF EXISTS flow_policy.category;
+CREATE TABLE flow_policy.portset
+(
+    port_set_uuid              UUID,
+    computed_port_set_uuid     UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+    atlas_port_set_uuid        UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+    policy_uuid                UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+    rule_uuid                  UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+    role                       LowCardinality(String) DEFAULT '',
+    component_id               String DEFAULT '',
+    entity_type                LowCardinality(String) DEFAULT '',
+    namespace_uuid             UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+    virtual_network_uuid       UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+    entity_group_uuid          UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+    reference_uuids            Array(UUID) DEFAULT [],
+    vm_category_refs           Array(UUID) DEFAULT [],
+    subnet_category_refs       Array(UUID) DEFAULT [],
+    vpc_category_refs          Array(UUID) DEFAULT [],
+    vm_ext_ids                 Array(UUID) DEFAULT [],
+    subnet_ext_ids             Array(UUID) DEFAULT [],
+    subnet_list                Array(String) DEFAULT [],
+    exception_list             Array(String) DEFAULT [],
+    effective_vpc_refs         Array(UUID) DEFAULT [],
+    effective_vpc_names        Array(String) DEFAULT [],
+    eg_address_grp             Array(String) DEFAULT [],
+    eg_exception_address_grp   Array(String) DEFAULT [],
+    computed_nic_uuids         Array(UUID) DEFAULT [],
+    atlas_nic_uuids            Array(UUID) DEFAULT [],
+    policy_name                String DEFAULT '',
+    atlas_name                 String DEFAULT '',
+    vpc_name                   LowCardinality(String) DEFAULT '',
+    entity_group_name          String DEFAULT '',
+    vm_category_names          Array(String) DEFAULT [],
+    subnet_category_names      Array(String) DEFAULT [],
+    vpc_category_names         Array(String) DEFAULT [],
+    reference_names            Array(String) DEFAULT [],
+    computed_nics Array(Tuple(
+        vm_name String, nic_uuid UUID, subnet String, vpc String, ip String
+    )) DEFAULT [],
+    atlas_nics Array(Tuple(
+        vm_name String, nic_uuid UUID, subnet String, vpc String, ip String
+    )) DEFAULT [],
+    match_status               LowCardinality(String) DEFAULT '',
+    mismatch_kind              LowCardinality(String) DEFAULT '',
+    only_computed_nics Array(Tuple(
+        vm_name String, nic_uuid UUID, subnet String, vpc String, ip String
+    )) DEFAULT [],
+    only_atlas_nics Array(Tuple(
+        vm_name String, nic_uuid UUID, subnet String, vpc String, ip String
+    )) DEFAULT [],
+    all_ports                  UInt8 DEFAULT 0,
+    updated_at                 DateTime64(3) DEFAULT now64()
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (entity_type, port_set_uuid, policy_uuid, component_id);
+CREATE TABLE flow_policy.vm_nic
+(
+    nic_uuid               UUID,
+    vm_uuid                UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+    vm_name                String DEFAULT '',
+    subnet_uuid            UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+    subnet                 LowCardinality(String) DEFAULT '',
+    vpc_uuid               UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+    vpc                    LowCardinality(String) DEFAULT '',
+    ip                     String DEFAULT '',
+    updated_at             DateTime64(3) DEFAULT now64()
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY nic_uuid;
+CREATE TABLE flow_policy.category
+(
+    category_uuid          UUID,
+    name                   String DEFAULT '',
+    updated_at             DateTime64(3) DEFAULT now64()
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY category_uuid;
+"""
 
 
 def as_uuid(value):
@@ -53,12 +141,142 @@ def uuid_list(values):
     return out
 
 
+def atlas_port_set_id(entity_type, refs, unique_uuid, project_uuid=None,
+                      is_flex=False):
+    """APPLICATION: uuid5(scope uuid, sorted refs). FLEX: MD5(salus+scope+refs)."""
+    refs = list(refs or [])
+    if not unique_uuid:
+        return ""
+    if is_flex:
+        body = "[" + " ".join(sorted(refs)) + "]"
+        body = _U_QUOTE.sub(lambda m: "u" + m.group(0), body)
+        if entity_type and entity_type not in ("VM", "EG"):
+            suffix = CATEGORY_SELECTION_TYPE_MAP.get(entity_type)
+            if suffix:
+                body = body + ":" + str(suffix)
+        if project_uuid and project_uuid != DEFAULT_PROJECT_EXT_ID:
+            body = body + ":project:" + project_uuid
+        digest = hashlib.md5(
+            (SALUS_SERVICE_NAME + unique_uuid + body).encode()).digest()
+        return str(uuid_lib.UUID(bytes=digest))
+    body = str(sorted(list(refs)))
+    body = _U_QUOTE.sub(lambda m: "u" + m.group(0), body)
+    if entity_type and entity_type not in ("VM", "EG"):
+        body = body + ":" + str(CATEGORY_SELECTION_TYPE_MAP.get(entity_type))
+    if project_uuid and project_uuid != DEFAULT_PROJECT_EXT_ID:
+        body = body + ":project:" + project_uuid
+    return str(uuid_lib.uuid5(uuid_lib.UUID(str(unique_uuid)), body))
+
+
+def apply_ip_version_combo(
+        has_ipv4, has_ipv6, ipv4_only=None, ipv6_only=None,
+        is_ipv6_traffic_allowed=False):
+    if ipv4_only is None and ipv6_only is None:
+        return bool(has_ipv4), bool(has_ipv6)
+    ipv4_only = bool(ipv4_only)
+    ipv6_only = bool(ipv6_only)
+    if is_ipv6_traffic_allowed:
+        ipv6_only = False
+    if ipv4_only and ipv6_only:
+        return bool(has_ipv4), bool(has_ipv6)
+    if ipv4_only and not ipv6_only:
+        return bool(has_ipv4), False
+    if not ipv4_only and ipv6_only:
+        return False, bool(has_ipv6)
+    return False, bool(has_ipv6) and bool(is_ipv6_traffic_allowed)
+
+
+def dump_allow_any(sel):
+    return bool(
+        sel.get("should_allow_any_src")
+        or sel.get("should_allow_any_dst")
+        or sel.get("src_allow_spec") in ALLOW_ANY_SPECS
+        or sel.get("dest_allow_spec") in ALLOW_ANY_SPECS)
+
+
+def scope_unique_uuid(scope, is_flex, vlan_uuid, global_uuid, policy_vpc_uuids):
+    policy_vpc_uuids = policy_vpc_uuids or []
+    if scope in ("GLOBAL", "kGlobal", "ALL_VPC"):
+        return GLOBAL_SCOPE_UNIQUE_ID if is_flex else global_uuid
+    if scope in ("ALL_VLAN", "kAllVlan"):
+        return VLAN_SCOPE_UNIQUE_ID if is_flex else vlan_uuid
+    if scope in ("VPC_AS_CATEGORY", "VPC_LIST") and policy_vpc_uuids:
+        return policy_vpc_uuids[0]
+    return ""
+
+
+def port_set_uuid(
+        sel, *, scope, project_uuid, vlan_uuid, global_uuid,
+        policy_vpc_uuids=None, is_flex=False, as_address_set=False,
+        skip_cidrs=False, ipv4_only=None, ipv6_only=None,
+        is_ipv6_traffic_allowed=False):
+    """Dump selector -> (entity_type, refs, uuid). Empty if not a port-set."""
+    del ipv4_only, ipv6_only, is_ipv6_traffic_allowed
+    sel = sel or {}
+    eg = str(sel.get("entity_group_uuid") or "").strip()
+    cidrs = [] if skip_cidrs else list(sel.get("subnet_list") or [])
+    addresses = [] if skip_cidrs else list(sel.get("addresses") or [])
+    allow_any = dump_allow_any(sel)
+    entity_type = None
+    refs = None
+    if eg and cidrs and as_address_set:
+        return "", [], ""
+    if eg:
+        entity_type = "EG"
+        refs = [eg]
+    elif allow_any:
+        entity_type = "VM"
+        refs = [ATLAS_ALLOW_ANY]
+    elif uuid_list(sel.get("vm_category_refs")):
+        entity_type = "VM"
+        refs = uuid_list(sel.get("vm_category_refs"))
+    elif uuid_list(sel.get("vm_ext_ids")):
+        entity_type = "VM"
+        refs = uuid_list(sel.get("vm_ext_ids"))
+    elif uuid_list(sel.get("subnet_category_refs")):
+        entity_type = "SUBNET"
+        refs = uuid_list(sel.get("subnet_category_refs"))
+    elif uuid_list(sel.get("subnet_ext_ids")):
+        entity_type = "SUBNET"
+        refs = uuid_list(sel.get("subnet_ext_ids"))
+    elif uuid_list(sel.get("vpc_category_refs")):
+        entity_type = "VPC"
+        refs = uuid_list(sel.get("vpc_category_refs"))
+    elif addresses:
+        return "", [], ""
+    unique = scope_unique_uuid(
+        scope, is_flex, vlan_uuid, global_uuid, policy_vpc_uuids)
+    if not entity_type or not refs or not unique:
+        return "", [], ""
+    hashed = atlas_port_set_id(
+        entity_type, refs, unique, project_uuid, is_flex=is_flex)
+    if not hashed:
+        return "", [], ""
+    return entity_type, ([] if allow_any else refs), hashed
+
+
+def compute_addressset_hashes(entity_uuid, has_ipv4, has_ipv6):
+    vid = uuid_lib.UUID(entity_uuid)
+    hashes = []
+    if has_ipv4 and has_ipv6:
+        hashes.append(str(uuid_lib.uuid5(vid, "IPv4")))
+        hashes.append(str(uuid_lib.uuid5(vid, "IPv6")))
+    elif has_ipv6:
+        hashes.append(str(uuid_lib.uuid5(vid, "IPv6")))
+    else:
+        hashes.append(str(uuid_lib.uuid5(vid, "IPv4")))
+    return hashes
+
+
+generate_port_set_id = atlas_port_set_id
+
+
 def namespace_for_policy(policy, vlan_uuid, global_uuid):
     """Return (hash_namespace, scope). Hash namespace is UUID-only.
 
-    ALL_VLAN / GLOBAL use the Flow unique UUIDs. VPC_LIST uses the first VPC
-    UUID. VPC_AS_CATEGORY uses the first scope category UUID (same as
-    neo4j_db_insert.compute_hash_value).
+    ALL_VLAN / GLOBAL use dump vlan_unique_uuid / global_unique_uuid.
+    VPC_LIST uses the first vpc_references UUID. VPC_AS_CATEGORY uses
+    the first scope_references UUID.
     """
     scope = str(policy.get("scope") or "ALL_VLAN")
     if scope in ("ALL_VLAN", "kAllVlan"):
@@ -77,13 +295,54 @@ def namespace_for_policy(policy, vlan_uuid, global_uuid):
 
 def policy_project_uuid(policy):
     """Non-default project UUID, or empty. Atlas appends :project:<uuid>."""
+    return entity_project_uuid(policy)
+
+
+def entity_project_uuid(entity):
+    if not isinstance(entity, dict):
+        return ""
     project = as_uuid(
-        policy.get("project_ext_id")
-        or policy.get("projectExtId")
-        or (policy.get("project") or {}).get("ext_id"))
+        entity.get("project_ext_id")
+        or entity.get("projectExtId")
+        or (entity.get("project") or {}).get("ext_id"))
     if not project or project == ZERO:
         return ""
     return project
+
+
+def as_bool(value, default=None):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("true", "1", "yes"):
+        return True
+    if text in ("false", "0", "no"):
+        return False
+    return default
+
+
+def nic_advanced_networking(nic):
+    """Dump subnet flags. Prefer advance_vlan, else is_advanced_networking."""
+    if nic.get("advance_vlan") is not None:
+        return as_bool(nic.get("advance_vlan"), None)
+    if nic.get("is_advanced_networking") is not None:
+        return as_bool(nic.get("is_advanced_networking"), None)
+    if nic.get("advanced_networking") is not None:
+        return as_bool(nic.get("advanced_networking"), None)
+    return None
+
+
+def is_basic_vlan_nic(nic):
+    """VLAN Basic: dump advance_vlan false or is_advanced_networking false.
+
+    Overlay is never Basic VLAN. Advanced VLAN (flag true) can still use
+    the ALL_VLAN placeholder VPC.
+    """
+    if str(nic.get("subnet_type") or "").upper() == "OVERLAY":
+        return False
+    return nic_advanced_networking(nic) is False
 
 
 def unwrap(row):
@@ -127,7 +386,7 @@ def insert_json(table, rows):
 
 
 def ips_in_range(start_ip, end_ip, cap=8192):
-    """Same idea as neo4j_db_insert.get_ips_in_range, with a safety cap."""
+    """Expand IPv4 ranges to CIDRs, with a safety cap."""
     try:
         start = ipaddress.ip_address(str(start_ip))
         end = ipaddress.ip_address(str(end_ip))
@@ -173,18 +432,138 @@ def cidrs_from_ip_ranges(ranges):
     return out
 
 
-def expand_entity_group(eg, ag_map=None):
+def name_matches(name, pattern, criteria=""):
+    """EG REGEX: CONTAINS / STARTS_WITH / ENDS_WITH / EQUALS.
+
+    If match_criteria is empty and the pattern has regex metacharacters,
+    treat it as a full-string regex.
+    """
+    name = str(name or "")
+    pattern = str(pattern or "")
+    if not pattern:
+        return False
+    crit = str(criteria or "").upper().replace(" ", "_")
+    if crit == "CONTAINS":
+        return pattern in name
+    if crit in ("STARTS_WITH", "STARTSWITH"):
+        return name.startswith(pattern)
+    if crit in ("ENDS_WITH", "ENDSWITH"):
+        return name.endswith(pattern)
+    if crit == "EQUALS":
+        return name == pattern
+    if re.search(r"[.*+?^${}()|[\]\\]", pattern):
+        try:
+            return re.fullmatch(pattern, name) is not None
+        except re.error:
+            return False
+    return name == pattern
+
+
+def _entity_names(entity):
+    out = []
+    for key in ("reference_names", "names", "name_list"):
+        value = entity.get(key)
+        if isinstance(value, list):
+            out.extend(str(item).strip() for item in value if str(item).strip())
+        elif value:
+            out.append(str(value).strip())
+    for item in entity.get("reference_ext_ids") or []:
+        if not as_uuid(item) and str(item).strip():
+            out.append(str(item).strip())
+    return out
+
+
+def resolve_ext_ids(entity, inventory):
+    """UUID refs plus NAME/REGEX resolution against dump VM/subnet inventory.
+
+    EXT_ID/NAME append reference_ext_ids; REGEX matches vm.name with
+    match_criteria and appends vm.ext_id. Identity is UUID after resolve.
+    """
+    select_by = str(entity.get("select_by") or "").upper()
+    refs = uuid_list(entity.get("reference_ext_ids"))
+    pattern = str(entity.get("reference_string") or "")
+    criteria = str(entity.get("match_criteria") or "")
+    is_regex = select_by == "REGEX" or bool(pattern)
+    if is_regex and pattern:
+        for row in inventory or []:
+            if name_matches(row.get("name"), pattern, criteria or "EQUALS"):
+                uid = as_uuid(row.get("ext_id"))
+                if uid:
+                    refs.append(uid)
+        return uuid_list(refs)
+    names = _entity_names(entity)
+    if select_by == "NAME" or names:
+        want = set(names)
+        for row in inventory or []:
+            if str(row.get("name") or "") in want:
+                uid = as_uuid(row.get("ext_id"))
+                if uid:
+                    refs.append(uid)
+    return uuid_list(refs)
+
+
+def vm_subnet_inventory(vms, subnets=None):
+    """ext_id + name for REGEX/NAME resolve. UUIDs only after match."""
+    vm_rows = []
+    seen_vm = set()
+    for vm in vms or []:
+        data = unwrap(vm) if isinstance(vm, dict) else vm
+        if not isinstance(data, dict):
+            continue
+        uid = as_uuid(data.get("ext_id") or data.get("uuid"))
+        name = str(data.get("name") or "")
+        if uid and uid not in seen_vm:
+            seen_vm.add(uid)
+            vm_rows.append({"ext_id": uid, "name": name})
+    sub_rows = []
+    seen_sub = set()
+    for row in subnets or []:
+        data = unwrap(row) if isinstance(row, dict) else row
+        if not isinstance(data, dict):
+            continue
+        uid = as_uuid(data.get("ext_id") or data.get("uuid"))
+        name = str(data.get("name") or "")
+        if uid and uid not in seen_sub:
+            seen_sub.add(uid)
+            sub_rows.append({"ext_id": uid, "name": name})
+    for vm in vms or []:
+        data = unwrap(vm) if isinstance(vm, dict) else vm
+        if not isinstance(data, dict):
+            continue
+        for nic in data.get("nics") or []:
+            subnet = (nic.get("nic_network_info") or {}).get("subnet") or {}
+            uid = as_uuid(subnet.get("ext_id"))
+            if uid and uid not in seen_sub:
+                seen_sub.add(uid)
+                sub_rows.append({
+                    "ext_id": uid,
+                    "name": str(subnet.get("name") or ""),
+                })
+    return vm_rows, sub_rows
+
+
+def expand_entity_group(eg, ag_map=None, fqdn_map=None, vms=None, subnets=None):
     ag_map = ag_map or {}
+    fqdn_map = fqdn_map or {}
+    vm_inv, sub_inv = vm_subnet_inventory(vms, subnets)
     sel = {
+        "name": str(eg.get("name") or ""),
         "vm_category_refs": [],
         "subnet_category_refs": [],
         "vpc_category_refs": [],
+        "vm_category_names": [],
+        "subnet_category_names": [],
+        "vpc_category_names": [],
         "vm_ext_ids": [],
         "subnet_ext_ids": [],
         "subnet_list": [],
         "exception_list": [],
+        "eg_address_grp": [],
+        "eg_exception_address_grp": [],
         "entity_group_uuid": as_uuid(eg.get("ext_id")),
         "is_kube": False,
+        "has_direct_vm": False,
+        "has_direct_subnet": False,
     }
     allowed = ((eg.get("allowed_config") or {}).get("entities")) or []
     kinds = [str(entity.get("type") or "").upper() for entity in allowed]
@@ -192,16 +571,19 @@ def expand_entity_group(eg, ag_map=None):
         k in ("VM", "SUBNET", "VPC") for k in kinds)
     for entity in allowed:
         kind = str(entity.get("type") or "").upper()
-        select_by = str(entity.get("select_by") or "")
+        select_by = str(entity.get("select_by") or "").upper()
         refs = uuid_list(entity.get("reference_ext_ids"))
         if kind == "VM" and select_by == "CATEGORY_EXT_ID":
             sel["vm_category_refs"].extend(refs)
         elif kind == "VM":
-            sel["vm_ext_ids"].extend(refs)
+            # EXT_ID / NAME / REGEX -> vm_ext_ids
+            sel["vm_ext_ids"].extend(resolve_ext_ids(entity, vm_inv))
+            sel["has_direct_vm"] = True
         elif kind == "SUBNET" and select_by == "CATEGORY_EXT_ID":
             sel["subnet_category_refs"].extend(refs)
         elif kind == "SUBNET":
-            sel["subnet_ext_ids"].extend(refs)
+            sel["subnet_ext_ids"].extend(resolve_ext_ids(entity, sub_inv))
+            sel["has_direct_subnet"] = True
         elif kind == "VPC":
             sel["vpc_category_refs"].extend(refs)
         elif kind == "ADDRESS_GROUP":
@@ -214,8 +596,15 @@ def expand_entity_group(eg, ag_map=None):
             else:
                 sel["subnet_list"].extend(cidrs_from_ip_ranges(ranges))
             for ag_ref in refs:
-                sel["subnet_list"].extend(
-                    (ag_map.get(ag_ref) or {}).get("subnet_list") or [])
+                rec = ag_map.get(ag_ref) or {}
+                sel["subnet_list"].extend(rec.get("subnet_list") or [])
+                ag_name = rec.get("name") or ""
+                if ag_name:
+                    sel["eg_address_grp"].append(ag_name)
+            # Dump FQDN resolved IPs append to EG subnet_list.
+            for fqdn in entity.get("fqdns") or []:
+                sel["subnet_list"].extend(fqdn_map.get(fqdn) or [])
+            sel["subnet_list"].extend(entity.get("resolved_ips") or [])
     excepted = ((eg.get("except_config") or {}).get("entities")) or []
     for entity in excepted:
         kind = str(entity.get("type") or "").upper()
@@ -225,17 +614,37 @@ def expand_entity_group(eg, ag_map=None):
         sel["exception_list"].extend(cidrs_from_addresses(addrs.get("ipv4_addresses")))
         sel["exception_list"].extend(cidrs_from_addresses(addrs.get("ipv6_addresses")))
         for ag_ref in uuid_list(entity.get("reference_ext_ids")):
-            sel["exception_list"].extend(
-                (ag_map.get(ag_ref) or {}).get("subnet_list") or [])
+            rec = ag_map.get(ag_ref) or {}
+            sel["exception_list"].extend(rec.get("subnet_list") or [])
+            ag_name = rec.get("name") or ""
+            if ag_name:
+                sel["eg_exception_address_grp"].append(ag_name)
+        for fqdn in entity.get("fqdns") or []:
+            sel["exception_list"].extend(fqdn_map.get(fqdn) or [])
+        sel["exception_list"].extend(entity.get("resolved_ips") or [])
+    if eg.get("subnet_list"):
+        sel["subnet_list"].extend(eg.get("subnet_list") or [])
+    sel["subnet_list"] = list(dict.fromkeys(sel["subnet_list"]))
+    sel["exception_list"] = list(dict.fromkeys(sel["exception_list"]))
+    sel["eg_address_grp"] = list(dict.fromkeys(sel["eg_address_grp"]))
+    sel["eg_exception_address_grp"] = list(
+        dict.fromkeys(sel["eg_exception_address_grp"]))
     for key in (
             "vm_category_refs", "subnet_category_refs", "vpc_category_refs",
             "vm_ext_ids", "subnet_ext_ids"):
         sel[key] = uuid_list(sel[key])
+    # VPC-only EG: names keep "any"; refs stay UUID-only.
+    if (sel["vpc_category_refs"]
+            and not sel["vm_category_refs"]
+            and not sel["subnet_category_refs"]):
+        sel["vm_category_names"] = ["any"]
+        sel["subnet_category_names"] = ["any"]
     return sel
 
 
-def expand_address_group(ag):
-    """CIDRs from an address group, same fields neo4j_db_insert.ag_map uses."""
+def expand_address_group(ag, fqdn_map=None):
+    """CIDRs from dump address group ipv4/ipv6 fields and fqdn_to_ip_map."""
+    fqdn_map = fqdn_map or {}
     out = []
     out.extend(cidrs_from_addresses(ag.get("ipv4_addresses")))
     out.extend(cidrs_from_addresses(ag.get("ipv6_addresses")))
@@ -244,11 +653,13 @@ def expand_address_group(ag):
         out.extend(cidrs_from_ip_ranges(ranges.get("ipv4_ranges")))
     else:
         out.extend(cidrs_from_ip_ranges(ranges))
+    for fqdn in ag.get("fqdns") or []:
+        out.extend(fqdn_map.get(fqdn) or [])
     return list(dict.fromkeys(out))
 
 
 def policy_hash_vpc_refs(policy, scope):
-    """policy_vpc_references passed into compute_hash_value."""
+    """Dump vpc_references / scope_references used as VPC_LIST unique uuid."""
     if scope == "VPC_AS_CATEGORY":
         return uuid_list(policy.get("scope_references"))
     if scope == "VPC_LIST":
@@ -257,44 +668,65 @@ def policy_hash_vpc_refs(policy, scope):
     return []
 
 
+def is_allow_all_selector(sel):
+    """Dump should_allow_any_src/dst or src_allow_spec/dest_allow_spec ALL|NONE.
+
+    FLEX applied_to with applied_to_entity_group_references missing is
+    UI Global (no Atlas port-set).
+    """
+    if dump_allow_any(sel):
+        return True
+    if ("applied_to_entity_group_references" in sel
+            and sel.get("applied_to_entity_group_references") is None):
+        return True
+    return False
+
+
+def rule_selects_all_ports(rule):
+    """Dump is_all_protocol_allowed / isolation / src_allow_spec NONE."""
+    spec = apply_rule_service_defaults(rule)
+    rule_type = str(rule.get("type") or "")
+    orig = rule.get("spec") or {}
+    has_sg = bool(
+        orig.get("service_group_references")
+        or orig.get("secured_group_service_references"))
+    if rule_type in ISOLATION_RULE_TYPES:
+        return True
+    if orig.get("src_allow_spec") == "NONE" or orig.get("dest_allow_spec") == "NONE":
+        return True
+    if spec.get("is_all_protocol_allowed") and not has_sg:
+        return True
+    return False
+
+
 def hash_selector(
         sel, scope, project_uuid, vpc_refs, vlan_uuid, global_uuid,
-        is_flex, is_endpoint):
-    """Call neo4j_db_insert.compute_hash_value. Skip Atlas 'all' port-sets."""
-    vm_refs = list(sel.get("vm_category_refs") or [])
-    if vm_refs == ["all"] or "all" in vm_refs or "any" in vm_refs:
+        is_flex, is_endpoint, ipv4_only=None, ipv6_only=None,
+        is_ipv6_traffic_allowed=False, role=""):
+    """Dump selector -> Atlas port-set UUID via port_set_uuid.
+
+    Skip FLEX Global applied_to (dump key applied_to_entity_group_references
+    missing). AppliedTo hashes in global-scope-unique-id with no CIDRs.
+    """
+    # FnsPortSetValidator skips Atlas token "all". Do not emit a computed
+    # port-set UUID Atlas will never list.
+    if is_allow_all_selector(sel):
         return "", [], ""
-    eg = as_uuid(sel.get("entity_group_uuid"))
-    hashed = compute_hash_value(
-        vm_category_refs=uuid_list(vm_refs),
-        subnet_category_refs=uuid_list(sel.get("subnet_category_refs")),
-        vpc_category_refs=uuid_list(sel.get("vpc_category_refs")),
-        entity_group_ref=eg,
-        addresses=list(sel.get("addresses") or []),
-        subnet_list=list(sel.get("subnet_list") or []),
-        policy_vpc_references=vpc_refs,
-        scope=scope,
-        vm_ext_ids=uuid_list(sel.get("vm_ext_ids")),
-        subnet_ext_ids=uuid_list(sel.get("subnet_ext_ids")),
+    applied = role == "applied_to"
+    return port_set_uuid(
+        sel,
+        scope="GLOBAL" if applied else scope,
         project_uuid=project_uuid or DEFAULT_PROJECT_EXT_ID,
+        vlan_uuid=vlan_uuid,
+        global_uuid=global_uuid,
+        policy_vpc_uuids=[] if applied else vpc_refs,
         is_flex=is_flex,
-        is_endpoint=is_endpoint,
-        vlan_unique_uuid=vlan_uuid,
-        global_unique_uuid=global_uuid,
+        as_address_set=(is_flex or is_endpoint) and not applied,
+        skip_cidrs=applied,
+        ipv4_only=ipv4_only,
+        ipv6_only=ipv6_only,
+        is_ipv6_traffic_allowed=is_ipv6_traffic_allowed,
     )
-    if not hashed or isinstance(hashed, list):
-        return "", [], ""
-    if eg:
-        return "EG", [eg], hashed
-    if uuid_list(vm_refs) or uuid_list(sel.get("vm_ext_ids")):
-        return "VM", uuid_list(vm_refs) or uuid_list(sel.get("vm_ext_ids")), hashed
-    if uuid_list(sel.get("subnet_category_refs")) or uuid_list(sel.get("subnet_ext_ids")):
-        return "SUBNET", (
-            uuid_list(sel.get("subnet_category_refs"))
-            or uuid_list(sel.get("subnet_ext_ids"))), hashed
-    if uuid_list(sel.get("vpc_category_refs")):
-        return "VPC", uuid_list(sel.get("vpc_category_refs")), hashed
-    return "", [], hashed
 
 
 def ip_in_cidrs(ips, cidrs):
@@ -308,12 +740,100 @@ def ip_in_cidrs(ips, cidrs):
         return False
     for ip in ips or []:
         try:
-            addr = ipaddress.ip_address(str(ip))
+            addr = ipaddress.ip_address(str(ip).split("/")[0])
         except ValueError:
             continue
         if any(addr in net for net in networks):
             return True
     return False
+
+
+def is_ipv4_addr(ip):
+    try:
+        return isinstance(
+            ipaddress.ip_address(str(ip).split("/")[0]), ipaddress.IPv4Address)
+    except ValueError:
+        return False
+
+
+def is_hostname(ip):
+    text = str(ip or "").strip()
+    if not text:
+        return False
+    try:
+        ipaddress.ip_address(text.split("/")[0])
+        return False
+    except ValueError:
+        return True
+
+
+def is_link_local(ip):
+    """IPv4 169.254.0.0/16 and IPv6 fe80::/10."""
+    try:
+        addr = ipaddress.ip_address(str(ip).split("/")[0])
+    except ValueError:
+        return False
+    if isinstance(addr, ipaddress.IPv4Address):
+        return addr in ipaddress.ip_network("169.254.0.0/16")
+    return addr.is_link_local
+
+
+def ip_version_flags(policy, rule):
+    """Dump is_ipv4_address_scope / is_ipv6_address_scope; link_local default True."""
+    ipv4_only = bool(policy.get("is_ipv4_address_scope"))
+    ipv6_only = bool(policy.get("is_ipv6_address_scope"))
+    allowed = bool(policy.get("is_ipv6_traffic_allowed"))
+    version = str((rule.get("spec") or {}).get("ip_version") or "").upper()
+    if version == "IPV4":
+        ipv4_only, ipv6_only = True, False
+    elif version == "IPV6":
+        ipv4_only, ipv6_only = False, True
+    elif version in ("IPV4_IPV6", "IPV4IPV6"):
+        ipv4_only, ipv6_only = True, True
+    if allowed:
+        ipv6_only = False
+    link_local = policy.get("link_local")
+    if link_local is None:
+        link_local = (rule.get("spec") or {}).get("link_local")
+    if link_local is None:
+        link_local = True
+    return ipv4_only, ipv6_only, allowed, bool(link_local)
+
+
+def filter_ips_by_protocol(
+        ips, ipv4_only, ipv6_only, is_ipv6_traffic_allowed, link_local=True):
+    """Keep IPs for dump ipv4_only / ipv6_only / is_ipv6_traffic_allowed."""
+    out = []
+    for ip in ips or []:
+        if ip is None or is_hostname(ip):
+            continue
+        ipv4 = is_ipv4_addr(ip)
+        if not link_local and is_link_local(ip):
+            continue
+        if ipv4_only and ipv6_only:
+            out.append(ip)
+        elif ipv4_only and not ipv6_only and ipv4:
+            out.append(ip)
+        elif not ipv4_only and ipv6_only and not ipv4:
+            out.append(ip)
+        elif (not ipv4_only and not ipv6_only and not ipv4
+              and is_ipv6_traffic_allowed):
+            out.append(ip)
+    return out
+
+
+def filter_cidrs_by_protocol(
+        cidrs, ipv4_only, ipv6_only, is_ipv6_traffic_allowed):
+    v4 = [cidr for cidr in cidrs or [] if ":" not in str(cidr)]
+    v6 = [cidr for cidr in cidrs or [] if ":" in str(cidr)]
+    keep_v4, keep_v6 = apply_ip_version_combo(
+        bool(v4), bool(v6), ipv4_only, ipv6_only, is_ipv6_traffic_allowed)
+    out = []
+    if keep_v4:
+        out.extend(v4)
+    if keep_v6:
+        out.extend(v6)
+    return out
 
 
 def nic_index(nics):
@@ -323,6 +843,7 @@ def nic_index(nics):
     by_vm = defaultdict(set)
     by_subnet = defaultdict(set)
     by_vpc = defaultdict(set)
+    by_project = defaultdict(set)
     all_nics = {}
     for nic in nics:
         uid = nic["nic_uuid"]
@@ -331,6 +852,8 @@ def nic_index(nics):
         by_subnet[nic["subnet_uuid"]].add(uid)
         if nic["vpc_uuid"]:
             by_vpc[nic["vpc_uuid"]].add(uid)
+        if nic.get("project_uuid"):
+            by_project[nic["project_uuid"]].add(uid)
         for cat in nic["vm_cat_ids"]:
             by_vm_cat[cat].add(uid)
         for cat in nic["subnet_cat_ids"]:
@@ -344,6 +867,7 @@ def nic_index(nics):
         "by_vm": by_vm,
         "by_subnet": by_subnet,
         "by_vpc": by_vpc,
+        "by_project": by_project,
         "all_nics": all_nics,
     }
 
@@ -360,9 +884,18 @@ def intersect_cat(index_map, refs):
     return out
 
 
-def scope_nics(matched, index, namespace, vlan_uuid, global_uuid, scope):
+def scope_nics(matched, index, namespace, vlan_uuid, global_uuid, scope,
+               role=""):
     if not matched:
         return matched
+    # AppliedTo membership is global (any VPC/VLAN). Policy scope only
+    # clips src/dest port-sets.
+    if role == "applied_to":
+        return matched
+    if role == "secured":
+        return set(
+            uid for uid in matched
+            if not is_basic_vlan_nic(index["all_nics"].get(uid) or {}))
     if scope in ("ALL_VLAN", "kAllVlan") or namespace == vlan_uuid:
         return matched & index["by_vpc"].get(ALL_VLAN_VPC, set())
     if scope in ("GLOBAL", "kGlobal", "ALL_VPC", "VPC_AS_CATEGORY"):
@@ -372,16 +905,28 @@ def scope_nics(matched, index, namespace, vlan_uuid, global_uuid, scope):
     return matched & index["by_vpc"].get(namespace, set())
 
 
-def match_nics(sel, index, namespace, vlan_uuid, global_uuid, scope):
+def match_nics(
+        sel, index, namespace, vlan_uuid, global_uuid, scope,
+        ipv4_only=False, ipv6_only=False, is_ipv6_traffic_allowed=False,
+        link_local=True, role="", project_uuid=""):
     vm_refs = [u for u in (sel.get("vm_category_refs") or []) if u not in ("all", "any")]
     sub_refs = [u for u in (sel.get("subnet_category_refs") or []) if u not in ("all", "any")]
     vpc_refs = uuid_list(sel.get("vpc_category_refs"))
     vm_ext = uuid_list(sel.get("vm_ext_ids"))
     sub_ext = uuid_list(sel.get("subnet_ext_ids"))
-    cidrs = sel.get("subnet_list") or []
+    cidrs = filter_cidrs_by_protocol(
+        sel.get("subnet_list") or [], ipv4_only, ipv6_only,
+        is_ipv6_traffic_allowed)
+    exceptions = filter_cidrs_by_protocol(
+        sel.get("exception_list") or [], ipv4_only, ipv6_only,
+        is_ipv6_traffic_allowed)
 
-    if sel.get("vm_category_refs") == ["all"] or "all" in (sel.get("vm_category_refs") or []):
-        return set()
+    if is_allow_all_selector(sel):
+        if role not in ("src", "dest"):
+            return set()
+        if project_uuid and project_uuid != ZERO:
+            return set(index["by_project"].get(project_uuid, set()))
+        return set(index["all_nics"])
 
     if vm_ext or sub_ext:
         out = set()
@@ -389,7 +934,8 @@ def match_nics(sel, index, namespace, vlan_uuid, global_uuid, scope):
             out |= index["by_vm"].get(vm_uuid, set())
         for subnet_uuid in sub_ext:
             out |= index["by_subnet"].get(subnet_uuid, set())
-        return scope_nics(out, index, namespace, vlan_uuid, global_uuid, scope)
+        return scope_nics(
+            out, index, namespace, vlan_uuid, global_uuid, scope, role=role)
 
     vm_set = intersect_cat(index["by_vm_cat"], vm_refs)
     sub_set = intersect_cat(index["by_sub_cat"], sub_refs)
@@ -406,11 +952,17 @@ def match_nics(sel, index, namespace, vlan_uuid, global_uuid, scope):
     elif cidrs:
         matched = set()
         for nic_uuid, nic in index["all_nics"].items():
-            if ip_in_cidrs(nic["ips"], cidrs):
+            filtered = filter_ips_by_protocol(
+                nic["ips"], ipv4_only, ipv6_only, is_ipv6_traffic_allowed,
+                link_local)
+            in_sel = [ip for ip in filtered if ip_in_cidrs([ip], cidrs)]
+            in_exc = [ip for ip in in_sel if ip_in_cidrs([ip], exceptions)]
+            if set(in_sel) - set(in_exc):
                 matched.add(nic_uuid)
     else:
         return set()
-    return scope_nics(matched, index, namespace, vlan_uuid, global_uuid, scope)
+    return scope_nics(
+        matched, index, namespace, vlan_uuid, global_uuid, scope, role=role)
 
 
 def ip_values(items):
@@ -452,41 +1004,143 @@ def learned_ips(nic):
     return uniq
 
 
-def collect_nics(vms):
+def _entity_cat_ids(*objs):
+    out = []
+    seen = set()
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        raw = (
+            obj.get("category_ids")
+            or obj.get("vm_category_ids")
+            or (obj.get("metadata") or {}).get("category_ids")
+            or [])
+        for uid in uuid_list(raw):
+            if uid not in seen:
+                seen.add(uid)
+                out.append(uid)
+    return out
+
+
+def atlas_vpc_names(port_set_get):
+    """Atlas virtual_network_name -> VPC UUID from port_set.get."""
+    if isinstance(port_set_get, dict):
+        records = list(port_set_get.values())
+    else:
+        records = port_set_get or []
+    out = {}
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        name = str(rec.get("virtual_network_name") or "").strip()
+        uid = as_uuid(rec.get("virtual_network_uuid"))
+        if name and uid:
+            out[name] = uid
+    return out
+
+
+def vpc_uuid_for_subnet(subnet, vpc_names):
+    """VLAN / VLAN Basic -> ALL_VLAN. Overlay: dump vpc_reference or Atlas name."""
+    subnet = subnet or {}
+    if nic_advanced_networking(subnet) is False:
+        return ALL_VLAN_VPC
+    ref = as_uuid(subnet.get("vpc_reference") or (subnet.get("vpc") or {}).get("ext_id"))
+    if ref and ref != ZERO:
+        return ref
+    subnet_type = str(subnet.get("subnet_type") or "").upper()
+    if subnet_type == "VLAN":
+        return ALL_VLAN_VPC
+    text = str(subnet.get("name") or "")
+    best_name = ""
+    best_uid = ""
+    for name, uid in (vpc_names or {}).items():
+        if not name or not text.startswith(name):
+            continue
+        rest = text[len(name):]
+        if rest[:1].isdigit():
+            continue
+        if len(name) > len(best_name):
+            best_name = name
+            best_uid = uid
+    return best_uid
+
+
+def collect_nics(vms, subnets=None, vpc_names=None):
     nics = []
+    sub_by = {}
+    for row in subnets or []:
+        uid = as_uuid(row.get("ext_id"))
+        if uid:
+            sub_by[uid] = row
+    vpc_names = vpc_names or {}
     for vm in vms or []:
+        name = str(vm.get("name") or "")
+        if (name.startswith("VMx_") or name.startswith("VMx")
+                or name.startswith("flow-") or name.startswith("auto_pc_")):
+            continue
         vm_uuid = as_uuid(vm.get("ext_id"))
-        vm_cat_ids = uuid_list(
-            vm.get("category_ids")
-            or (vm.get("metadata") or {}).get("category_ids"))
+        vm_cat_ids = _entity_cat_ids(vm)
+        vm_project = entity_project_uuid(vm)
         for nic in vm.get("nics") or []:
             nic_uuid = as_uuid(nic.get("ext_id"))
             if not nic_uuid:
                 continue
             net = nic.get("nic_network_info") or {}
-            subnet = net.get("subnet") or {}
-            vpc = net.get("vpc") or {}
-            nic_vm_cats = uuid_list(net.get("vm_category_ids") or vm_cat_ids)
+            subnet = dict(net.get("subnet") or {})
+            subnet_uuid = as_uuid(subnet.get("ext_id"))
+            dump_sub = sub_by.get(subnet_uuid) or {}
+            if dump_sub:
+                if dump_sub.get("name") and not subnet.get("name"):
+                    subnet["name"] = dump_sub.get("name")
+                if dump_sub.get("subnet_type") and not subnet.get("subnet_type"):
+                    subnet["subnet_type"] = dump_sub.get("subnet_type")
+                if dump_sub.get("vpc_reference") and not subnet.get("vpc_reference"):
+                    subnet["vpc_reference"] = dump_sub.get("vpc_reference")
+                if dump_sub.get("is_advanced_networking") is not None:
+                    subnet.setdefault(
+                        "is_advanced_networking",
+                        dump_sub.get("is_advanced_networking"))
+            vpc = dict(net.get("vpc") or {})
+            vpc_uuid = (
+                as_uuid(vpc.get("ext_id"))
+                or vpc_uuid_for_subnet(subnet, vpc_names)
+                or ZERO)
+            nic_vm_cats = _entity_cat_ids(net, vm) or vm_cat_ids
+            flags = {}
+            flags.update(nic)
+            flags.update(net)
+            flags.update(subnet)
+            advanced = nic_advanced_networking(flags)
             nics.append({
                 "nic_uuid": nic_uuid,
                 "vm_uuid": vm_uuid or ZERO,
-                "vm_name": str(vm.get("name") or ""),
-                "subnet_uuid": as_uuid(subnet.get("ext_id")) or ZERO,
-                "subnet": str(subnet.get("name") or ""),
-                "vpc_uuid": as_uuid(vpc.get("ext_id")) or ZERO,
+                "vm_name": name,
+                "subnet_uuid": subnet_uuid or ZERO,
+                "subnet": str(subnet.get("name") or dump_sub.get("name") or ""),
+                "subnet_type": str(
+                    subnet.get("subnet_type") or dump_sub.get("subnet_type")
+                    or net.get("subnet_type") or ""),
+                "advance_vlan": advanced,
+                "is_advanced_networking": advanced,
+                "vpc_uuid": vpc_uuid,
                 "vpc": str(vpc.get("name") or ""),
+                "project_uuid": (
+                    entity_project_uuid(nic)
+                    or entity_project_uuid(net)
+                    or vm_project),
                 "vm_cat_ids": nic_vm_cats,
-                "subnet_cat_ids": uuid_list(subnet.get("category_ids")),
-                "vpc_cat_ids": uuid_list(vpc.get("category_ids")),
+                "subnet_cat_ids": _entity_cat_ids(subnet, dump_sub),
+                "vpc_cat_ids": _entity_cat_ids(vpc),
                 "ips": learned_ips(nic),
                 "ip": ",".join(learned_ips(nic)),
             })
     return nics
 
 
-def add_component(
-        components, role, sel, policy, rule, namespace, scope, eg_map,
-        project_uuid, vlan_uuid, global_uuid):
+def expand_selector(sel, eg_map):
+    if not sel:
+        return sel
+    eg_map = eg_map or {}
     if sel.get("entity_group_uuid") and sel["entity_group_uuid"] in eg_map:
         expanded = dict(eg_map[sel["entity_group_uuid"]])
         for key, value in sel.items():
@@ -494,15 +1148,70 @@ def add_component(
                 continue
             if value:
                 expanded[key] = value
-        sel = expanded
-    is_flex = str(rule.get("type") or "") == "FLEX"
-    # neo4j applied_hash_value uses is_flex only (is_endpoint defaults false).
-    is_endpoint = role not in ("secured", "applied_to")
+        return expanded
+    return sel
+
+
+def nic_match_key(comp, sel):
+    return (
+        comp["namespace_uuid"],
+        comp.get("policy_scope") or "",
+        comp.get("role") or "",
+        comp.get("policy_project_uuid") or "",
+        tuple(sel.get("vm_category_refs") or []),
+        tuple(sel.get("subnet_category_refs") or []),
+        tuple(sel.get("vpc_category_refs") or []),
+        tuple(sel.get("vm_ext_ids") or []),
+        tuple(sel.get("subnet_ext_ids") or []),
+        tuple(sel.get("subnet_list") or []),
+        tuple(sel.get("exception_list") or []),
+        sel.get("should_allow_any_src"),
+        sel.get("should_allow_any_dst"),
+        sel.get("src_allow_spec"),
+        sel.get("dest_allow_spec"),
+        comp.get("ipv4_only"),
+        comp.get("ipv6_only"),
+        comp.get("is_ipv6_traffic_allowed"),
+        comp.get("link_local"),
+    )
+
+
+def add_component(
+        components, role, sel, policy, rule, namespace, scope, eg_map,
+        project_uuid, vlan_uuid, global_uuid):
+    sel = expand_selector(sel, eg_map)
+    rule_type = str(rule.get("type") or "")
+    is_flex = rule_type == "FLEX"
+    # Isolation groups hash as Secured (not Endpoint address-set).
+    isolation = (
+        rule_type in ISOLATION_RULE_TYPES
+        or str(role).startswith("isolation"))
+    is_endpoint = (not isolation) and role not in ("secured", "applied_to")
+    # FnsPortSetValidator step 2: skip inbound/outbound EG that is AG/NA
+    # (entity_group_ref with no VM/subnet/VPC category refs). UUID and
+    # REGEX members count even when name resolve found zero VMs this dump.
+    if is_endpoint and sel.get("entity_group_uuid"):
+        if not (
+                uuid_list(sel.get("vm_category_refs"))
+                or uuid_list(sel.get("subnet_category_refs"))
+                or uuid_list(sel.get("vpc_category_refs"))
+                or uuid_list(sel.get("vm_ext_ids"))
+                or uuid_list(sel.get("subnet_ext_ids"))
+                or sel.get("has_direct_vm")
+                or sel.get("has_direct_subnet")):
+            return "ag_na"
+    # Kube EGs are not Atlas port-sets (neo4j kube_cluster path).
+    if sel.get("is_kube"):
+        return "kube"
+    if is_allow_all_selector(sel):
+        return "allow_all"
+    ipv4_only, ipv6_only, allowed, link_local = ip_version_flags(policy, rule)
     entity_type, refs, port_set = hash_selector(
         sel, scope, project_uuid, policy_hash_vpc_refs(policy, scope),
-        vlan_uuid, global_uuid, is_flex, is_endpoint)
+        vlan_uuid, global_uuid, is_flex, is_endpoint,
+        ipv4_only, ipv6_only, allowed, role=role)
     if not port_set:
-        return
+        return "no_hash"
     rule_uuid = as_uuid(rule.get("ext_id")) or ZERO
     policy_uuid = as_uuid(policy.get("ext_id")) or ZERO
     component_id = "%s:%s:%s" % (policy_uuid, rule_uuid, role)
@@ -514,11 +1223,13 @@ def add_component(
         "rule_uuid": rule_uuid,
         "role": role,
         "component_id": component_id,
-        "namespace_uuid": namespace,
-        "policy_scope": scope,
+        "namespace_uuid": global_uuid if role == "applied_to" else namespace,
+        "policy_scope": "GLOBAL" if role == "applied_to" else scope,
+        "policy_project_uuid": (
+            project_uuid if project_uuid and project_uuid != ZERO else ""),
         "virtual_network_uuid": ZERO,
         "entity_group_uuid": sel.get("entity_group_uuid") or ZERO,
-        "entity_group_name": "",
+        "entity_group_name": str(sel.get("name") or ""),
         "reference_uuids": refs,
         "vm_category_refs": uuid_list(sel.get("vm_category_refs")),
         "subnet_category_refs": uuid_list(sel.get("subnet_category_refs")),
@@ -527,11 +1238,183 @@ def add_component(
         "subnet_ext_ids": uuid_list(sel.get("subnet_ext_ids")),
         "subnet_list": list(sel.get("subnet_list") or []),
         "exception_list": list(sel.get("exception_list") or []),
+        "eg_address_grp": list(sel.get("eg_address_grp") or []),
+        "eg_exception_address_grp": list(
+            sel.get("eg_exception_address_grp") or []),
+        "vm_category_names": list(sel.get("vm_category_names") or []),
+        "subnet_category_names": list(sel.get("subnet_category_names") or []),
+        "vpc_category_names": list(sel.get("vpc_category_names") or []),
+        "effective_vpc_refs": [],
+        "effective_vpc_names": [],
+        "ipv4_only": ipv4_only,
+        "ipv6_only": ipv6_only,
+        "is_ipv6_traffic_allowed": allowed,
+        "link_local": link_local,
+        "all_ports": 1 if rule_selects_all_ports(rule) else 0,
+        "should_allow_any": dump_allow_any(sel),
         "sel": sel,
     })
+    return "ok"
 
 
-def selectors_from_spec(spec, ag_map=None):
+def is_allow_any(spec, side, rule_type=""):
+    """Dump should_allow_any_src/dst or src_allow_spec/dest_allow_spec ALL|NONE."""
+    del rule_type
+    if side == "src":
+        return bool(
+            spec.get("should_allow_any_src")
+            or spec.get("src_allow_spec") in ALLOW_ANY_SPECS)
+    return bool(
+        spec.get("should_allow_any_dst")
+        or spec.get("dest_allow_spec") in ALLOW_ANY_SPECS)
+
+
+def apply_rule_service_defaults(rule):
+    """Dump isolation / is_all_protocol_allowed / src_allow_spec NONE ports."""
+    spec = dict(rule.get("spec") or {})
+    rule_type = str(rule.get("type") or "")
+    has_sg = bool(
+        spec.get("service_group_references")
+        or spec.get("secured_group_service_references"))
+    has_ports = bool(
+        spec.get("tcp_services") or spec.get("udp_services")
+        or spec.get("icmp_services") or spec.get("icmp_v6_services"))
+    if rule_type in ISOLATION_RULE_TYPES:
+        spec["is_all_protocol_allowed"] = True
+        spec["secured_group_action"] = spec.get("secured_group_action") or "DENY_ALL"
+        spec["tcpPort"] = ["0-65535"]
+        spec["udpPort"] = ["0-65535"]
+        spec["icmpTypes"] = ["any:any"]
+        spec["icmpv6Types"] = ["any:any"]
+    elif spec.get("src_allow_spec") == "NONE" or spec.get("dest_allow_spec") == "NONE":
+        spec["is_all_protocol_allowed"] = True
+        spec["secured_group_action"] = "DENY"
+        spec["tcpPort"] = ["0-65535"]
+        spec["udpPort"] = ["0-65535"]
+        spec["icmpTypes"] = ["any:any"]
+        spec["icmpv6Types"] = ["any:any"]
+    elif spec.get("is_all_protocol_allowed") and not has_sg:
+        spec.setdefault("tcpPort", ["0-65535"])
+        spec.setdefault("udpPort", ["0-65535"])
+        spec.setdefault("icmpTypes", ["any:any"])
+        spec.setdefault("icmpv6Types", ["any:any"])
+        spec.setdefault("secured_group_action", "allow")
+    elif spec.get("secured_group_action") and not has_sg and not has_ports:
+        spec["is_all_protocol_allowed"] = True
+        spec["tcpPort"] = ["0-65535"]
+        spec["udpPort"] = ["0-65535"]
+        spec["icmpTypes"] = ["any:any"]
+        spec["icmpv6Types"] = ["any:any"]
+    return spec
+
+
+def _side_eg_uuid(spec, prefix):
+    eg = as_uuid(spec.get("%s_entity_group_reference" % prefix))
+    if eg:
+        return eg
+    eg_list = uuid_list(spec.get("%s_entity_group_references" % prefix))
+    return eg_list[0] if eg_list else ""
+
+
+def _side_category_sel(spec, prefix):
+    refs = uuid_list(spec.get("%s_category_references" % prefix))
+    if not refs:
+        return None
+    et = str(spec.get("%s_category_associated_entity_type" % prefix) or "VM")
+    return {
+        "vm_category_refs": refs if et == "VM" else [],
+        "subnet_category_refs": refs if et == "SUBNET" else [],
+        "vpc_category_refs": refs if et == "VPC" else [],
+    }
+
+
+def _side_subnet_sel(spec, prefix):
+    subnet = spec.get("%s_subnet" % prefix)
+    if not isinstance(subnet, dict):
+        return None
+    value = subnet.get("value")
+    prefix_len = subnet.get("prefix_length")
+    if value is None or prefix_len is None:
+        return None
+    return {"subnet_list": ["%s/%s" % (value, prefix_len)]}
+
+
+def _side_ag_sel(spec, prefix, ag_map):
+    ag = uuid_list(spec.get("%s_address_group_references" % prefix))
+    if not ag:
+        return None
+    cidrs = []
+    for uid in ag:
+        cidrs.extend((ag_map.get(uid) or {}).get("subnet_list") or [])
+    return {"addresses": ag, "subnet_list": cidrs}
+
+
+def _allow_any_sel(spec, side):
+    sel = {}
+    if side == "src":
+        if spec.get("should_allow_any_src"):
+            sel["should_allow_any_src"] = True
+        if spec.get("src_allow_spec") in ALLOW_ANY_SPECS:
+            sel["src_allow_spec"] = spec["src_allow_spec"]
+    else:
+        if spec.get("should_allow_any_dst"):
+            sel["should_allow_any_dst"] = True
+        if spec.get("dest_allow_spec") in ALLOW_ANY_SPECS:
+            sel["dest_allow_spec"] = spec["dest_allow_spec"]
+    return sel or None
+
+
+def peer_selector(spec, side, ag_map, rule_type=""):
+    """One src or dest selector from dump spec keys.
+
+    FLEX: EG elif should_allow_any_* elif subnet elif AG.
+    APPLICATION: subnet elif AG elif category elif EG elif should_allow_any
+    / src_allow_spec|dest_allow_spec ALL|NONE.
+    """
+    prefix = "src" if side == "src" else "dest"
+    if str(rule_type) == "FLEX":
+        eg = _side_eg_uuid(spec, prefix)
+        if eg:
+            return {"entity_group_uuid": eg}
+        allow = _allow_any_sel(spec, side)
+        if allow:
+            return allow
+        sub = _side_subnet_sel(spec, prefix)
+        if sub:
+            return sub
+        return _side_ag_sel(spec, prefix, ag_map)
+    sub = _side_subnet_sel(spec, prefix)
+    if sub:
+        return sub
+    ag = _side_ag_sel(spec, prefix, ag_map)
+    if ag:
+        return ag
+    cat = _side_category_sel(spec, prefix)
+    if cat:
+        return cat
+    eg = _side_eg_uuid(spec, prefix)
+    if eg:
+        return {"entity_group_uuid": eg}
+    return _allow_any_sel(spec, side)
+
+
+def applied_to_selector(spec, rule_type=""):
+    """FLEX dump applied_to_entity_group_references -> role applied_to.
+
+    Key missing (UI Global): no Atlas port-set. Empty list: no hash.
+    EG hashes in global-scope-unique-id with no CIDRs.
+    """
+    if str(rule_type) != "FLEX":
+        return None
+    applied = uuid_list(spec.get("applied_to_entity_group_references"))
+    if applied:
+        return {"entity_group_uuid": applied[0]}
+    if "applied_to_entity_group_references" not in spec:
+        return {"applied_to_entity_group_references": None}
+    return None
+
+
+def selectors_from_spec(spec, ag_map=None, rule_type=""):
     out = []
     ag_map = ag_map or {}
     sg_refs = uuid_list(spec.get("secured_group_category_references"))
@@ -547,62 +1430,16 @@ def selectors_from_spec(spec, ag_map=None):
     elif sg_eg:
         out.append(("secured", {"entity_group_uuid": sg_eg}))
 
-    def subnet_cidrs(key):
-        subnet = spec.get(key)
-        if not isinstance(subnet, dict):
-            return []
-        value = subnet.get("value")
-        prefix = subnet.get("prefix_length")
-        if value is None or prefix is None:
-            return []
-        return ["%s/%s" % (value, prefix)]
+    src = peer_selector(spec, "src", ag_map, rule_type)
+    if src:
+        out.append(("src", src))
+    dst = peer_selector(spec, "dest", ag_map, rule_type)
+    if dst:
+        out.append(("dest", dst))
 
-    src_cidrs = subnet_cidrs("src_subnet")
-    dst_cidrs = subnet_cidrs("dest_subnet")
-    if src_cidrs:
-        out.append(("src", {"subnet_list": src_cidrs}))
-    if dst_cidrs:
-        out.append(("dest", {"subnet_list": dst_cidrs}))
-
-    applied = uuid_list(spec.get("applied_to_entity_group_references"))
+    applied = applied_to_selector(spec, rule_type)
     if applied:
-        out.append(("applied_to", {"entity_group_uuid": applied[0]}))
-
-    ag_src = uuid_list(spec.get("src_address_group_references"))
-    ag_dst = uuid_list(spec.get("dest_address_group_references"))
-    # neo4j_db_insert FLEX: address groups become Endpoint subnet_list +
-    # addresses, hashed as address_set (not port_set). Prefer AG over "all".
-    if spec.get("should_allow_any_src") and not ag_src:
-        out.append(("src", {"vm_category_refs": ["all"]}))
-    if spec.get("should_allow_any_dst") and not ag_dst:
-        out.append(("dest", {"vm_category_refs": ["all"]}))
-    if ag_src:
-        cidrs = []
-        for uid in ag_src:
-            cidrs.extend((ag_map.get(uid) or {}).get("subnet_list") or [])
-        out.append(("src", {"addresses": ag_src, "subnet_list": cidrs}))
-    if ag_dst:
-        cidrs = []
-        for uid in ag_dst:
-            cidrs.extend((ag_map.get(uid) or {}).get("subnet_list") or [])
-        out.append(("dest", {"addresses": ag_dst, "subnet_list": cidrs}))
-
-    for side, prefix in (("src", "src"), ("dest", "dest")):
-        refs = uuid_list(spec.get("%s_category_references" % prefix))
-        et = str(spec.get("%s_category_associated_entity_type" % prefix) or "VM")
-        eg = as_uuid(spec.get("%s_entity_group_reference" % prefix))
-        if not eg:
-            eg_list = uuid_list(spec.get("%s_entity_group_references" % prefix))
-            eg = eg_list[0] if eg_list else ""
-        if refs:
-            sel = {
-                "vm_category_refs": refs if et == "VM" else [],
-                "subnet_category_refs": refs if et == "SUBNET" else [],
-                "vpc_category_refs": refs if et == "VPC" else [],
-            }
-            out.append((side, sel))
-        elif eg:
-            out.append((side, {"entity_group_uuid": eg}))
+        out.append(("applied_to", applied))
 
     first = uuid_list(spec.get("first_isolation_group"))
     second = uuid_list(spec.get("second_isolation_group"))
@@ -699,17 +1536,66 @@ def map_names(uuids, mapping):
     return [mapping.get(uid, "") for uid in uuids]
 
 
-def nic_tuples(uuids, by_uuid):
-    """(vm_name, nic_uuid, subnet, vpc, ip) per NIC."""
+def category_names(refs, mapping, existing=None):
+    mapped = map_names(refs or [], mapping)
+    if any(mapped):
+        return mapped
+    return [name for name in (existing or []) if name in ("any", "all")]
+
+
+def vpc_category_map(vpcs):
+    """VPC uuid -> category uuid list, plus ALL_VLAN empty list."""
+    out = {ALL_VLAN_VPC: []}
+    for row in vpcs or []:
+        data = unwrap(row) if isinstance(row, dict) else row
+        if not isinstance(data, dict):
+            continue
+        uid = as_uuid(data.get("ext_id") or data.get("uuid"))
+        if not uid:
+            continue
+        meta = data.get("metadata") or {}
+        out[uid] = uuid_list(meta.get("category_ids") or data.get("category_ids"))
+    return out
+
+
+def effective_vpc_refs(vpc_cat_refs, vpc_cat_map):
+    """VPCs whose categories contain every selector VPC cat.
+
+    If the selector has no VPC cats, skip storing all VPC UUIDs (too large).
+    """
+    vpc_cat_map = vpc_cat_map or {}
+    want = set(uuid_list(vpc_cat_refs))
+    if not want:
+        return []
+    return [
+        vpc_uid for vpc_uid, cats in vpc_cat_map.items()
+        if want <= set(uuid_list(cats))
+    ]
+
+
+def nic_tuples(uuids, by_uuid, ipv4_only=None, ipv6_only=None,
+               is_ipv6_traffic_allowed=False, link_local=True):
+    """(vm_name, nic_uuid, subnet, vpc, ip) per NIC.
+
+    When ipv4_only/ipv6_only are set, IP text follows those dump flags.
+    Atlas rows pass neither so every learned IP is kept.
+    """
     out = []
+    apply_proto = ipv4_only is not None or ipv6_only is not None
     for uid in uuids:
         rec = by_uuid.get(uid) or {}
+        if apply_proto:
+            ips = filter_ips_by_protocol(
+                rec.get("ips") or [], bool(ipv4_only), bool(ipv6_only),
+                is_ipv6_traffic_allowed, link_local)
+        else:
+            ips = list(rec.get("ips") or [])
         out.append({
             "vm_name": rec.get("vm_name") or "",
             "nic_uuid": uid,
             "subnet": rec.get("subnet") or "",
             "vpc": rec.get("vpc") or "",
-            "ip": rec.get("ip") or "",
+            "ip": ",".join(ips),
         })
     return out
 
@@ -719,41 +1605,41 @@ def attach_nics(components, nics, vlan_uuid, global_uuid):
     cache = {}
     for comp in components:
         sel = comp.pop("sel")
-        if sel.get("vm_category_refs") == ["all"] or "all" in (sel.get("vm_category_refs") or []):
-            comp["computed_nic_uuids"] = []
-            continue
-        key = (
-            comp["namespace_uuid"],
-            comp.get("policy_scope") or "",
-            tuple(sel.get("vm_category_refs") or []),
-            tuple(sel.get("subnet_category_refs") or []),
-            tuple(sel.get("vpc_category_refs") or []),
-            tuple(sel.get("vm_ext_ids") or []),
-            tuple(sel.get("subnet_ext_ids") or []),
-            tuple(sel.get("subnet_list") or []),
-        )
+        key = nic_match_key(comp, sel)
         if key not in cache:
             cache[key] = match_nics(
                 sel, index, comp["namespace_uuid"], vlan_uuid, global_uuid,
-                comp.get("policy_scope") or "")
+                comp.get("policy_scope") or "",
+                ipv4_only=bool(comp.get("ipv4_only")),
+                ipv6_only=bool(comp.get("ipv6_only")),
+                is_ipv6_traffic_allowed=bool(
+                    comp.get("is_ipv6_traffic_allowed")),
+                link_local=comp.get("link_local", True),
+                role=comp.get("role") or "",
+                project_uuid=comp.get("policy_project_uuid") or "")
         comp["computed_nic_uuids"] = sorted(cache[key])
 
 
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--dump_dir",
-        default="/home/rakeshkumar.r/panacea/flow_pc_dumps/full")
+    parser = argparse.ArgumentParser(
+        description="Ingest PC dump JSON into ClickHouse. Stdlib + clickhouse-client only.")
+    parser.add_argument("--dump_dir", required=True, help="Directory of dump JSON files")
     parser.add_argument(
         "--schema",
-        default=os.path.join(here, "schema.sql"))
+        default="",
+        help="Optional schema.sql; embedded schema is used if omitted or missing")
     args = parser.parse_args()
     dump_dir = args.dump_dir
 
     ch_client("--query", "SELECT 1")
-    with open(args.schema) as handle:
-        ch_client("--multiquery", input_text=handle.read())
+    schema_path = args.schema or os.path.join(here, "schema.sql")
+    if schema_path and os.path.exists(schema_path):
+        with open(schema_path) as handle:
+            schema_sql = handle.read()
+    else:
+        schema_sql = SCHEMA_SQL
+    ch_client("--multiquery", input_text=schema_sql)
 
     meta = load_json(os.path.join(dump_dir, "meta.json"), {})
     vlan_uuid = as_uuid(meta.get("vlan_unique_uuid"))
@@ -768,21 +1654,30 @@ def main():
 
     cat_map = category_name_map(categories)
     vpc_map = named_map(vpcs)
+    vpc_cat_map = vpc_category_map(vpcs)
     eg_names = named_map(egs)
     insert_json("flow_policy.category", [
         {"category_uuid": uid, "name": name} for uid, name in cat_map.items()
     ])
     address_groups = [
         unwrap(row) for row in load_json(os.path.join(dump_dir, "address_groups.json"), [])]
+    fqdn_map = load_json(os.path.join(dump_dir, "fqdn_to_ip_map.json"), {}) or {}
+    subnet_rows = [
+        unwrap(row) for row in load_json(os.path.join(dump_dir, "subnets.json"), [])]
     ag_map = {}
     for ag in address_groups:
         uid = as_uuid(ag.get("ext_id") or ag.get("uuid"))
         if uid:
-            ag_map[uid] = {"subnet_list": expand_address_group(ag)}
+            ag_map[uid] = {
+                "subnet_list": expand_address_group(ag, fqdn_map),
+                "name": str(ag.get("name") or ""),
+            }
     eg_map = {
-        as_uuid(eg.get("ext_id")): expand_entity_group(eg, ag_map) for eg in egs}
+        as_uuid(eg.get("ext_id")): expand_entity_group(
+            eg, ag_map, fqdn_map, vms, subnet_rows)
+        for eg in egs}
     eg_map.pop("", None)
-    nics = collect_nics(vms)
+    nics = collect_nics(vms, subnet_rows, atlas_vpc_names(atlas_get))
     insert_json("flow_policy.vm_nic", [{
         "nic_uuid": nic["nic_uuid"],
         "vm_uuid": nic["vm_uuid"] or ZERO,
@@ -796,17 +1691,40 @@ def main():
     atlas = atlas_by_uuid(atlas_list, atlas_get)
 
     components = []
+    verify = {
+        "save": 0, "allow_all": 0, "ag_na": 0, "no_hash": 0, "ok": 0,
+        "dump_should_allow_any": 0, "dump_should_allow_any_src": 0,
+        "dump_should_allow_any_dst": 0, "dump_all_protocol": 0,
+    }
     for policy in policies:
+        if str(policy.get("state") or "").upper() == "SAVE":
+            verify["save"] += 1
+            continue
         namespace, scope = namespace_for_policy(policy, vlan_uuid, global_uuid)
         if not namespace:
             continue
         project_uuid = policy_project_uuid(policy) or DEFAULT_PROJECT_EXT_ID
         for rule in policy.get("rules") or []:
-            spec = rule.get("spec") or {}
-            for role, sel in selectors_from_spec(spec, ag_map):
-                add_component(
+            orig = rule.get("spec") or {}
+            if orig.get("should_allow_any_src"):
+                verify["dump_should_allow_any_src"] += 1
+                verify["dump_should_allow_any"] += 1
+            if orig.get("should_allow_any_dst"):
+                verify["dump_should_allow_any_dst"] += 1
+                if not orig.get("should_allow_any_src"):
+                    verify["dump_should_allow_any"] += 1
+            if orig.get("is_all_protocol_allowed"):
+                verify["dump_all_protocol"] += 1
+            spec = apply_rule_service_defaults(rule)
+            rule_type = str(rule.get("type") or "")
+            for role, sel in selectors_from_spec(spec, ag_map, rule_type):
+                reason = add_component(
                     components, role, sel, policy, rule, namespace, scope,
                     eg_map, project_uuid, vlan_uuid, global_uuid)
+                verify[reason] = verify.get(reason, 0) + 1
+                if role == "applied_to":
+                    key = "applied_to_%s" % reason
+                    verify[key] = verify.get(key, 0) + 1
 
     attach_nics(components, nics, vlan_uuid, global_uuid)
     nic_by_uuid = {nic["nic_uuid"]: nic for nic in nics}
@@ -816,7 +1734,16 @@ def main():
         atlas_nics = list(row.get("atlas_nic_uuids") or [])
         row["computed_nic_uuids"] = computed
         row["atlas_nic_uuids"] = atlas_nics
-        row["computed_nics"] = nic_tuples(computed, nic_by_uuid)
+        proto = {}
+        if "ipv4_only" in row or "ipv6_only" in row:
+            proto = {
+                "ipv4_only": bool(row.get("ipv4_only")),
+                "ipv6_only": bool(row.get("ipv6_only")),
+                "is_ipv6_traffic_allowed": bool(
+                    row.get("is_ipv6_traffic_allowed")),
+                "link_local": row.get("link_local", True),
+            }
+        row["computed_nics"] = nic_tuples(computed, nic_by_uuid, **proto)
         row["atlas_nics"] = nic_tuples(atlas_nics, nic_by_uuid)
         vn = row.get("virtual_network_uuid") or ZERO
         ns = row.get("namespace_uuid") or ZERO
@@ -826,11 +1753,27 @@ def main():
             or vpc_map.get(vn)
             or vpc_map.get(ns)
             or "")
-        row["entity_group_name"] = eg_names.get(row.get("entity_group_uuid"), "")
-        row["vm_category_names"] = map_names(row.get("vm_category_refs") or [], cat_map)
-        row["subnet_category_names"] = map_names(
-            row.get("subnet_category_refs") or [], cat_map)
-        row["vpc_category_names"] = map_names(row.get("vpc_category_refs") or [], cat_map)
+        row["entity_group_name"] = (
+            row.get("entity_group_name")
+            or eg_names.get(row.get("entity_group_uuid"), "")
+            or "")
+        row["vm_category_names"] = category_names(
+            row.get("vm_category_refs") or [], cat_map,
+            row.get("vm_category_names"))
+        row["subnet_category_names"] = category_names(
+            row.get("subnet_category_refs") or [], cat_map,
+            row.get("subnet_category_names"))
+        row["vpc_category_names"] = category_names(
+            row.get("vpc_category_refs") or [], cat_map,
+            row.get("vpc_category_names"))
+        if row.get("role") or (row.get("computed_port_set_uuid") or ZERO) != ZERO:
+            vpc_refs = effective_vpc_refs(
+                row.get("vpc_category_refs"), vpc_cat_map)
+            row["effective_vpc_refs"] = vpc_refs
+            row["effective_vpc_names"] = map_names(vpc_refs, vpc_map)
+        else:
+            row["effective_vpc_refs"] = []
+            row["effective_vpc_names"] = []
         row["reference_names"] = [
             cat_map.get(uid) or eg_names.get(uid) or ""
             for uid in (row.get("reference_uuids") or [])
@@ -839,8 +1782,21 @@ def main():
 
     rows = []
     seen = set()
+    allow_any_src_rows = sum(
+        1 for row in components
+        if row.get("role") == "src" and row.get("should_allow_any"))
+    allow_any_dst_rows = sum(
+        1 for row in components
+        if row.get("role") == "dest" and row.get("should_allow_any"))
+    allow_any_src_nics = sum(
+        len(row.get("computed_nic_uuids") or []) for row in components
+        if row.get("role") == "src" and row.get("should_allow_any"))
+    allow_any_dst_nics = sum(
+        len(row.get("computed_nic_uuids") or []) for row in components
+        if row.get("role") == "dest" and row.get("should_allow_any"))
     for row in components:
         row.pop("policy_scope", None)
+        row.pop("policy_project_uuid", None)
         ps = row["port_set_uuid"]
         seen.add(ps)
         atlas_rec = atlas.get(ps) or {}
@@ -852,6 +1808,11 @@ def main():
         row["computed_nic_uuids"] = list(row.get("computed_nic_uuids") or [])
         row["atlas_nic_uuids"] = list(atlas_rec.get("atlas_nic_uuids") or [])
         fill_names(row, atlas_rec)
+        row.pop("ipv4_only", None)
+        row.pop("ipv6_only", None)
+        row.pop("is_ipv6_traffic_allowed", None)
+        row.pop("link_local", None)
+        row.pop("should_allow_any", None)
         rows.append(row)
     for ps, atlas_rec in atlas.items():
         if ps in seen:
@@ -877,8 +1838,13 @@ def main():
             "subnet_ext_ids": [],
             "subnet_list": [],
             "exception_list": [],
+            "effective_vpc_refs": [],
+            "effective_vpc_names": [],
+            "eg_address_grp": [],
+            "eg_exception_address_grp": [],
             "computed_nic_uuids": [],
             "atlas_nic_uuids": list(atlas_rec.get("atlas_nic_uuids") or []),
+            "all_ports": 0,
         }
         fill_names(row, atlas_rec)
         rows.append(row)
@@ -887,6 +1853,46 @@ def main():
     print("nics", len(nics))
     print("atlas_uuids", len(atlas))
     print("computed_components", len(components))
+    print("isolation_components", sum(
+        1 for row in components if str(row.get("role") or "").startswith("isolation")))
+    print("dump_should_allow_any", verify["dump_should_allow_any"])
+    print("dump_should_allow_any_src", verify["dump_should_allow_any_src"])
+    print("dump_should_allow_any_dst", verify["dump_should_allow_any_dst"])
+    print("dump_is_all_protocol_allowed", verify["dump_all_protocol"])
+    print("verify_skip_save", verify["save"])
+    print("verify_allow_all_skipped", verify["allow_all"])
+    print("verify_kube_skipped", verify.get("kube", 0))
+    print("allow_any_src_rows", allow_any_src_rows)
+    print("allow_any_dst_rows", allow_any_dst_rows)
+    print("allow_any_src_nics", allow_any_src_nics)
+    print("allow_any_dst_nics", allow_any_dst_nics)
+    print("verify_applied_to_hashed", verify.get("applied_to_ok", 0))
+    print("verify_applied_to_all_skipped", verify.get("applied_to_allow_all", 0))
+    print("applied_to_with_vm_cats", sum(
+        1 for row in components
+        if row.get("role") == "applied_to" and row.get("vm_category_refs")))
+    print("applied_to_with_subnet_cats", sum(
+        1 for row in components
+        if row.get("role") == "applied_to" and row.get("subnet_category_refs")))
+    print("applied_to_with_vpc_cats", sum(
+        1 for row in components
+        if row.get("role") == "applied_to" and row.get("vpc_category_refs")))
+    print("applied_to_with_subnet_list", sum(
+        1 for row in components
+        if row.get("role") == "applied_to" and row.get("subnet_list")))
+    print("applied_to_with_vm_ext_ids", sum(
+        1 for row in components
+        if row.get("role") == "applied_to" and row.get("vm_ext_ids")))
+    print("verify_ag_na_skipped", verify["ag_na"])
+    print("verify_no_hash", verify["no_hash"])
+    print("verify_all_ports_components", sum(
+        1 for row in components if row.get("all_ports")))
+    print("eg_vm_ext_ids", sum(
+        len(sel.get("vm_ext_ids") or []) for sel in eg_map.values()))
+    print("eg_subnet_ext_ids", sum(
+        len(sel.get("subnet_ext_ids") or []) for sel in eg_map.values()))
+    print("eg_direct_vm", sum(
+        1 for sel in eg_map.values() if sel.get("has_direct_vm")))
     print("computed_uuids", len(seen))
     print("rows", len(rows))
     print("inserted_into", "flow_policy.portset,flow_policy.vm_nic,flow_policy.category")

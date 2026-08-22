@@ -1,11 +1,13 @@
 -- One flat port-set table. Presence columns on the same row:
---   computed_port_set_uuid = uuid5 hash, or zero if Atlas-only
+--   computed_port_set_uuid = hash from ingest.py, or zero if Atlas-only
 --   atlas_port_set_uuid    = port_set.list/get uuid, or zero if computed-only
--- Zero UUID means not present (schema-types-avoid-nullable).
+-- FLEX applied_to is a separate row (role = 'applied_to').
+-- should_allow_any_src/dst matches every NIC in the policy project, or
+-- every VM NIC if the policy has no project.
+-- Secured-group NICs exclude VLAN Basic (advance_vlan /
+-- is_advanced_networking false). Advanced VLAN and overlay stay.
+-- Zero UUID means not present.
 -- Native 127.0.0.1:19000 / HTTP 8123.
--- Per schema-types-native-types, schema-pk-cardinality-order,
--- schema-pk-prioritize-filters, schema-partition-start-without,
--- insert-mutation-avoid-update.
 
 CREATE DATABASE IF NOT EXISTS flow_policy;
 
@@ -37,6 +39,10 @@ CREATE TABLE flow_policy.portset
     subnet_ext_ids             Array(UUID) DEFAULT [],
     subnet_list                Array(String) DEFAULT [],
     exception_list             Array(String) DEFAULT [],
+    effective_vpc_refs         Array(UUID) DEFAULT [],
+    effective_vpc_names        Array(String) DEFAULT [],
+    eg_address_grp             Array(String) DEFAULT [],
+    eg_exception_address_grp   Array(String) DEFAULT [],
     computed_nic_uuids         Array(UUID) DEFAULT [],
     atlas_nic_uuids            Array(UUID) DEFAULT [],
     policy_name                String DEFAULT '',
@@ -77,6 +83,7 @@ CREATE TABLE flow_policy.portset
         vpc String,
         ip String
     )) DEFAULT [],
+    all_ports                  UInt8 DEFAULT 0,
     updated_at                 DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)

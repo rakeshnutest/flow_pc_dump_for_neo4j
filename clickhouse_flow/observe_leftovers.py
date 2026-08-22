@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from portset_hash import (  # noqa: E402
+from ingest import (  # noqa: E402
     DEFAULT_PROJECT_EXT_ID,
     GLOBAL_SCOPE_UNIQUE_ID,
     VLAN_SCOPE_UNIQUE_ID,
@@ -179,6 +179,10 @@ SELECT
     p.subnet_ext_ids,
     p.subnet_list,
     p.exception_list,
+    p.effective_vpc_refs,
+    p.effective_vpc_names,
+    p.eg_address_grp,
+    p.eg_exception_address_grp,
     p.computed_nic_uuids,
     p.atlas_nic_uuids,
     p.computed_nics,
@@ -682,8 +686,7 @@ def enrich(rec, index, dump):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--dump_dir",
-        default="/home/rakeshkumar.r/panacea/flow_pc_dumps/full")
+        "--dump_dir", required=True, help="Directory of dump JSON files")
     parser.add_argument(
         "--out",
         default=os.path.join(HERE, "leftover_observations.md"))
