@@ -76,6 +76,12 @@ LOG = logging.getLogger("flow_pc_dump")
 # neo4j_db_insert.py create_vpc_map / ALL_VLAN scope
 ALL_VLAN_VPC_UUID = "00000000-0000-0000-0000-000000000001"
 ALL_VLAN_VPC_NAME = "VLAN"
+DEFAULT_PROJECT_UUID = "00000000-0000-0000-0000-000000000000"
+
+# AtlasNetworkFunction insertion_type / ha_mode / fallback_mode ints.
+NF_TRAFFIC = {1: "INLINE", 2: "VTAP"}
+NF_HA = {1: "ACTIVE_PASSIVE", 2: "ACTIVE_ACTIVE"}
+NF_FAIL = {1: "BLOCK", 2: "PASS"}
 
 ALLOWED_SELECT = {
     AllowedEntity.kVmByCategoryUuid: ("VM", "CATEGORY_EXT_ID"),
@@ -166,6 +172,20 @@ def _uuid_list(values):
   return out
 
 
+def _camel_upper(raw, default=""):
+  text = str(raw or "")
+  if text.startswith("k") and len(text) > 1 and text[1].isupper():
+    text = text[1:]
+  pieces = []
+  for idx, char in enumerate(text):
+    if idx and char.isupper() and (
+        text[idx - 1].islower() or
+        (idx + 1 < len(text) and text[idx + 1].islower())):
+      pieces.append("_")
+    pieces.append(char.upper())
+  return "".join(pieces) or default
+
+
 def _enum_name(enum_cls, value, default=""):
   if value is None or value == 0:
     return default
@@ -173,16 +193,43 @@ def _enum_name(enum_cls, value, default=""):
     raw = enum_cls.Name(int(value))
   except Exception:
     return default
-  if raw.startswith("k"):
-    raw = raw[1:]
-  pieces = []
-  for idx, char in enumerate(raw):
-    if idx and char.isupper() and (
-        raw[idx - 1].islower() or
-        (idx + 1 < len(raw) and raw[idx + 1].islower())):
-      pieces.append("_")
-    pieces.append(char.upper())
-  return "".join(pieces) or default
+  return _camel_upper(raw, default)
+
+
+def _enum_label(msg, *fields, default="unknown"):
+  for field in fields:
+    if msg is None or not hasattr(msg, field):
+      continue
+    value = getattr(msg, field)
+    if value in (None, "", 0):
+      continue
+    try:
+      enum_type = msg.DESCRIPTOR.fields_by_name[field].enum_type
+      if enum_type is not None:
+        raw = enum_type.values_by_number[int(value)].name
+        return _camel_upper(raw, default)
+    except Exception:
+      pass
+    text = str(value)
+    if text.isdigit():
+      continue
+    return _camel_upper(text, default)
+  return default
+
+
+def _nf_enum(value, mapping, default="unknown"):
+  if value in (None, ""):
+    return default
+  try:
+    number = int(value)
+    if number in mapping:
+      return mapping[number]
+  except (TypeError, ValueError):
+    pass
+  label = _camel_upper(value, default)
+  if label in mapping.values():
+    return label
+  return default if label == default else label
 
 
 def _has(msg, field):
@@ -227,9 +274,23 @@ def _get_manager(interfaces, *names):
   return None
 
 
+def _log_matching_managers(interfaces, needle):
+  names = []
+  for name in dir(interfaces):
+    if needle in name.lower() and not name.startswith("_"):
+      names.append(name)
+  LOG.info("FlowInterfaces matching %r: %s", needle, names or "<none>")
+
+
 def _project_fields(proto):
-  project_uuid = _uuid_str(getattr(proto, "project_uuid", None))
-  shared = bool(getattr(proto, "shared_with_all_projects", False))
+  project_uuid = _uuid_str(
+      getattr(proto, "project_uuid", None)
+      or getattr(proto, "project_id", None)
+      or getattr(proto, "projectExtId", None)
+      or getattr(proto, "project_ext_id", None))
+  shared = bool(
+      getattr(proto, "shared_with_all_projects", False)
+      or getattr(proto, "sharedWithAllProjects", False))
   data = {
       "shared_with_all_projects": shared,
       "sharedWithAllProjects": shared,
@@ -239,6 +300,37 @@ def _project_fields(proto):
     data["projectExtId"] = project_uuid
     data["project"] = {"ext_id": project_uuid}
   return data
+
+
+def _row_project_id(row):
+  if not isinstance(row, dict):
+    return None
+  for name in ("project_uuid", "project_id", "project_reference"):
+    uid = _uuid_str(row.get(name))
+    if uid:
+      return uid
+  project = row.get("project")
+  if isinstance(project, dict):
+    return _uuid_str(project.get("ext_id") or project.get("uuid") or project.get("id"))
+  return _uuid_str(project)
+
+
+def _project_blob(entity):
+  if not isinstance(entity, dict):
+    return None
+  blob = entity.get("project")
+  if isinstance(blob, dict) and blob.get("ext_id"):
+    data = dict(blob)
+    uid = data["ext_id"]
+    if not data.get("name"):
+      name = entity.get("project_name")
+      if name:
+        data["name"] = name
+    return data
+  uid = _uuid_str(entity.get("project_ext_id") or entity.get("projectExtId"))
+  if uid:
+    return _project_ref(uid, entity.get("project_name") or "")
+  return None
 
 
 def _cidr_from_subnet(subnet_msg):
@@ -319,6 +411,9 @@ def convert_address_group(item):
       "ipv4_addresses": ipv4_addresses,
       "ipv6_addresses": ipv6_addresses,
       "ip_ranges": ip_ranges,
+      "fqdns": [str(fqdn) for fqdn in (
+          getattr(proto, "fqdn_addresses", None)
+          or getattr(proto, "fqdns", None) or [])],
   }
   data.update(_project_fields(proto))
   return data
@@ -344,6 +439,34 @@ def _icmp_row(icmp_type=None, icmp_code=None, all_allowed=False):
   if all_allowed:
     row["is_all_allowed"] = True
   return row
+
+
+def _all_ports_spec_fields(action="DENY_ALL"):
+  """neo4j parse_rule isolation / allow-all / INTRA_GROUP with no services."""
+  return {
+      "is_all_protocol_allowed": True,
+      "tcp_services": [_port_row(0, 65535, True)],
+      "udp_services": [_port_row(0, 65535, True)],
+      "icmp_services": [_icmp_row(all_allowed=True)],
+      "icmp_v6_services": [_icmp_row(all_allowed=True)],
+      "secured_group_action": action,
+  }
+
+
+def _all_ports_service_detail(action="DENY_ALL"):
+  return {
+      "name": "ALL",
+      "is_all_protocol_allowed": True,
+      "tcpPort": ["0-65535"],
+      "udpPort": ["0-65535"],
+      "icmpTypes": ["any:any"],
+      "icmpv6Types": ["any:any"],
+      "tcp_services": [_port_row(0, 65535, True)],
+      "udp_services": [_port_row(0, 65535, True)],
+      "icmp_services": [_icmp_row(all_allowed=True)],
+      "icmp_v6_services": [_icmp_row(all_allowed=True)],
+      "secured_group_action": [action],
+  }
 
 
 def _service_lists_from_service_list(service_list):
@@ -435,18 +558,54 @@ def convert_service_group(item):
 def _convert_allowed_entity(entity):
   select_type = getattr(entity, "select_type_enum", None)
   entity_type, select_by = ALLOWED_SELECT.get(select_type, ("UNKNOWN", "EXT_ID"))
+  raw_refs = list(getattr(entity, "reference_uuids", []) or [])
+  uuids = []
+  names = []
+  for item in raw_refs:
+    uid = _uuid_str(item)
+    if uid:
+      uuids.append(uid)
+    else:
+      text = str(item).strip() if item is not None else ""
+      if text:
+        names.append(text)
+  for attr in ("reference_names", "names", "name_list"):
+    extra = getattr(entity, attr, None)
+    if extra:
+      names.extend(str(item).strip() for item in extra if str(item).strip())
   row = {
       "type": entity_type,
       "select_by": select_by,
-      "reference_ext_ids": _uuid_list(getattr(entity, "reference_uuids", [])),
+      "reference_ext_ids": uuids,
       "kube_entities": [str(item) for item in (getattr(entity, "kube_entities", []) or [])],
       "fqdns": [str(item) for item in (getattr(entity, "fqdn_addresses", []) or [])],
   }
-  if _has(entity, "regex_match_entity"):
-    regex = entity.regex_match_entity
-    row["reference_string"] = getattr(regex, "reference_string", "") or ""
-    row["match_criteria"] = REGEX_MATCH.get(
-        getattr(regex, "match_type", None), "EQUALS")
+  if names:
+    row["reference_names"] = names
+  regex = getattr(entity, "regex_match_entity", None)
+  pattern = ""
+  criteria = ""
+  if regex is not None:
+    pattern = (
+        getattr(regex, "reference_string", None)
+        or getattr(regex, "regex_string", None)
+        or getattr(regex, "pattern", None)
+        or "")
+    match_type = getattr(regex, "match_type", None)
+    criteria = REGEX_MATCH.get(match_type, "")
+    if not criteria:
+      try:
+        criteria = REGEX_MATCH.get(int(match_type), "")
+      except Exception:
+        criteria = str(getattr(regex, "match_criteria", "") or "")
+  if not pattern:
+    pattern = str(getattr(entity, "reference_string", "") or "")
+  if pattern:
+    row["reference_string"] = str(pattern)
+    row["match_criteria"] = str(criteria or "EQUALS")
+  elif select_by == "REGEX":
+    row["reference_string"] = ""
+    row["match_criteria"] = str(criteria or "EQUALS")
   if _has(entity, "ip_address_group"):
     ipv4_addresses, ip_ranges, ipv6_addresses, ipv4_ranges = _ip_group_to_v4(
         entity.ip_address_group)
@@ -517,6 +676,10 @@ def _services_to_spec(services):
     protocol = getattr(service, "protocol", 0)
     if protocol in (1,):
       spec["is_all_protocol_allowed"] = True
+      spec["tcp_services"].append(_port_row(0, 65535, True))
+      spec["udp_services"].append(_port_row(0, 65535, True))
+      spec["icmp_services"].append(_icmp_row(all_allowed=True))
+      spec["icmp_v6_services"].append(_icmp_row(all_allowed=True))
       continue
     port_ranges = list(getattr(service, "port_range_list", []) or [])
     if protocol == 3:
@@ -543,8 +706,20 @@ def _endpoint_to_side(endpoint, side):
   if endpoint is None:
     return spec
   allow_type = getattr(endpoint, "allow_type", 0)
-  if allow_type == 1:
+  allow_name = ""
+  try:
+    allow_name = str(endpoint.AllowType.Name(allow_type) or "")
+  except Exception:
+    allow_name = str(allow_type)
+  # Integer 1 is the first named proto value (often address-group), not
+  # kAllowAll. Only the enum name is allow-any; that peer has no AG/EG/cat.
+  if allow_name in ("kAllowAll", "kALL", "ALL", "kAllowAny"):
     spec["should_allow_any_src" if side == "src" else "should_allow_any_dst"] = True
+    spec["src_allow_spec" if side == "src" else "dest_allow_spec"] = "ALL"
+    return spec
+  if allow_name in ("kAllowNone", "kNONE", "NONE"):
+    spec["src_allow_spec" if side == "src" else "dest_allow_spec"] = "NONE"
+    return spec
   ag_uuid = _uuid_str(getattr(endpoint, "address_group_uuid", None))
   if ag_uuid:
     spec["%s_address_group_references" % side] = [ag_uuid]
@@ -592,6 +767,15 @@ def _base_rule(rule_info, rule_type, spec):
   }
 
 
+def _set_ip_version(msg, spec):
+  ip_version = IP_VERSION.get(getattr(msg, "rule_ip_version", 0) or 0)
+  if not ip_version:
+    ip_version = IP_VERSION.get(getattr(msg, "ip_version", 0) or 0)
+  if ip_version:
+    spec["ip_version"] = ip_version
+  return spec
+
+
 def _convert_application_rule(app_rule, fallback_type="APPLICATION"):
   rule_info = app_rule.rule_info if _has(app_rule, "rule_info") else None
   spec = {}
@@ -606,6 +790,7 @@ def _convert_application_rule(app_rule, fallback_type="APPLICATION"):
   nf_uuid = _uuid_str(getattr(app_rule, "network_function_uuid", None))
   if nf_uuid:
     spec["network_function_reference"] = nf_uuid
+  _set_ip_version(app_rule, spec)
   return _base_rule(rule_info, fallback_type, spec)
 
 
@@ -616,14 +801,22 @@ def _convert_flex_rule(flex_rule):
       "action": FLEX_ACTION.get(getattr(flex_rule, "action", 0), "ALLOW"),
       "priority": getattr(flex_rule, "rule_priority", 0) or 0,
   }
-  ip_version = IP_VERSION.get(getattr(flex_rule, "rule_ip_version", 0))
-  if ip_version:
-    spec["ip_version"] = ip_version
+  _set_ip_version(flex_rule, spec)
   spec.update(_endpoint_to_side(
       flex_rule.src_endpoint if _has(flex_rule, "src_endpoint") else None, "src"))
   spec.update(_endpoint_to_side(
       flex_rule.dest_endpoint if _has(flex_rule, "dest_endpoint") else None, "dest"))
+  if _has(flex_rule, "should_allow_any_src") and getattr(
+      flex_rule, "should_allow_any_src", False):
+    spec["should_allow_any_src"] = True
+  if _has(flex_rule, "should_allow_any_dst") and getattr(
+      flex_rule, "should_allow_any_dst", False):
+    spec["should_allow_any_dst"] = True
   applied = _uuid_list(getattr(flex_rule, "applied_to_entity_group_uuid_list", []))
+  if not applied:
+    one = _uuid_str(getattr(flex_rule, "applied_to_entity_group_uuid", None))
+    if one:
+      applied = [one]
   if applied:
     spec["applied_to_entity_group_references"] = applied
   spec.update(_services_to_spec(getattr(flex_rule, "services", [])))
@@ -654,6 +847,7 @@ def _convert_two_env_rule(iso_rule):
       "second_isolation_group": _uuid_list(
           getattr(second, "category_uuid_list", []) if second else []),
   }
+  spec.update(_all_ports_spec_fields("DENY_ALL"))
   return _base_rule(rule_info, "TWO_ENV_ISOLATION", spec)
 
 
@@ -673,6 +867,7 @@ def _convert_multi_env_rule(iso_rule):
         row["group_entity_group_reference"] = eg_list[0]
       groups.append(row)
   spec = {"spec": {"isolation_groups": groups}}
+  spec.update(_all_ports_spec_fields("DENY_ALL"))
   return _base_rule(rule_info, "MULTI_ENV_ISOLATION", spec)
 
 
@@ -871,7 +1066,7 @@ _IDF_LOCKS = {}
 _IDF_GUARD = threading.Lock()
 
 
-def _idfcli_one(entity_type, timeout=90):
+def _idfcli_one(entity_type, timeout=180):
   with _IDF_GUARD:
     lock = _IDF_LOCKS.setdefault(entity_type, threading.Lock())
   with lock:
@@ -1115,6 +1310,20 @@ def _all_vlan_vpc():
   }
 
 
+def _collect_ips(*groups):
+  """Merge IP field lists from IDF, preserving order and dropping empties."""
+  out = []
+  seen = set()
+  for group in groups:
+    for ip in _as_list(group):
+      text = str(ip).strip()
+      if not text or text in seen:
+        continue
+      seen.add(text)
+      out.append(text)
+  return out
+
+
 def _learned_ips(ips):
   ipv4 = []
   ipv6 = []
@@ -1129,7 +1338,26 @@ def _learned_ips(ips):
   return ipv4, ipv6
 
 
-def _nic_payload(ext_id, mac, subnet_id, ips):
+def _project_ref(ext_id, name=""):
+  uid = _uuid_str(ext_id)
+  if not uid:
+    return None
+  data = {"ext_id": uid}
+  if name:
+    data["name"] = str(name)
+  return data
+
+
+def _apply_project(entity, ext_id, name=""):
+  blob = _project_ref(ext_id, name)
+  if not blob or not isinstance(entity, dict):
+    return
+  entity["project"] = blob
+  entity["project_ext_id"] = blob["ext_id"]
+  entity["projectExtId"] = blob["ext_id"]
+
+
+def _nic_payload(ext_id, mac, subnet_id, ips, project=None):
   ipv4, ipv6 = _learned_ips(ips)
   network = {
       "subnet": {"ext_id": subnet_id} if subnet_id else None,
@@ -1138,11 +1366,16 @@ def _nic_payload(ext_id, mac, subnet_id, ips):
     network["ipv4_info"] = {"learned_ip_addresses": ipv4}
   if ipv6:
     network["ipv6_info"] = {"learned_ipv6_addresses": ipv6}
-  return {
+  if project:
+    network["project"] = project
+  payload = {
       "ext_id": ext_id or "",
       "nic_backing_info": {"mac_address": mac or ""},
       "nic_network_info": network,
   }
+  if project:
+    payload["project"] = project
+  return payload
 
 
 def _map_vm(row):
@@ -1155,15 +1388,21 @@ def _map_vm(row):
     power = "OFF"
   host_id = _uuid_str(_first_attr(
       row, "node", "host_uuid", "node_uuid", "host"))
-  project_id = _uuid_str(_first_attr(row, "project_uuid", "project_reference", "project"))
+  project_id = _row_project_id(row)
   nics = []
-  ips = _as_list(_first_attr(row, "ip_addresses", "ipv4_addresses", "vm_ipv4_addresses", default=[]))
+  ips = _collect_ips(
+      row.get("ip_addresses"),
+      row.get("ipv4_addresses"),
+      row.get("vm_ipv4_addresses"),
+      row.get("ipv6_addresses"),
+      row.get("vm_ipv6_addresses"))
   subnet_id = _uuid_str(_first_attr(row, "subnet_uuid", "virtual_network_uuid"))
   mac = _first_attr(row, "mac_address", "mac")
   nic_ids = _as_list(_first_attr(row, "virtual_nic_uuids", "nic_uuid", default=[]))
   if ips or subnet_id:
     nics.append(_nic_payload(
-        _uuid_str(nic_ids[0]) if nic_ids else "", mac, subnet_id, ips))
+        _uuid_str(nic_ids[0]) if nic_ids else "", mac, subnet_id, ips,
+        project=_project_ref(project_id)))
   data = {
       "ext_id": ext_id,
       "name": name,
@@ -1175,19 +1414,25 @@ def _map_vm(row):
   if host_id:
     data["host"] = {"ext_id": host_id}
   if project_id:
-    data["project"] = {"ext_id": project_id}
+    _apply_project(data, project_id)
   return data
 
 
 def _map_virtual_nic(row):
+  project_id = _row_project_id(row)
   return {
       "ext_id": _uuid_str(_first_attr(row, "ext_id", "uuid", "id")) or "",
       "vm": _uuid_str(_first_attr(row, "vm", "vm_uuid")),
       "subnet_id": _uuid_str(_first_attr(
           row, "virtual_network", "subnet_uuid", "network_uuid")),
       "mac": _first_attr(row, "mac_address", "mac") or "",
-      "ips": _as_list(_first_attr(
-          row, "ipv4_addresses", "assigned_ipv4_addresses", default=[])),
+      "ips": _collect_ips(
+          row.get("ipv4_addresses"),
+          row.get("assigned_ipv4_addresses"),
+          row.get("ipv6_addresses"),
+          row.get("assigned_ipv6_addresses"),
+          row.get("ip_addresses")),
+      "project": _project_ref(project_id),
   }
 
 
@@ -1198,14 +1443,22 @@ def _attach_virtual_nics(vms, nic_rows=None, nic_errors=None):
     LOG.warning("virtual_nic: %s", err)
   by_vm = {}
   with_subnet = 0
+  with_ipv4 = 0
+  with_ipv6 = 0
   for nic in nic_rows:
     vm_id = nic.get("vm")
     if not vm_id:
       continue
     payload = _nic_payload(
-        nic.get("ext_id"), nic.get("mac"), nic.get("subnet_id"), nic.get("ips"))
-    if payload["nic_network_info"].get("subnet"):
+        nic.get("ext_id"), nic.get("mac"), nic.get("subnet_id"),
+        nic.get("ips"), project=nic.get("project"))
+    network = payload["nic_network_info"]
+    if network.get("subnet"):
       with_subnet += 1
+    if network.get("ipv4_info"):
+      with_ipv4 += 1
+    if network.get("ipv6_info"):
+      with_ipv6 += 1
     by_vm.setdefault(vm_id, []).append(payload)
   attached = 0
   for vm in vms:
@@ -1213,9 +1466,17 @@ def _attach_virtual_nics(vms, nic_rows=None, nic_errors=None):
     if nics:
       vm["nics"] = nics
       attached += 1
+      blob = _project_blob(vm)
+      if blob:
+        for nic in nics:
+          if not nic.get("project"):
+            _apply_project(nic, blob["ext_id"], blob.get("name") or "")
+            nic.setdefault("nic_network_info", {})["project"] = dict(
+                nic.get("project") or blob)
   LOG.info(
-      "DUMP virtual_nic mapped=%s vms_attached=%s nics_with_subnet=%s",
-      len(nic_rows), attached, with_subnet)
+      "DUMP virtual_nic mapped=%s vms_attached=%s nics_with_subnet=%s "
+      "nics_with_ipv4=%s nics_with_ipv6=%s",
+      len(nic_rows), attached, with_subnet, with_ipv4, with_ipv6)
   return vms
 
 
@@ -1225,31 +1486,36 @@ def _map_subnet(row):
       row, "overlay_network_uuid", "vpc_uuid", "vpc_reference"))
   vlan_id = _first_attr(row, "vlan_id", "vlan")
   cats = _category_ids_from_row(row)
-  project_id = _uuid_str(_first_attr(row, "project_uuid", "project"))
+  project_id = _row_project_id(row)
+  advanced = _as_bool(_first_attr(
+      row, "is_advanced_networking", "advanced_networking",
+      "advance_vlan", "is_advanced"), False)
   subnet_type = _subnet_type_name(
       _first_attr(row, "subnet_type", "type"), vpc_ref, vlan_id)
-  if not vpc_ref:
-    vpc_ref = ALL_VLAN_VPC_UUID
+  if not advanced:
     subnet_type = "VLAN"
+    if not vpc_ref:
+      vpc_ref = ALL_VLAN_VPC_UUID
+  elif not vpc_ref and subnet_type == "VLAN":
+    vpc_ref = ALL_VLAN_VPC_UUID
   data = {
       "ext_id": ext_id,
       "name": _first_attr(row, "name", "subnet_name") or "",
       "subnet_type": subnet_type,
       "vpc_reference": vpc_ref,
       "vlan_id": vlan_id,
-      "is_advanced_networking": _as_bool(_first_attr(
-          row, "is_advanced_networking", "advanced_networking"), False),
+      "is_advanced_networking": advanced,
       "metadata": {"category_ids": cats},
   }
   if project_id:
-    data["project"] = {"ext_id": project_id}
+    _apply_project(data, project_id)
   return data
 
 
 def _map_vpc(row):
   ext_id = _uuid_str(_first_attr(row, "ext_id", "uuid", "id")) or ""
   cats = _category_ids_from_row(row)
-  project_id = _uuid_str(_first_attr(row, "project_uuid", "project"))
+  project_id = _row_project_id(row)
   data = {
       "ext_id": ext_id,
       "name": _first_attr(row, "name", "vpc_name") or "",
@@ -1259,7 +1525,7 @@ def _map_vpc(row):
       "external_subnets": [],
   }
   if project_id:
-    data["project"] = {"ext_id": project_id}
+    _apply_project(data, project_id)
   return data
 
 
@@ -1286,10 +1552,18 @@ def _map_cluster(row):
 
 
 def _map_project(row):
-  return {
-      "ext_id": _uuid_str(_first_attr(row, "ext_id", "uuid", "id")) or "",
+  ext_id = _uuid_str(_first_attr(row, "ext_id", "uuid", "id")) or ""
+  vm_ids = _uuid_list(_as_list(_first_attr(
+      row, "vm_uuids", "vm_uuid_list", "virtual_machine_uuids",
+      "entity_uuids", "resource_uuids", default=[])))
+  data = {
+      "ext_id": ext_id,
       "name": _first_attr(row, "name", "project_name") or "",
+      "vm_ext_ids": vm_ids,
   }
+  if ext_id:
+    _apply_project(data, ext_id, data.get("name") or "")
+  return data
 
 
 def _map_category(row):
@@ -1322,14 +1596,173 @@ def _map_category(row):
   }
 
 
+def _int_attr(row, *names, default=0):
+  value = _first_attr(row, *names, default=default)
+  try:
+    return int(value)
+  except (TypeError, ValueError):
+    return default
+
+
 def _map_nf(row):
-  return {
+  ingress = _as_list(_first_attr(
+      row, "vnic_pair_list.ingress_vnic_uuid", "ingress_vnic_uuid",
+      "ingress_nic_reference", default=[]))
+  egress = _as_list(_first_attr(
+      row, "vnic_pair_list.egress_vnic_uuid", "egress_vnic_uuid",
+      "egress_nic_reference", default=[]))
+  vm_ids = _as_list(_first_attr(
+      row, "vnic_pair_list.vm_uuid", "vm_uuid", "vm_reference", default=[]))
+  ha_states = _as_list(_first_attr(
+      row, "vnic_pair_list.ha_state", "high_availability_state", default=[]))
+  healths = _as_list(_first_attr(
+      row, "vnic_pair_list.datapath_health_status",
+      "data_plane_health_status", default=[]))
+  pairs = []
+  count = max(len(ingress), len(egress), len(vm_ids), 0)
+  for idx in range(count):
+    pairs.append({
+        "vm_reference": _uuid_str(vm_ids[idx] if idx < len(vm_ids) else None) or "",
+        "ingress_nic_reference": _uuid_str(
+            ingress[idx] if idx < len(ingress) else None) or "",
+        "egress_nic_reference": _uuid_str(
+            egress[idx] if idx < len(egress) else None) or "",
+        "high_availability_state": str(
+            ha_states[idx] if idx < len(ha_states) else ""),
+        "data_plane_health_status": str(
+            healths[idx] if idx < len(healths) else "UNKNOWN") or "UNKNOWN",
+    })
+  health = {
+      "interval_secs": _int_attr(
+          row, "datapath_health_check_config.interval_secs", "interval_secs",
+          default=5),
+      "timeout_secs": _int_attr(
+          row, "datapath_health_check_config.timeout_secs", "timeout_secs",
+          default=2),
+      "success_threshold": _int_attr(
+          row, "datapath_health_check_config.success_count",
+          "success_threshold", "success_count", default=3),
+      "failure_threshold": _int_attr(
+          row, "datapath_health_check_config.failure_count",
+          "failure_threshold", "failure_count", default=3),
+  }
+  data = {
       "ext_id": _uuid_str(_first_attr(row, "ext_id", "uuid", "id")) or "",
       "name": _first_attr(row, "name") or "",
-      "failure_handling": _first_attr(row, "failure_handling") or "unknown",
-      "traffic_forwarding_mode": _first_attr(row, "traffic_forwarding_mode") or "unknown",
-      "high_availability_mode": _first_attr(row, "high_availability_mode") or "unknown",
+      "description": _first_attr(row, "description") or "",
+      "failure_handling": _nf_enum(
+          _first_attr(row, "failure_handling", "fallback_mode"),
+          NF_FAIL),
+      "traffic_forwarding_mode": _nf_enum(
+          _first_attr(row, "traffic_forwarding_mode", "insertion_type",
+                      "traffic_mode"),
+          NF_TRAFFIC),
+      "high_availability_mode": _nf_enum(
+          _first_attr(row, "high_availability_mode", "ha_mode"),
+          NF_HA),
+      "nic_pairs": pairs,
+      "data_plane_health_check_config": health,
   }
+  project_id = _row_project_id(row)
+  if project_id:
+    _apply_project(data, project_id)
+  return data
+
+
+def _nf_pair_row(pair):
+  proto = _item_proto(pair)
+  ha_state = _enum_label(proto, "high_availability_state", "ha_state", default="")
+  health = _enum_label(
+      proto, "data_plane_health_status", "datapath_health_status",
+      default="UNKNOWN")
+  return {
+      "vm_reference": _uuid_str(getattr(proto, "vm_reference", None)
+                                or getattr(proto, "vm_uuid", None)) or "",
+      "ingress_nic_reference": _uuid_str(
+          getattr(proto, "ingress_nic_reference", None)
+          or getattr(proto, "ingress_vnic_uuid", None)) or "",
+      "egress_nic_reference": _uuid_str(
+          getattr(proto, "egress_nic_reference", None)
+          or getattr(proto, "egress_vnic_uuid", None)) or "",
+      "high_availability_state": ha_state,
+      "data_plane_health_status": health or "UNKNOWN",
+      "is_enabled": bool(getattr(proto, "is_enabled", True)),
+  }
+
+
+def _health_config(proto):
+  health = (
+      getattr(proto, "data_plane_health_check_config", None)
+      or getattr(proto, "datapath_health_check_config", None)
+      or getattr(proto, "health_check_config", None))
+  if health is None:
+    return {
+        "interval_secs": 5,
+        "timeout_secs": 2,
+        "success_threshold": 3,
+        "failure_threshold": 3,
+    }
+  success = (
+      getattr(health, "success_threshold", None)
+      or getattr(health, "success_count", None) or 3)
+  failure = (
+      getattr(health, "failure_threshold", None)
+      or getattr(health, "failure_count", None) or 3)
+  return {
+      "interval_secs": int(getattr(health, "interval_secs", 5) or 5),
+      "timeout_secs": int(getattr(health, "timeout_secs", 2) or 2),
+      "success_threshold": int(success),
+      "failure_threshold": int(failure),
+  }
+
+
+def convert_network_function(item):
+  proto = _item_proto(item)
+  pairs = []
+  for pair in list(getattr(proto, "nic_pairs", None)
+                   or getattr(proto, "vnic_pair_list", None) or []):
+    pairs.append(_nf_pair_row(pair))
+  fail = _enum_label(proto, "failure_handling", "fallback_mode")
+  if fail == "unknown":
+    fail = _nf_enum(getattr(proto, "fallback_mode", None), NF_FAIL)
+  traffic = _enum_label(
+      proto, "traffic_forwarding_mode", "insertion_type", "traffic_mode")
+  if traffic == "unknown":
+    traffic = _nf_enum(getattr(proto, "insertion_type", None), NF_TRAFFIC)
+  ha = _enum_label(proto, "high_availability_mode", "ha_mode")
+  if ha == "unknown":
+    ha = _nf_enum(getattr(proto, "ha_mode", None), NF_HA)
+  data = {
+      "ext_id": _item_uuid(item, proto),
+      "name": getattr(proto, "name", "") or "",
+      "description": getattr(proto, "description", "") or "",
+      "failure_handling": fail,
+      "traffic_forwarding_mode": traffic,
+      "high_availability_mode": ha,
+      "nic_pairs": pairs,
+      "data_plane_health_check_config": _health_config(proto),
+  }
+  data.update(_project_fields(proto))
+  return data
+
+
+def convert_project(item):
+  proto = _item_proto(item)
+  vm_ids = _uuid_list(
+      getattr(proto, "vm_uuid_list", None)
+      or getattr(proto, "vm_uuids", None)
+      or getattr(proto, "virtual_machine_uuids", None)
+      or [])
+  data = {
+      "ext_id": _item_uuid(item, proto),
+      "name": getattr(proto, "name", "") or "",
+      "description": getattr(proto, "description", "") or "",
+      "vm_ext_ids": vm_ids,
+  }
+  data.update(_project_fields(proto))
+  if not data.get("project_ext_id") and data.get("ext_id"):
+    _apply_project(data, data["ext_id"], data.get("name") or "")
+  return data
 
 
 def _idf_mapped(entity_types, mapper):
@@ -1404,11 +1837,13 @@ def fetch_vpcs(_interfaces):
 
 
 def _map_entity_capability(row):
+  # Join key is kind_id (the VM/subnet/VPC UUID). Capability uuid is a
+  # different object and must not be treated as the entity id.
   ids = []
-  for name in ("kind_id", "uuid", "owner_reference", "ext_id"):
-    uid = _uuid_str(_first_attr(row, name))
-    if uid and uid not in ids:
-      ids.append(uid)
+  uid = _uuid_str(_first_attr(row, "kind_id"))
+  if uid:
+    ids.append(uid)
+  cats = _category_ids_from_row(row)
   mapping = []
   for item in _as_list(_first_attr(
       row, "categories_mapping_list", "category_mapping_list", default=[])):
@@ -1418,12 +1853,17 @@ def _map_entity_capability(row):
       text = ("%s:%s" % (key, value)).strip(":") if key or value else ""
     else:
       text = str(item).strip()
+    mapped = _uuid_str(text) if text else None
+    if mapped:
+      if mapped not in cats:
+        cats.append(mapped)
+      continue
     if text and text not in mapping:
       mapping.append(text)
   return {
       "kind": str(_first_attr(row, "kind") or "").lower(),
       "ids": ids,
-      "category_ids": _category_ids_from_row(row),
+      "category_ids": cats,
       "category_names": mapping,
   }
 
@@ -1653,6 +2093,384 @@ def _enrich_nics_and_vlan_vpc(payload):
       with_vpc_subnet_cats, len(vpcs))
 
 
+def _copy_project(target, blob):
+  if not blob or not blob.get("ext_id") or not isinstance(target, dict):
+    return
+  _apply_project(target, blob["ext_id"], blob.get("name") or "")
+
+
+def _note_project(store, entity):
+  blob = _project_blob(entity)
+  if not blob or not blob.get("ext_id"):
+    return
+  uid = blob["ext_id"]
+  name = blob.get("name") or ""
+  prev = store.get(uid) or ""
+  if name and (not prev or prev == "Unknown"):
+    store[uid] = name
+  else:
+    store.setdefault(uid, name)
+
+
+def _enrich_projects(payload):
+  """Copy VM/subnet/VPC project onto each NIC for neo4j extract_project_info.
+
+  IDF `project` is often empty on PC. Harvest project UUIDs from dumped
+  entities so projects.json is not []. NICs inherit the VM project.
+  """
+  projects = list(payload.get("projects") or [])
+  by_id = {proj.get("ext_id"): proj for proj in projects if proj.get("ext_id")}
+  name_by_id = {
+      proj.get("ext_id"): proj.get("name") or ""
+      for proj in projects if proj.get("ext_id")}
+  vms = payload.get("vms") or []
+  vm_by_id = {vm.get("ext_id"): vm for vm in vms if vm.get("ext_id")}
+  subnet_by_id = {
+      subnet.get("ext_id"): subnet
+      for subnet in (payload.get("subnets") or []) if subnet.get("ext_id")}
+  vpc_by_id = {
+      vpc.get("ext_id"): vpc
+      for vpc in (payload.get("vpcs") or []) if vpc.get("ext_id")}
+
+  assigned = 0
+  for proj in projects:
+    uid = proj.get("ext_id")
+    name = proj.get("name") or ""
+    if uid and name:
+      name_by_id[uid] = name
+    for vm_id in proj.get("vm_ext_ids") or []:
+      vm = vm_by_id.get(vm_id)
+      if vm and not _project_blob(vm):
+        _apply_project(vm, uid, name)
+        assigned += 1
+
+  inherited = 0
+  nic_count = 0
+  for vm in vms:
+    blob = _project_blob(vm)
+    if not blob:
+      for nic in vm.get("nics") or []:
+        network = nic.get("nic_network_info") or {}
+        subnet_obj = network.get("subnet") or {}
+        subnet_id = subnet_obj.get("ext_id") if isinstance(subnet_obj, dict) else ""
+        subnet = subnet_by_id.get(subnet_id) or {}
+        blob = _project_blob(subnet)
+        if not blob:
+          vpc_ref = ""
+          if isinstance(network.get("vpc"), dict):
+            vpc_ref = network["vpc"].get("ext_id") or ""
+          blob = _project_blob(
+              vpc_by_id.get(vpc_ref or subnet.get("vpc_reference") or "") or {})
+        if blob:
+          if not blob.get("name"):
+            blob["name"] = name_by_id.get(blob["ext_id"], "")
+          _copy_project(vm, blob)
+          inherited += 1
+          break
+    blob = _project_blob(vm)
+    if not blob:
+      continue
+    if not blob.get("name"):
+      blob["name"] = name_by_id.get(blob["ext_id"], "")
+      vm["project"] = blob
+    for nic in vm.get("nics") or []:
+      _copy_project(nic, blob)
+      network = nic.setdefault("nic_network_info", {})
+      network["project"] = dict(blob)
+      nic_count += 1
+
+  harvested = {}
+  for key in ("projects", "address_groups", "service_groups", "entity_groups",
+              "subnets", "vpcs", "vms", "network_functions"):
+    for entity in payload.get(key) or []:
+      _note_project(harvested, entity)
+      if key == "vms":
+        for nic in entity.get("nics") or []:
+          _note_project(harvested, nic)
+          _note_project(harvested, (nic.get("nic_network_info") or {}))
+  for policy in payload.get("policies") or []:
+    _note_project(harvested, policy.get("data") or policy)
+
+  added = 0
+  for uid, name in harvested.items():
+    if uid in by_id:
+      if name and not by_id[uid].get("name"):
+        by_id[uid]["name"] = name
+      continue
+    stub = {
+        "ext_id": uid,
+        "name": name or ("default" if uid == DEFAULT_PROJECT_UUID else "Unknown"),
+        "vm_ext_ids": [],
+    }
+    _apply_project(stub, uid, stub["name"])
+    projects.append(stub)
+    by_id[uid] = stub
+    added += 1
+  payload["projects"] = projects
+  LOG.info(
+      "DUMP project enrich vm_from_project=%s vm_inherited=%s nics=%s "
+      "harvested=%s added=%s projects=%s",
+      assigned, inherited, nic_count, len(harvested), added, len(projects))
+
+
+def _sg_port_strings(services, kind):
+  out = []
+  for ports in services or []:
+    if not isinstance(ports, dict):
+      continue
+    if ports.get("is_all_allowed"):
+      out.append("0-65535" if kind in ("tcp", "udp") else "any:any")
+      continue
+    if kind in ("tcp", "udp"):
+      start = ports.get("start_port", 0)
+      end = ports.get("end_port", start)
+      out.append(str(start) if start == end else "%s-%s" % (start, end))
+    else:
+      out.append("%s:%s" % (ports.get("type", 0), ports.get("code", 0)))
+  return out
+
+
+def _sg_detail(sg):
+  return {
+      "ext_id": sg.get("ext_id"),
+      "name": sg.get("name") or "",
+      "tcp_services": sg.get("tcp_services") or [],
+      "udp_services": sg.get("udp_services") or [],
+      "icmp_services": sg.get("icmp_services") or [],
+      "icmp_v6_services": sg.get("icmp_v6_services") or [],
+      "tcpPort": _sg_port_strings(sg.get("tcp_services"), "tcp"),
+      "udpPort": _sg_port_strings(sg.get("udp_services"), "udp"),
+      "icmpTypes": _sg_port_strings(sg.get("icmp_services"), "icmp"),
+      "icmpv6Types": _sg_port_strings(sg.get("icmp_v6_services"), "icmpv6"),
+      "project": sg.get("project"),
+      "project_ext_id": sg.get("project_ext_id") or sg.get("projectExtId"),
+      "projectExtId": sg.get("projectExtId") or sg.get("project_ext_id"),
+      "shared_with_all_projects": bool(sg.get("shared_with_all_projects")),
+  }
+
+
+def _policy_nf_uuids(payload):
+  uuids = []
+  seen = set()
+  for policy in payload.get("policies") or []:
+    data = policy.get("data") or policy
+    for rule in data.get("rules") or []:
+      spec = rule.get("spec") or {}
+      uid = _uuid_str(spec.get("network_function_reference"))
+      if uid and uid not in seen:
+        seen.add(uid)
+        uuids.append(uid)
+  return uuids
+
+
+def _synthetic_all_ports_action(rule):
+  """Match neo4j parse_rule all-port ServiceGroup cases.
+
+  Isolation / TWO_ENV / MULTI_ENV always DENY_ALL on 0-65535.
+  is_all_protocol_allowed is allow-all protocols.
+  INTRA_GROUP with an action and no services is all ports.
+  src/dest_allow_spec NONE is deny-all ports.
+  SG refs overwrite all-port strings later, so return None when SG refs exist
+  except isolation (isolation has no SG refs).
+  """
+  rule_type = str(rule.get("type") or "")
+  spec = rule.get("spec") or {}
+  if rule_type in ("TWO_ENV_ISOLATION", "MULTI_ENV_ISOLATION"):
+    return "DENY_ALL"
+  has_sg = bool(
+      spec.get("service_group_references")
+      or spec.get("secured_group_service_references"))
+  has_ports = bool(
+      spec.get("tcp_services") or spec.get("udp_services")
+      or spec.get("icmp_services") or spec.get("icmp_v6_services"))
+  if spec.get("src_allow_spec") == "NONE" or spec.get("dest_allow_spec") == "NONE":
+    return "DENY"
+  if spec.get("is_all_protocol_allowed") and not has_sg:
+    return "allow"
+  if spec.get("secured_group_action") and not has_sg and not has_ports:
+    return spec.get("secured_group_action")
+  return None
+
+
+def _expand_service_and_function_details(payload):
+  """Expand SG/NF UUID refs on rules the same way neo4j_db_insert.parse_rule does."""
+  sg_map = {
+      sg.get("ext_id"): sg
+      for sg in (payload.get("service_groups") or []) if sg.get("ext_id")}
+  nf_map = {}
+  for nf in payload.get("network_functions") or []:
+    if nf.get("ext_id"):
+      nf_map[nf["ext_id"]] = nf
+  for uid, wrapped in (payload.get("network_function_by_id") or {}).items():
+    detailed = (wrapped or {}).get("data") or wrapped or {}
+    if isinstance(detailed, dict) and detailed.get("ext_id"):
+      nf_map[detailed["ext_id"]] = detailed
+    elif isinstance(detailed, dict):
+      nf_map[uid] = detailed
+
+  sg_rules = 0
+  nf_rules = 0
+  missing_sg = 0
+  all_port_rules = 0
+  for policy in payload.get("policies") or []:
+    data = policy.get("data") or policy
+    for rule in data.get("rules") or []:
+      spec = rule.get("spec")
+      if not isinstance(spec, dict):
+        continue
+      refs = list(spec.get("service_group_references") or [])
+      if spec.get("secured_group_service_references"):
+        for uid in spec.get("secured_group_service_references") or []:
+          if uid not in refs:
+            refs.append(uid)
+      details = []
+      for uid in refs:
+        sg = sg_map.get(uid)
+        if sg:
+          details.append(_sg_detail(sg))
+        else:
+          missing_sg += 1
+          details.append({"ext_id": uid, "name": ""})
+      if details:
+        spec["service_group_details"] = details
+        sg_rules += 1
+      else:
+        action = _synthetic_all_ports_action(rule)
+        if action is not None:
+          spec.update(_all_ports_spec_fields(action))
+          spec["service_group_details"] = [_all_ports_service_detail(action)]
+          all_port_rules += 1
+      nf_uid = _uuid_str(spec.get("network_function_reference"))
+      if nf_uid:
+        nf = nf_map.get(nf_uid)
+        spec["network_function_details"] = dict(nf) if nf else {"ext_id": nf_uid}
+        nf_rules += 1
+  LOG.info(
+      "DUMP service details rules_with_sg=%s rules_with_all_ports=%s "
+      "rules_with_nf=%s missing_sg_refs=%s service_groups=%s "
+      "network_functions=%s",
+      sg_rules, all_port_rules, nf_rules, missing_sg, len(sg_map), len(nf_map))
+
+
+def _stringify_ips(values):
+  out = []
+  for item in _as_list(values):
+    if isinstance(item, dict):
+      text = str(item.get("value") or item.get("ip") or "").strip()
+    else:
+      text = str(getattr(item, "value", item) or "").strip()
+    if text and text not in out:
+      out.append(text)
+  return out
+
+
+def _add_fqdn_ips(mapping, fqdn, ips):
+  key = str(fqdn or "").strip()
+  if not key:
+    return
+  have = mapping.setdefault(key, [])
+  for ip in _stringify_ips(ips):
+    if ip not in have:
+      have.append(ip)
+
+
+def _fqdn_mapping_entry(fqdn, ips):
+  return "%s:[%s]" % (fqdn, ",".join(ips or []))
+
+
+def _nic_dump_ips(nic):
+  network = nic.get("nic_network_info") or {}
+  ipv4_info = network.get("ipv4_info") or {}
+  ipv4_config = network.get("ipv4_config") or {}
+  ipv6_info = network.get("ipv6_info") or {}
+  ipv6_config = network.get("ipv6_config") or {}
+  ips = []
+  for group in (
+      ipv4_info.get("learned_ip_addresses"),
+      ipv4_config.get("ip_address"),
+      ipv4_config.get("secondary_ip_address_list"),
+      ipv6_info.get("learned_ipv6_addresses"),
+      ipv6_config.get("ip_address"),
+      ipv6_config.get("secondary_ipv6_address_list")):
+    for ip in _stringify_ips(group):
+      if ip not in ips:
+        ips.append(ip)
+  return ips
+
+
+def _expand_fqdn_details(payload):
+  """Resolve EG FQDNs into subnet_list and match those IPs onto NICs.
+
+  neo4j_db_insert.create_entity_group_map puts resolved FQDN IPs on
+  eg_subnet_list and fqdn_mapping ("fqdn:[ip1,ip2]"). PolicyRuleEvaluator
+  then matches NIC learned_ips against that mapping.
+  """
+  fqdn_map = payload.get("fqdn_to_ip_map") or {}
+  ip_to_fqdns = {}
+  for fqdn, ips in fqdn_map.items():
+    for ip in ips or []:
+      ip_to_fqdns.setdefault(str(ip).strip(), []).append(fqdn)
+
+  eg_with_fqdn = 0
+  for eg in payload.get("entity_groups") or []:
+    subnet_list = []
+    fqdn_mapping = []
+    found = False
+    for cfg_name in ("allowed_config", "except_config"):
+      is_except = cfg_name == "except_config"
+      for entity in ((eg.get(cfg_name) or {}).get("entities") or []):
+        fqdns = [str(item) for item in (entity.get("fqdns") or []) if item]
+        if not fqdns:
+          continue
+        found = True
+        details = []
+        for fqdn in fqdns:
+          ips = list(fqdn_map.get(fqdn) or [])
+          entry = _fqdn_mapping_entry(fqdn, ips)
+          details.append({
+              "fqdn": fqdn,
+              "resolved_ips": ips,
+              "fqdn_mapping": entry,
+          })
+          if is_except:
+            continue
+          if entry not in fqdn_mapping:
+            fqdn_mapping.append(entry)
+          for ip in ips:
+            if ip not in subnet_list:
+              subnet_list.append(ip)
+        entity["fqdn_details"] = details
+        entity["resolved_ips"] = [
+            ip for detail in details for ip in (detail.get("resolved_ips") or [])]
+    if found:
+      eg["fqdn_mapping"] = fqdn_mapping
+      eg["subnet_list"] = subnet_list
+      eg_with_fqdn += 1
+
+  nics_with_fqdn = 0
+  for vm in payload.get("vms") or []:
+    for nic in vm.get("nics") or []:
+      matched = []
+      mapping = []
+      for ip in _nic_dump_ips(nic):
+        for fqdn in ip_to_fqdns.get(ip, []):
+          if fqdn in matched:
+            continue
+          matched.append(fqdn)
+          mapping.append(_fqdn_mapping_entry(fqdn, fqdn_map.get(fqdn) or []))
+      if not matched:
+        continue
+      network = nic.setdefault("nic_network_info", {})
+      network["fqdns"] = matched
+      network["fqdn_mapping"] = mapping
+      nic["fqdns"] = matched
+      nics_with_fqdn += 1
+  with_ips = sum(1 for ips in fqdn_map.values() if ips)
+  LOG.info(
+      "DUMP fqdn enrich egs=%s nics=%s fqdns=%s with_resolved_ips=%s",
+      eg_with_fqdn, nics_with_fqdn, len(fqdn_map), with_ips)
+
+
 def fetch_clusters(_interfaces):
   LOG.info("DUMP start clusters")
   rows, errors = _idf_mapped(("cluster",), _map_cluster)
@@ -1662,13 +2480,80 @@ def fetch_clusters(_interfaces):
   return rows
 
 
-def fetch_projects(_interfaces):
+def fetch_projects(interfaces):
   LOG.info("DUMP start projects")
-  rows, errors = _idf_mapped(("project",), _map_project)
-  for err in errors:
-    LOG.warning("projects fallback: %s", err)
-  LOG.info("DUMP done projects count=%s", len(rows))
+  manager = _get_manager(
+      interfaces, "project_manager", "projects_manager", "iam_project_manager")
+  if manager is None:
+    _log_matching_managers(interfaces, "project")
+  rows = []
+  if manager:
+    rows = _dump_manager("projects", manager, convert_project)
+  if not rows:
+    mapped, errors = _idf_mapped(
+        ("project", "projects", "iam_project", "xi_project", "abac_project"),
+        _map_project)
+    for err in errors:
+      LOG.warning("projects fallback: %s", err)
+    rows = mapped
+    LOG.info("DUMP done projects count=%s (idf)", len(rows))
   return rows
+
+
+def fetch_network_functions(interfaces):
+  LOG.info("DUMP start network_functions")
+  manager = _get_manager(
+      interfaces, "network_function_manager", "service_function_manager")
+  if manager is None:
+    _log_matching_managers(interfaces, "function")
+  rows = []
+  if manager:
+    rows = _dump_manager("network_functions", manager, convert_network_function)
+  if not rows:
+    mapped, errors = _idf_mapped(
+        ("atlas_network_function", "network_function", "flow_network_function"),
+        _map_nf)
+    for err in errors:
+      LOG.warning("network_functions fallback: %s", err)
+    rows = mapped
+    LOG.info("DUMP done network_functions count=%s (idf)", len(rows))
+  return rows
+
+
+def fetch_network_function_by_id(interfaces, nf_rows, extra_uuids=None):
+  manager = _get_manager(
+      interfaces, "network_function_manager", "service_function_manager")
+  by_id = {}
+  seen = set()
+  for nf in nf_rows or []:
+    ext_id = nf.get("ext_id")
+    if not ext_id:
+      continue
+    seen.add(ext_id)
+    detailed = dict(nf)
+    if manager:
+      item = _call_first(manager, ("get", "get_by_id", "lookup"), ext_id)
+      if item:
+        try:
+          detailed = convert_network_function(item)
+        except Exception as err:
+          LOG.debug("network_function get %s failed: %s", ext_id, err)
+    by_id[ext_id] = {"data": detailed}
+  for ext_id in extra_uuids or []:
+    if not ext_id or ext_id in seen:
+      continue
+    detailed = {"ext_id": ext_id}
+    if manager:
+      item = _call_first(manager, ("get", "get_by_id", "lookup"), ext_id)
+      if item:
+        try:
+          detailed = convert_network_function(item)
+        except Exception as err:
+          LOG.debug("network_function get %s failed: %s", ext_id, err)
+    by_id[ext_id] = {"data": detailed}
+    seen.add(ext_id)
+  LOG.info("DUMP done network_function_by_id count=%s", len(by_id))
+  return by_id
 
 
 def fetch_categories(_interfaces):
@@ -1693,26 +2578,6 @@ def fetch_categories(_interfaces):
   filled = sum(1 for row in rows if row.get("key") and row.get("value"))
   LOG.info("DUMP done categories count=%s key_value=%s", len(rows), filled)
   return rows
-
-
-def fetch_network_functions(_interfaces):
-  LOG.info("DUMP start network_functions")
-  rows, errors = _idf_mapped(
-      ("network_function", "flow_network_function"), _map_nf)
-  for err in errors:
-    LOG.warning("network_functions fallback: %s", err)
-  LOG.info("DUMP done network_functions count=%s", len(rows))
-  return rows
-
-
-def fetch_network_function_by_id(_interfaces, nf_rows):
-  by_id = {}
-  for nf in nf_rows or []:
-    ext_id = nf.get("ext_id")
-    if ext_id:
-      by_id[ext_id] = {"data": nf}
-  LOG.info("DUMP done network_function_by_id count=%s", len(by_id))
-  return by_id
 
 
 def fetch_unique_uuids():
@@ -1742,34 +2607,43 @@ def fetch_unique_uuids():
 
 
 def fetch_fqdn_map(interfaces):
+  """FQDN → resolved IPv4+IPv6, same as neo4j_db_insert.get_fqdn_to_ip_mapping.
+
+  IDF entity type is fns_fqdn_to_ip_info (resolved_ipv4_addresses +
+  resolved_ipv6_addresses). FlowInterfaces is merged on top so names
+  without IDF rows are still listed.
+  """
   LOG.info("DUMP start fqdn_to_ip_map")
   mapping = {}
-  manager = _get_manager(interfaces, "fqdn_resolution_manager")
+  raw, errors = _idfcli_entities(("fns_fqdn_to_ip_info",))
+  for err in errors:
+    LOG.warning("fqdn idf: %s", err)
+  for item in raw:
+    fqdn = _first_attr(item, "fqdn")
+    ips = list(_as_list(_first_attr(item, "resolved_ipv4_addresses", default=[])))
+    ips.extend(_as_list(_first_attr(item, "resolved_ipv6_addresses", default=[])))
+    _add_fqdn_ips(mapping, fqdn, ips)
+  manager = _get_manager(
+      interfaces, "fqdn_resolution_manager", "fqdn_manager")
   payload = _call_first(manager, [
       "iter_all", "get_all", "list", "get_fqdn_to_ip_mapping"])
   for item in _unwrap_list(payload) or _iter_manager(manager):
     proto = _item_proto(item)
     fqdn = getattr(proto, "fqdn", None) or getattr(item, "fqdn", None)
     ips = []
-    for attr in ("ip_list", "resolved_ips", "ipv4_addresses", "ip_addresses"):
-      values = getattr(proto, attr, None) or getattr(item, attr, None)
+    for attr in (
+        "resolved_ipv4_addresses", "resolved_ipv6_addresses",
+        "ip_list", "resolved_ips", "ipv4_addresses", "ip_addresses"):
+      values = getattr(proto, attr, None)
+      if values is None:
+        values = getattr(item, attr, None)
       if values:
-        ips.extend([str(ip) for ip in values])
-        break
-    if fqdn:
-      mapping[str(fqdn)] = ips
-  if not mapping:
-    raw, errors = _idfcli_entities(("fns_fqdn_to_ip_info",))
-    for err in errors:
-      LOG.warning("fqdn fallback: %s", err)
-    for item in raw:
-      fqdn = _first_attr(item, "fqdn")
-      ips = _as_list(_first_attr(
-          item, "resolved_ipv4_addresses", "resolved_ipv6_addresses",
-          default=[]))
-      if fqdn:
-        mapping[str(fqdn)] = [str(ip) for ip in ips]
-  LOG.info("DUMP done fqdn_to_ip_map count=%s", len(mapping))
+        ips.extend(_stringify_ips(values))
+    _add_fqdn_ips(mapping, fqdn, ips)
+  with_ips = sum(1 for ips in mapping.values() if ips)
+  LOG.info(
+      "DUMP done fqdn_to_ip_map count=%s with_resolved_ips=%s",
+      len(mapping), with_ips)
   return mapping
 
 
@@ -2203,6 +3077,30 @@ def _run_jobs_parallel(jobs, workers, timeout_secs, errors):
   return results
 
 
+def _merge_network_functions(payload):
+  rows = list(payload.get("network_functions") or [])
+  have = {nf.get("ext_id") for nf in rows if nf.get("ext_id")}
+  extra = 0
+  for uid, wrapped in (payload.get("network_function_by_id") or {}).items():
+    detailed = (wrapped or {}).get("data") or {}
+    ext_id = detailed.get("ext_id") or uid
+    if ext_id and ext_id not in have:
+      rows.append(detailed)
+      have.add(ext_id)
+      extra += 1
+  payload["network_functions"] = rows
+  if extra:
+    LOG.info("DUMP merged %s network_functions from by_id lookups", extra)
+
+
+def _post_fetch_enrich(payload):
+  _merge_network_functions(payload)
+  _enrich_nics_and_vlan_vpc(payload)
+  _enrich_projects(payload)
+  _expand_service_and_function_details(payload)
+  _expand_fqdn_details(payload)
+
+
 def main(argv):
   try:
     argv = FLAGS(argv)
@@ -2225,6 +3123,9 @@ def main(argv):
     LOG.info("Splitting existing dump %s (no live fetch)", FLAGS.from_json)
     with open(FLAGS.from_json, "r") as handle:
       payload = json.load(handle)
+    _enrich_projects(payload)
+    _expand_service_and_function_details(payload)
+    _expand_fqdn_details(payload)
     _write_outputs(payload, output_dir, combined_path, workers)
     LOG.info("Split complete under %s", output_dir)
     return 0
@@ -2310,8 +3211,9 @@ def main(argv):
     payload["vlan_unique_uuid"] = unique.get("vlan_unique_uuid", "")
     payload["global_unique_uuid"] = unique.get("global_unique_uuid", "")
     payload["network_function_by_id"] = fetch_network_function_by_id(
-        interfaces, payload.get("network_functions") or [])
-    _enrich_nics_and_vlan_vpc(payload)
+        interfaces, payload.get("network_functions") or [],
+        _policy_nf_uuids(payload))
+    _post_fetch_enrich(payload)
 
     skip_late = ("port_set_list", "port_set_get", "dump_errors")
     write_fut = None
@@ -2351,8 +3253,45 @@ def main(argv):
   LOG.info("  %-22s %s", "vlan_unique_uuid", payload.get("vlan_unique_uuid") or "<empty>")
   LOG.info("  %-22s %s", "global_unique_uuid", payload.get("global_unique_uuid") or "<empty>")
   LOG.info("  %-22s %s", "fqdn_to_ip_map", len(payload.get("fqdn_to_ip_map") or {}))
+  fqdn_map = payload.get("fqdn_to_ip_map") or {}
+  LOG.info(
+      "  %-22s %s", "fqdn_with_resolved_ips",
+      sum(1 for ips in fqdn_map.values() if ips))
+  nic_fqdn = 0
+  for vm in payload.get("vms") or []:
+    for nic in vm.get("nics") or []:
+      if nic.get("fqdns") or (nic.get("nic_network_info") or {}).get("fqdns"):
+        nic_fqdn += 1
+  LOG.info("  %-22s %s", "nics_with_fqdn", nic_fqdn)
+  eg_fqdn = sum(
+      1 for eg in (payload.get("entity_groups") or [])
+      if eg.get("fqdn_mapping") or eg.get("subnet_list"))
+  LOG.info("  %-22s %s", "egs_with_fqdn_subnet", eg_fqdn)
   LOG.info("  %-22s %s", "network_function_by_id",
            len(payload.get("network_function_by_id") or {}))
+  vms = payload.get("vms") or []
+  vm_proj = sum(1 for vm in vms if _project_blob(vm))
+  nic_proj = 0
+  nic_total = 0
+  for vm in vms:
+    for nic in vm.get("nics") or []:
+      nic_total += 1
+      if nic.get("project") or (nic.get("nic_network_info") or {}).get("project"):
+        nic_proj += 1
+  sg_rules = 0
+  nf_rules = 0
+  for policy in payload.get("policies") or []:
+    data = policy.get("data") or policy
+    for rule in data.get("rules") or []:
+      spec = rule.get("spec") or {}
+      if spec.get("service_group_details"):
+        sg_rules += 1
+      if spec.get("network_function_details"):
+        nf_rules += 1
+  LOG.info("  %-22s %s / %s", "vms_with_project", vm_proj, len(vms))
+  LOG.info("  %-22s %s / %s", "nics_with_project", nic_proj, nic_total)
+  LOG.info("  %-22s %s", "rules_with_sg_details", sg_rules)
+  LOG.info("  %-22s %s", "rules_with_nf_details", nf_rules)
   LOG.info("  %-22s %s", "platform", payload.get("platform") or "<empty>")
   LOG.info("  %-22s %s", "port_set_list", len(payload.get("port_set_list") or []))
   LOG.info("  %-22s %s", "port_set_get", len(payload.get("port_set_get") or {}))
