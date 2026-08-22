@@ -1,0 +1,140 @@
+# flow_pc_dump_for_neo4j
+
+Dump Prism Central Flow policy and infra objects into JSON that `neo4j_db_insert.py` can prefetch.
+
+The script **must run on the PCVM**, using the Flow venv. It uses `FlowInterfaces` managers (address group, service group, entity group, policy) plus parallel `idfcli` for VMs, subnets, hosts, clusters, and categories. Do **not** use `/home/nutanix/.venvs/bin/bin/python3.9` — that venv has a different `flow` package and fails with `No module named 'flow.common'`.
+
+## Python binary (PCVM)
+
+```text
+/home/nutanix/.venvs/flow/bin/python3
+```
+
+That is the same interpreter the live `flow` / `microseg` services use:
+
+```text
+/home/nutanix/.venvs/flow/bin/python3 /home/nutanix/flow/bin/flow
+```
+
+`flow_cli` also forces `PYTHON_TARGET_PATH` to this binary.
+
+## Copy the script to the PC
+
+From your laptop / jump host:
+
+```bash
+scp flow_pc_dump_for_neo4j.py nutanix@<PC_IP>:/tmp/flow_pc_dump_for_neo4j.py
+ssh nutanix@<PC_IP>
+```
+
+Place it anywhere readable by `nutanix` (for example `/tmp`).
+
+## Run
+
+```bash
+/home/nutanix/.venvs/flow/bin/python3 /tmp/flow_pc_dump_for_neo4j.py \
+  --output /tmp/flow_neo4j_dump.json \
+  --workers 12 \
+  --dataset_timeout_secs 90
+```
+
+Flags are parsed **before** `FlowInterfaces()` is created. That is required on PC; accessing Flow clients before `FLAGS(argv)` triggers `UnparsedFlagAccessError` and Zeus/ZK retry loops.
+
+### Flags
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--output` | `/tmp/flow_neo4j_dump.json` | Prefetch JSON path |
+| `--workers` | `12` | Parallel workers for fetch + conversion |
+| `--dataset_timeout_secs` | `90` | Per-batch timeout; hung datasets are skipped |
+| `--fail_on_error` | off | Exit non-zero if any dataset fails |
+
+Help:
+
+```bash
+/home/nutanix/.venvs/flow/bin/python3 /tmp/flow_pc_dump_for_neo4j.py --help
+```
+
+## What it dumps
+
+Logged as `DUMP start` / `DUMP done` / `DATASET … dumped N records`, then `===== DUMP SUMMARY =====`.
+
+| JSON key | Source | Used by `neo4j_db_insert.py` |
+|---|---|---|
+| `address_groups` | `interfaces.address_group_manager.iter_all()` | `create_ag_map` |
+| `service_groups` | `interfaces.service_group_manager.iter_all()` | `create_service_group_map` |
+| `entity_groups` | `interfaces.entity_group_manager.iter_all()` | `create_entity_group_map` |
+| `policies` | `interfaces.network_security_policy_manager.iter_all()` | `insert_policy_graph` (`policy["data"]`) |
+| `hosts` | `host_manager`, else `idfcli` `node` | `load_infrastructure_data` |
+| `vms` | `idfcli` `mh_vm` / `vm` | `_fetch_vms` |
+| `subnets` | `idfcli` `subnet` / `virtual_network` | `_fetch_subnets` |
+| `vpcs` | `idfcli` `vpc` (falls back to `virtual_network`) | `create_vpc_map` |
+| `clusters` | `idfcli` `cluster` | `load_infrastructure_data` |
+| `projects` | `idfcli` `project` | `load_projects_data` |
+| `categories` | `idfcli` `category` | `create_category_map` |
+| `network_functions` | `idfcli` `network_function` | `load_network_functions_data` |
+| `vlan_unique_uuid` / `global_unique_uuid` | `zkcat` Flow ZK paths | `get_flow_unique_uuid` |
+| `fqdn_to_ip_map` | `fqdn_resolution_manager` or `idfcli` `fns_fqdn_to_ip_info` | EG FQDN expansion |
+
+Two parallel batches:
+
+1. Flow managers + hosts + zkcat + FQDN
+2. VMs / subnets / VPCs / clusters / projects / categories / network functions
+
+Manager object conversion also runs in a thread pool.
+
+## Use with neo4j_db_insert.py
+
+Copy the JSON off the PC, then run the inserter with prefetch (same keys as `_fetch_from_source`):
+
+```bash
+# on PC, after dump
+ls -lh /tmp/flow_neo4j_dump.json
+scp nutanix@<PC_IP>:/tmp/flow_neo4j_dump.json .
+
+# on the machine that runs neo4j_db_insert.py
+python neo4j_db_insert.py \
+  --pc-ip <PC_IP> \
+  --neo4j-ip <NEO4J_IP> \
+  --prefetch-json /tmp/flow_neo4j_dump.json
+```
+
+Exact prefetch CLI flag names come from `neo4j_prefetcher.add_prefetch_cli_arguments` in your tree. The JSON keys above are what `PolicyGraphInserter` reads (`address_groups`, `service_groups`, `entity_groups`, `policies`, `vms`, …).
+
+## Logs to expect
+
+```text
+INFO FlowInterfaces managers + parallel idfcli infra (no v4_client)
+INFO FlowInterfaces ready
+INFO Parallel batch: ['address_groups', 'service_groups', ...]
+INFO DUMP start address_groups
+INFO DUMP listed address_groups raw N objects
+INFO DUMP done address_groups count=N
+INFO DATASET address_groups dumped N records
+INFO ===== DUMP SUMMARY =====
+INFO   address_groups         N
+```
+
+Zeus messages such as `Zookeeper host port list is not set` / `Unable to read Zeus configuration` can appear and are usually non-fatal for Flow manager dumps.
+
+## Do not
+
+- Run with `/usr/bin/python3` or `/home/nutanix/.venvs/bin/bin/python3.9`
+- Call Prism `v4_client` from this script on PC (it can loop on Zeus config forever)
+- Run from `/tmp` with a shebang `python` and no Flow venv — always invoke the Flow binary explicitly
+
+## Example collected on a lab PC
+
+| Dataset | Count (example) |
+|---|---|
+| address_groups | 1368 |
+| service_groups | 2125 |
+| entity_groups | 85 |
+| policies | 651 |
+| vms | 6669 |
+| subnets | 1887 |
+| categories | 3273 |
+| hosts | 32 |
+| clusters | 3 |
+
+`projects` / `network_functions` may be `0` if IDF entity-type names do not match this PC. `vpcs` may match `subnets` when `vpc` is missing and the script falls back to `virtual_network`.
