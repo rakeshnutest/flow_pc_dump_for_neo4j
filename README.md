@@ -176,6 +176,24 @@ INFO   address_groups         N
 
 Zeus messages such as `Zookeeper host port list is not set` / `Unable to read Zeus configuration` can appear and are usually non-fatal for Flow manager dumps.
 
+## ClickHouse port-set compare (local)
+
+After a dump exists, ingest policy hashes vs Atlas `port_set.list` / `port_set.get` into local ClickHouse (`127.0.0.1:19000`, database `flow_policy`). Identity is **port-set UUID only**. Names are display.
+
+Required files: `clickhouse_flow/ingest.py`, `compare.py`, `observe_leftovers.py`, `portset_hash.py`, `schema.sql`. Leftover analysis skill: `.cursor/skills/portset-leftover-observe/SKILL.md`.
+
+```bash
+python3 clickhouse_flow/ingest.py --dump_dir /path/to/dump
+python3 clickhouse_flow/compare.py
+python3 clickhouse_flow/observe_leftovers.py \
+  --dump_dir /path/to/dump \
+  --out clickhouse_flow/leftover_observations.md
+```
+
+- `ingest.py` loads every policy (APPLICATION, FLEX, kube), hashes port-sets the same way as `neo4j_db_insert.py`, and stores Atlas leftovers.
+- `compare.py` stamps match/mismatch. A computed NIC UUID missing in Atlas, or an Atlas NIC UUID missing in computed, is a bug. Atlas leftover UUIDs stay mismatches.
+- `observe_leftovers.py` writes UUID-only leftover notes (Atlas leftover vs Atlas missing). Do not group leftovers by display name.
+
 ## Do not
 
 - Run with `/usr/bin/python3` or `/home/nutanix/.venvs/bin/bin/python3.9`
