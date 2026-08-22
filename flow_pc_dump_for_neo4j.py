@@ -900,7 +900,7 @@ def _idfcli_entities(entity_types):
       LOG.info("DUMP idfcli entitytype %s", entity_type)
       proc = subprocess.run(
           [binary, "get", "entitytype", "-e", entity_type],
-          capture_output=True, text=True, check=False, timeout=60)
+          capture_output=True, text=True, check=False, timeout=90)
       text = proc.stdout or ""
       if proc.returncode != 0 and not text:
         errors.append("%s: %s" % (entity_type, (proc.stderr or "").strip()[:200]))
@@ -930,6 +930,36 @@ def _as_list(value):
   return [value]
 
 
+def _learned_ips(ips):
+  ipv4 = []
+  ipv6 = []
+  for ip in ips or []:
+    text = str(ip).strip()
+    if not text:
+      continue
+    if ":" in text:
+      ipv6.append({"value": text})
+    else:
+      ipv4.append({"value": text})
+  return ipv4, ipv6
+
+
+def _nic_payload(ext_id, mac, subnet_id, ips):
+  ipv4, ipv6 = _learned_ips(ips)
+  network = {
+      "subnet": {"ext_id": subnet_id} if subnet_id else None,
+  }
+  if ipv4:
+    network["ipv4_info"] = {"learned_ip_addresses": ipv4}
+  if ipv6:
+    network["ipv6_info"] = {"learned_ipv6_addresses": ipv6}
+  return {
+      "ext_id": ext_id or "",
+      "nic_backing_info": {"mac_address": mac or ""},
+      "nic_network_info": network,
+  }
+
+
 def _map_vm(row):
   ext_id = _uuid_str(_first_attr(row, "ext_id", "vm_uuid", "uuid", "id")) or ""
   name = _first_attr(row, "vm_name", "name", "display_name") or ""
@@ -942,23 +972,17 @@ def _map_vm(row):
   for cat in _as_list(_first_attr(row, "category_id_list", "category_ids", "categories", default=[])):
     cat_id = _uuid_str(cat) or str(cat)
     cats.append({"ext_id": cat_id} if cat_id else cat)
-  host_id = _uuid_str(_first_attr(row, "host_uuid", "node_uuid", "host"))
+  host_id = _uuid_str(_first_attr(
+      row, "node", "host_uuid", "node_uuid", "host"))
   project_id = _uuid_str(_first_attr(row, "project_uuid", "project_reference", "project"))
   nics = []
   ips = _as_list(_first_attr(row, "ip_addresses", "ipv4_addresses", "vm_ipv4_addresses", default=[]))
   subnet_id = _uuid_str(_first_attr(row, "subnet_uuid", "virtual_network_uuid"))
   mac = _first_attr(row, "mac_address", "mac")
+  nic_ids = _as_list(_first_attr(row, "virtual_nic_uuids", "nic_uuid", default=[]))
   if ips or subnet_id:
-    nics.append({
-        "ext_id": _uuid_str(_first_attr(row, "nic_uuid", "virtual_nic_uuid")) or "",
-        "nic_backing_info": {"mac_address": mac or ""},
-        "nic_network_info": {
-            "subnet": {"ext_id": subnet_id} if subnet_id else None,
-            "ipv4_info": {
-                "learned_ip_addresses": [{"value": str(ip)} for ip in ips]
-            },
-        },
-    })
+    nics.append(_nic_payload(
+        _uuid_str(nic_ids[0]) if nic_ids else "", mac, subnet_id, ips))
   data = {
       "ext_id": ext_id,
       "name": name,
@@ -971,6 +995,45 @@ def _map_vm(row):
   if project_id:
     data["project"] = {"ext_id": project_id}
   return data
+
+
+def _map_virtual_nic(row):
+  return {
+      "ext_id": _uuid_str(_first_attr(row, "ext_id", "uuid", "id")) or "",
+      "vm": _uuid_str(_first_attr(row, "vm", "vm_uuid")),
+      "subnet_id": _uuid_str(_first_attr(
+          row, "virtual_network", "subnet_uuid", "network_uuid")),
+      "mac": _first_attr(row, "mac_address", "mac") or "",
+      "ips": _as_list(_first_attr(
+          row, "ipv4_addresses", "assigned_ipv4_addresses", default=[])),
+  }
+
+
+def _attach_virtual_nics(vms):
+  nic_rows, errors = _idf_mapped(("virtual_nic",), _map_virtual_nic)
+  for err in errors:
+    LOG.warning("virtual_nic: %s", err)
+  by_vm = {}
+  with_subnet = 0
+  for nic in nic_rows:
+    vm_id = nic.get("vm")
+    if not vm_id:
+      continue
+    payload = _nic_payload(
+        nic.get("ext_id"), nic.get("mac"), nic.get("subnet_id"), nic.get("ips"))
+    if payload["nic_network_info"].get("subnet"):
+      with_subnet += 1
+    by_vm.setdefault(vm_id, []).append(payload)
+  attached = 0
+  for vm in vms:
+    nics = by_vm.get(vm.get("ext_id") or "")
+    if nics:
+      vm["nics"] = nics
+      attached += 1
+  LOG.info(
+      "DUMP virtual_nic mapped=%s vms_attached=%s nics_with_subnet=%s",
+      len(nic_rows), attached, with_subnet)
+  return vms
 
 
 def _map_subnet(row):
@@ -1104,6 +1167,7 @@ def fetch_vms(_interfaces):
   rows, errors = _idf_mapped(("mh_vm", "vm", "ahv_vm"), _map_vm)
   for err in errors:
     LOG.warning("vms fallback: %s", err)
+  rows = _attach_virtual_nics(rows)
   LOG.info("DUMP done vms count=%s", len(rows))
   return rows
 
