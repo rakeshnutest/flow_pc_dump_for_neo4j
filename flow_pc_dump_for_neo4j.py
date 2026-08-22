@@ -5,10 +5,12 @@
 # Dump Flow policy + infra objects for neo4j_db_insert.py prefetch JSON.
 # Run on PCVM:
 #   /home/nutanix/.venvs/flow/bin/python3 flow_pc_dump_for_neo4j.py \
-#       --output_dir /tmp/flow_pc_neo4j_prefetch
-# Writes per-dataset JSON files plus all.json (not /tmp/flow_neo4j_dump.json).
+#       --output_dir /tmp/flow_pc_neo4j_prefetch \
+#       --workers 16 --atlas_get_workers 32
+# Writes per-dataset JSON files plus compact all.json.
 #
 
+import codecs
 import json
 import logging
 import os
@@ -51,8 +53,8 @@ gflags.DEFINE_string(
     "from_json", "",
     "If set, skip fetch and split this combined JSON into output_dir files.")
 gflags.DEFINE_integer(
-    "workers", 12,
-    "Parallel worker count for dataset fetch and conversion.")
+    "workers", 16,
+    "Parallel worker count for dataset fetch, conversion, and writes.")
 gflags.DEFINE_integer(
     "dataset_timeout_secs", 90,
     "Per-dataset timeout. Hung v4/Zeus calls are abandoned.")
@@ -65,8 +67,15 @@ gflags.DEFINE_boolean(
 gflags.DEFINE_integer(
     "atlas_timeout_secs", 300,
     "Timeout for atlas_cli port_set.list and the port_set.get batch.")
+gflags.DEFINE_integer(
+    "atlas_get_workers", 32,
+    "Parallel atlas_cli port_set.get processes.")
 
 LOG = logging.getLogger("flow_pc_dump")
+
+# neo4j_db_insert.py create_vpc_map / ALL_VLAN scope
+ALL_VLAN_VPC_UUID = "00000000-0000-0000-0000-000000000001"
+ALL_VLAN_VPC_NAME = "VLAN"
 
 ALLOWED_SELECT = {
     AllowedEntity.kVmByCategoryUuid: ("VM", "CATEGORY_EXT_ID"),
@@ -857,6 +866,61 @@ def _idfcli_bin():
   return "idfcli"
 
 
+_IDF_RESULTS = {}
+_IDF_LOCKS = {}
+_IDF_GUARD = threading.Lock()
+
+
+def _idfcli_one(entity_type, timeout=90):
+  with _IDF_GUARD:
+    lock = _IDF_LOCKS.setdefault(entity_type, threading.Lock())
+  with lock:
+    cached = _IDF_RESULTS.get(entity_type)
+    if cached is not None:
+      parsed, err = cached
+      LOG.info("DUMP idfcli entitytype %s cached=%s", entity_type, len(parsed))
+      return cached
+    LOG.info("DUMP idfcli entitytype %s", entity_type)
+    err = None
+    parsed = []
+    try:
+      proc = subprocess.run(
+          [_idfcli_bin(), "get", "entitytype", "-e", entity_type],
+          capture_output=True, text=True, check=False, timeout=timeout)
+      text = proc.stdout or ""
+      if proc.returncode != 0 and not text:
+        err = "%s: %s" % (entity_type, (proc.stderr or "").strip()[:200])
+      else:
+        parsed = _parse_idf_entities(text)
+    except Exception as exc:
+      err = "%s: %s" % (entity_type, exc)
+    LOG.info("DUMP idfcli %s parsed=%s", entity_type, len(parsed))
+    _IDF_RESULTS[entity_type] = (parsed, err)
+    return _IDF_RESULTS[entity_type]
+
+
+def _idf_unquote(raw):
+  try:
+    return codecs.decode(raw, "unicode_escape")
+  except Exception:
+    return raw
+
+
+def _idf_bytes_to_value(raw):
+  text = _idf_unquote(raw)
+  if isinstance(text, bytes):
+    data = text
+  else:
+    try:
+      data = text.encode("latin-1")
+    except Exception:
+      data = text.encode("utf-8", "replace")
+  if len(data) == 16:
+    return _uuid_str(data) or data.hex()
+  decoded = data.decode("utf-8", "replace")
+  return _uuid_str(decoded) or decoded
+
+
 def _parse_idf_entities(text):
   entities = []
   blocks = re.split(r"^entity:\s*<", text or "", flags=re.MULTILINE)
@@ -874,14 +938,20 @@ def _parse_idf_entities(text):
         block, re.DOTALL):
       name = match.group(1)
       body = match.group(2)
+      str_list = re.findall(r'value_list:\s*"([^"]*)"', body)
       str_val = re.search(r'str_value:\s*"([^"]*)"', body)
       int_val = re.search(r'int64_value:\s*(-?\d+)', body)
       bool_val = re.search(r'bool_value:\s*(true|false)', body)
-      str_list = re.findall(r'value_list:\s*"([^"]*)"', body)
+      bytes_list = re.findall(r'bytes_value:\s*"((?:\\.|[^"\\])*)"', body)
       if str_list:
-        attrs[name] = str_list
+        attrs[name] = [
+            _uuid_str(item) or _idf_unquote(item) for item in str_list]
+      elif len(bytes_list) > 1:
+        attrs[name] = [_idf_bytes_to_value(item) for item in bytes_list]
       elif str_val:
-        attrs[name] = str_val.group(1)
+        attrs[name] = _uuid_str(str_val.group(1)) or str_val.group(1)
+      elif bytes_list:
+        attrs[name] = _idf_bytes_to_value(bytes_list[0])
       elif int_val:
         attrs[name] = int(int_val.group(1))
       elif bool_val:
@@ -892,26 +962,15 @@ def _parse_idf_entities(text):
 
 
 def _idfcli_entities(entity_types):
-  binary = _idfcli_bin()
   rows = []
   errors = []
   for entity_type in entity_types:
-    try:
-      LOG.info("DUMP idfcli entitytype %s", entity_type)
-      proc = subprocess.run(
-          [binary, "get", "entitytype", "-e", entity_type],
-          capture_output=True, text=True, check=False, timeout=90)
-      text = proc.stdout or ""
-      if proc.returncode != 0 and not text:
-        errors.append("%s: %s" % (entity_type, (proc.stderr or "").strip()[:200]))
-        continue
-      parsed = _parse_idf_entities(text)
-      LOG.info("DUMP idfcli %s parsed=%s", entity_type, len(parsed))
-      if parsed:
-        rows.extend(parsed)
-        break
-    except Exception as err:
-      errors.append("%s: %s" % (entity_type, err))
+    parsed, err = _idfcli_one(entity_type)
+    if err:
+      errors.append(err)
+    if parsed:
+      rows.extend(parsed)
+      break
   return rows, errors
 
 
@@ -928,6 +987,132 @@ def _as_list(value):
   if isinstance(value, list):
     return value
   return [value]
+
+
+def _as_bool(value, default=False):
+  if value is None or value == "":
+    return default
+  if isinstance(value, bool):
+    return value
+  if isinstance(value, (int, float)):
+    return bool(value)
+  text = str(value).strip().lower()
+  if text in ("true", "1", "yes"):
+    return True
+  if text in ("false", "0", "no"):
+    return False
+  return default
+
+
+def _subnet_type_name(value, vpc_ref=None, vlan_id=None):
+  text = "" if value in (None, "") else str(value).strip()
+  upper = text.upper().lstrip("K")
+  if upper in ("VLAN", "0"):
+    return "VLAN"
+  if upper in ("OVERLAY", "1"):
+    return "OVERLAY"
+  if vpc_ref:
+    return "OVERLAY"
+  if vlan_id not in (None, "", 0, "0"):
+    return "VLAN"
+  return text or "VLAN"
+
+
+def _looks_uuid(text):
+  text = str(text or "").strip()
+  return len(text) == 36 and text.count("-") == 4
+
+
+def _prefer_human_key(old, new):
+  old = str(old or "").strip()
+  new = str(new or "").strip()
+  if new and not _looks_uuid(new):
+    return new
+  if old and not _looks_uuid(old):
+    return old
+  return new or old
+
+
+def _category_ids_from_row(row):
+  raw = _first_attr(row, "category_id_list", "category_ids", "categories", default=[])
+  ids = []
+  for item in _as_list(raw):
+    if isinstance(item, dict):
+      cat_id = _uuid_str(item.get("ext_id") or item.get("uuid")) or ""
+    else:
+      cat_id = _uuid_str(item) or str(item)
+    if cat_id:
+      ids.append(cat_id)
+  return ids
+
+
+def _category_name_map(categories):
+  mapping = {}
+  for cat in categories or []:
+    ext_id = cat.get("ext_id")
+    if not ext_id:
+      continue
+    key = str(cat.get("key") or "").strip()
+    value = str(cat.get("value") or "").strip()
+    if key and value:
+      mapping[ext_id] = "%s:%s" % (key, value)
+    elif key:
+      mapping[ext_id] = key
+    elif value:
+      mapping[ext_id] = value
+    else:
+      mapping[ext_id] = ext_id
+  return mapping
+
+
+def _category_names(ids, cat_map):
+  names = []
+  seen = set()
+  for cat_id in ids or []:
+    uid = _uuid_str(cat_id) or str(cat_id)
+    name = cat_map.get(uid) or uid
+    if name in seen:
+      continue
+    seen.add(name)
+    names.append(name)
+  return names
+
+
+def _vpc_name_from_subnet_name(name):
+  text = str(name or "").strip()
+  if not text:
+    return ""
+  lower = text.lower()
+  for token in ("_subnet_", "-subnet-"):
+    idx = lower.rfind(token)
+    if idx > 0:
+      return text[:idx]
+  return ""
+
+
+def _vpc_display_name(vpc_ref, subnet_name=None, existing=""):
+  """Never return an empty VPC name. ALL_VLAN is VLAN; overlay is inferred."""
+  if vpc_ref == ALL_VLAN_VPC_UUID:
+    return ALL_VLAN_VPC_NAME
+  name = str(existing or "").strip()
+  if name and name.lower() not in ("unnamed", "(unnamed)", "none", "null"):
+    return name
+  inferred = _vpc_name_from_subnet_name(subnet_name)
+  if inferred:
+    return inferred
+  ext = str(vpc_ref or "unknown")
+  return "VPC_%s" % ext[:8]
+
+
+def _all_vlan_vpc():
+  return {
+      "ext_id": ALL_VLAN_VPC_UUID,
+      "name": ALL_VLAN_VPC_NAME,
+      "vpc_type": "VLAN",
+      "metadata": {"category_ids": []},
+      "externally_routable_prefixes": [],
+      "external_subnets": [],
+  }
 
 
 def _learned_ips(ips):
@@ -968,10 +1153,6 @@ def _map_vm(row):
     power = "ON"
   elif power in ("POWERED_OFF", "OFF", "0", "FALSE"):
     power = "OFF"
-  cats = []
-  for cat in _as_list(_first_attr(row, "category_id_list", "category_ids", "categories", default=[])):
-    cat_id = _uuid_str(cat) or str(cat)
-    cats.append({"ext_id": cat_id} if cat_id else cat)
   host_id = _uuid_str(_first_attr(
       row, "node", "host_uuid", "node_uuid", "host"))
   project_id = _uuid_str(_first_attr(row, "project_uuid", "project_reference", "project"))
@@ -987,7 +1168,8 @@ def _map_vm(row):
       "ext_id": ext_id,
       "name": name,
       "power_state": power,
-      "categories": cats,
+      "metadata": {"category_ids": _category_ids_from_row(row)},
+      "categories": [],
       "nics": nics,
   }
   if host_id:
@@ -1009,9 +1191,10 @@ def _map_virtual_nic(row):
   }
 
 
-def _attach_virtual_nics(vms):
-  nic_rows, errors = _idf_mapped(("virtual_nic",), _map_virtual_nic)
-  for err in errors:
+def _attach_virtual_nics(vms, nic_rows=None, nic_errors=None):
+  if nic_rows is None:
+    nic_rows, nic_errors = _idf_mapped(("virtual_nic",), _map_virtual_nic)
+  for err in nic_errors or []:
     LOG.warning("virtual_nic: %s", err)
   by_vm = {}
   with_subnet = 0
@@ -1038,17 +1221,25 @@ def _attach_virtual_nics(vms):
 
 def _map_subnet(row):
   ext_id = _uuid_str(_first_attr(row, "ext_id", "uuid", "id")) or ""
-  vpc_ref = _uuid_str(_first_attr(row, "vpc_uuid", "vpc_reference", "virtual_network_uuid"))
-  cats = _as_list(_first_attr(row, "category_id_list", "category_ids", default=[]))
+  vpc_ref = _uuid_str(_first_attr(
+      row, "overlay_network_uuid", "vpc_uuid", "vpc_reference"))
+  vlan_id = _first_attr(row, "vlan_id", "vlan")
+  cats = _category_ids_from_row(row)
   project_id = _uuid_str(_first_attr(row, "project_uuid", "project"))
+  subnet_type = _subnet_type_name(
+      _first_attr(row, "subnet_type", "type"), vpc_ref, vlan_id)
+  if not vpc_ref:
+    vpc_ref = ALL_VLAN_VPC_UUID
+    subnet_type = "VLAN"
   data = {
       "ext_id": ext_id,
       "name": _first_attr(row, "name", "subnet_name") or "",
-      "subnet_type": _first_attr(row, "subnet_type", "type") or "OVERLAY",
+      "subnet_type": subnet_type,
       "vpc_reference": vpc_ref,
-      "is_advanced_networking": bool(_first_attr(
-          row, "is_advanced_networking", "advanced_networking", default=False)),
-      "metadata": {"category_ids": [_uuid_str(cat) or str(cat) for cat in cats]},
+      "vlan_id": vlan_id,
+      "is_advanced_networking": _as_bool(_first_attr(
+          row, "is_advanced_networking", "advanced_networking"), False),
+      "metadata": {"category_ids": cats},
   }
   if project_id:
     data["project"] = {"ext_id": project_id}
@@ -1057,13 +1248,13 @@ def _map_subnet(row):
 
 def _map_vpc(row):
   ext_id = _uuid_str(_first_attr(row, "ext_id", "uuid", "id")) or ""
-  cats = _as_list(_first_attr(row, "category_id_list", "category_ids", default=[]))
+  cats = _category_ids_from_row(row)
   project_id = _uuid_str(_first_attr(row, "project_uuid", "project"))
   data = {
       "ext_id": ext_id,
       "name": _first_attr(row, "name", "vpc_name") or "",
       "vpc_type": _first_attr(row, "vpc_type", "type") or "REGULAR",
-      "metadata": {"category_ids": [_uuid_str(cat) or str(cat) for cat in cats]},
+      "metadata": {"category_ids": cats},
       "externally_routable_prefixes": [],
       "external_subnets": [],
   }
@@ -1102,10 +1293,28 @@ def _map_project(row):
 
 
 def _map_category(row):
-  key = _first_attr(row, "key", "category_key", "name") or ""
+  # abac_category.abac_category_key is the key UUID, not App16. Prefer
+  # IDF `category.key` / fq_name (`App16:app5`) for the human key.
+  fq = str(_first_attr(row, "fq_name") or "")
+  key = _first_attr(row, "key", "category_key") or ""
   value = _first_attr(row, "value", "category_value") or ""
-  if not value and ":" in str(key):
-    key, value = str(key).split(":", 1)
+  name = str(_first_attr(row, "name", "user_specified_name") or "")
+  if fq and ":" in fq:
+    fq_key, fq_val = fq.split(":", 1)
+    key = _prefer_human_key(key, fq_key)
+    if fq_val and not value:
+      value = fq_val
+  elif name and ":" in name:
+    nkey, nval = name.split(":", 1)
+    key = _prefer_human_key(key, nkey)
+    if nval and not value:
+      value = nval
+  elif not value and name and name != key and not _looks_uuid(name):
+    value = name
+  if not key and name and not _looks_uuid(name) and ":" not in name:
+    key = name
+  if _looks_uuid(key):
+    key = ""
   return {
       "ext_id": _uuid_str(_first_attr(row, "ext_id", "uuid", "id")) or "",
       "key": key,
@@ -1164,17 +1373,21 @@ def fetch_hosts(interfaces):
 
 def fetch_vms(_interfaces):
   LOG.info("DUMP start vms")
-  rows, errors = _idf_mapped(("mh_vm", "vm", "ahv_vm"), _map_vm)
+  with ThreadPoolExecutor(max_workers=2) as pool:
+    vm_fut = pool.submit(_idf_mapped, ("vm", "mh_vm", "ahv_vm"), _map_vm)
+    nic_fut = pool.submit(_idf_mapped, ("virtual_nic",), _map_virtual_nic)
+    rows, errors = vm_fut.result()
+    nic_rows, nic_errors = nic_fut.result()
   for err in errors:
     LOG.warning("vms fallback: %s", err)
-  rows = _attach_virtual_nics(rows)
+  rows = _attach_virtual_nics(rows, nic_rows, nic_errors)
   LOG.info("DUMP done vms count=%s", len(rows))
   return rows
 
 
 def fetch_subnets(_interfaces):
   LOG.info("DUMP start subnets")
-  rows, errors = _idf_mapped(("subnet", "virtual_network"), _map_subnet)
+  rows, errors = _idf_mapped(("virtual_network", "subnet"), _map_subnet)
   for err in errors:
     LOG.warning("subnets fallback: %s", err)
   LOG.info("DUMP done subnets count=%s", len(rows))
@@ -1183,11 +1396,261 @@ def fetch_subnets(_interfaces):
 
 def fetch_vpcs(_interfaces):
   LOG.info("DUMP start vpcs")
-  rows, errors = _idf_mapped(("vpc", "virtual_private_cloud", "virtual_network"), _map_vpc)
+  rows, errors = _idf_mapped(("vpc", "virtual_private_cloud"), _map_vpc)
   for err in errors:
     LOG.warning("vpcs fallback: %s", err)
   LOG.info("DUMP done vpcs count=%s", len(rows))
   return rows
+
+
+def _map_entity_capability(row):
+  ids = []
+  for name in ("kind_id", "uuid", "owner_reference", "ext_id"):
+    uid = _uuid_str(_first_attr(row, name))
+    if uid and uid not in ids:
+      ids.append(uid)
+  mapping = []
+  for item in _as_list(_first_attr(
+      row, "categories_mapping_list", "category_mapping_list", default=[])):
+    if isinstance(item, dict):
+      key = item.get("key") or item.get("name") or ""
+      value = item.get("value") or ""
+      text = ("%s:%s" % (key, value)).strip(":") if key or value else ""
+    else:
+      text = str(item).strip()
+    if text and text not in mapping:
+      mapping.append(text)
+  return {
+      "kind": str(_first_attr(row, "kind") or "").lower(),
+      "ids": ids,
+      "category_ids": _category_ids_from_row(row),
+      "category_names": mapping,
+  }
+
+
+def fetch_entity_capabilities(_interfaces):
+  LOG.info("DUMP start entity_capabilities")
+  rows, errors = _idf_mapped(
+      ("abac_entity_capability", "volume_group_entity_capability"),
+      _map_entity_capability)
+  for err in errors:
+    LOG.warning("entity_capabilities fallback: %s", err)
+  LOG.info("DUMP done entity_capabilities count=%s", len(rows))
+  return rows
+
+
+def _merge_entity_categories(entity, cats, extra_names):
+  meta = entity.setdefault("metadata", {})
+  have = list(meta.get("category_ids") or [])
+  for cid in cats or []:
+    if cid not in have:
+      have.append(cid)
+  meta["category_ids"] = have
+  extra = list(entity.get("extra_category_names") or [])
+  for name in extra_names or []:
+    if name and name not in extra:
+      extra.append(name)
+  entity["extra_category_names"] = extra
+
+
+def _cap_target(kind):
+  compact = str(kind or "").lower().replace(" ", "").replace("-", "_").lstrip("k")
+  if compact in ("vpc", "virtual_private_cloud") or (
+      "vpc" in compact and "subnet" not in compact):
+    return "vpc"
+  if compact in ("subnet", "virtual_network", "overlay_subnet"):
+    return "subnet"
+  if compact in ("vm", "mh_vm", "ahv_vm", "virtual_machine"):
+    return "vm"
+  return "both"
+
+
+def _enrich_nics_and_vlan_vpc(payload):
+  """Fill NIC VPC/subnet/VM category fields for neo4j_db_insert.py.
+
+  IDF `vm` has no category_id_list; VM categories come from
+  abac_entity_capability. ALL_VLAN is 00000000-0000-0000-0000-000000000001
+  named VLAN. Overlay VPC names are inferred from subnet prefixes.
+  """
+  cat_map = _category_name_map(payload.get("categories") or [])
+  subnets = payload.get("subnets") or []
+  vpcs = list(payload.get("vpcs") or [])
+  vms = payload.get("vms") or []
+  vpc_by_id = {vpc.get("ext_id"): vpc for vpc in vpcs if vpc.get("ext_id")}
+  subnet_by_id = {
+      subnet.get("ext_id"): subnet for subnet in subnets if subnet.get("ext_id")}
+  vm_by_id = {vm.get("ext_id"): vm for vm in vms if vm.get("ext_id")}
+
+  for subnet in subnets:
+    vpc_ref = subnet.get("vpc_reference")
+    if vpc_ref and vpc_ref not in vpc_by_id and vpc_ref != ALL_VLAN_VPC_UUID:
+      stub = {
+          "ext_id": vpc_ref,
+          "name": _vpc_display_name(
+              vpc_ref, subnet.get("name"), subnet.get("vpc_name")),
+          "vpc_type": "REGULAR",
+          "metadata": {"category_ids": []},
+          "externally_routable_prefixes": [],
+          "external_subnets": [],
+      }
+      vpcs.append(stub)
+      vpc_by_id[vpc_ref] = stub
+
+  if ALL_VLAN_VPC_UUID not in vpc_by_id:
+    vlan_vpc = _all_vlan_vpc()
+    vpcs.append(vlan_vpc)
+    vpc_by_id[ALL_VLAN_VPC_UUID] = vlan_vpc
+  payload["vpcs"] = vpcs
+
+  applied_subnet_caps = 0
+  applied_vpc_caps = 0
+  applied_vm_caps = 0
+  for cap in payload.pop("entity_capabilities", None) or []:
+    cats = cap.get("category_ids") or []
+    extra_names = cap.get("category_names") or []
+    if not cats and not extra_names:
+      continue
+    target = _cap_target(cap.get("kind") or "")
+    for eid in cap.get("ids") or []:
+      if target in ("subnet", "both") and eid in subnet_by_id:
+        _merge_entity_categories(subnet_by_id[eid], cats, extra_names)
+        applied_subnet_caps += 1
+      if target in ("vpc", "both") and eid in vpc_by_id:
+        _merge_entity_categories(vpc_by_id[eid], cats, extra_names)
+        applied_vpc_caps += 1
+      if target in ("vm", "both") and eid in vm_by_id:
+        _merge_entity_categories(vm_by_id[eid], cats, extra_names)
+        applied_vm_caps += 1
+  LOG.info(
+      "DUMP category join subnet_caps=%s vpc_caps=%s vm_caps=%s",
+      applied_subnet_caps, applied_vpc_caps, applied_vm_caps)
+
+  names_by_vpc = {}
+  for subnet in subnets:
+    vpc_ref = subnet.get("vpc_reference")
+    if not vpc_ref or vpc_ref == ALL_VLAN_VPC_UUID:
+      continue
+    inferred = (
+        subnet.get("vpc_name") or
+        _vpc_name_from_subnet_name(subnet.get("name")))
+    if inferred:
+      names_by_vpc.setdefault(vpc_ref, []).append(inferred)
+  for vpc_id, names in names_by_vpc.items():
+    vpc = vpc_by_id.get(vpc_id)
+    if not vpc:
+      continue
+    counts = {}
+    for name in names:
+      counts[name] = counts.get(name, 0) + 1
+    vpc["name"] = max(counts, key=counts.get)
+  for vpc in vpcs:
+    vpc["name"] = _vpc_display_name(
+        vpc.get("ext_id"), existing=vpc.get("name"))
+
+  def _resolved_cats(entity):
+    cat_ids = ((entity.get("metadata") or {}).get("category_ids") or [])
+    names = _category_names(cat_ids, cat_map)
+    for extra in entity.get("extra_category_names") or []:
+      if extra not in names:
+        names.append(extra)
+    return cat_ids, names
+
+  vpc_subnet_cat_ids = {}
+  for subnet in subnets:
+    vpc_ref = subnet.get("vpc_reference") or ALL_VLAN_VPC_UUID
+    vpc_subnet_cat_ids.setdefault(vpc_ref, [])
+    for cid in (subnet.get("metadata") or {}).get("category_ids") or []:
+      if cid not in vpc_subnet_cat_ids[vpc_ref]:
+        vpc_subnet_cat_ids[vpc_ref].append(cid)
+    _ids, names = _resolved_cats(subnet)
+    subnet["categories"] = names
+  for vpc in vpcs:
+    _ids, names = _resolved_cats(vpc)
+    vpc["categories"] = names
+    if vpc.get("ext_id") == ALL_VLAN_VPC_UUID:
+      vpc["subnet_categories"] = []
+    else:
+      vpc["subnet_categories"] = _category_names(
+          vpc_subnet_cat_ids.get(vpc.get("ext_id") or "", []), cat_map)
+
+  vlan_nics = 0
+  overlay_nics = 0
+  with_subnet_cats = 0
+  with_vpc_subnet_cats = 0
+  vms_with_cats = 0
+  for vm in vms:
+    vm_cat_ids, vm_cat_names = _resolved_cats(vm)
+    vm["categories"] = vm_cat_names
+    vm["category_ids"] = vm_cat_ids
+    if vm_cat_names:
+      vms_with_cats += 1
+    for nic in vm.get("nics") or []:
+      network = nic.setdefault("nic_network_info", {})
+      subnet_obj = network.get("subnet")
+      subnet_id = ""
+      if isinstance(subnet_obj, dict):
+        subnet_id = subnet_obj.get("ext_id") or ""
+      subnet = subnet_by_id.get(subnet_id) or {}
+      cat_ids, cat_names = _resolved_cats(subnet)
+      if cat_names:
+        with_subnet_cats += 1
+      advanced = _as_bool(subnet.get("is_advanced_networking"), False)
+      subnet_type = subnet.get("subnet_type") or ""
+      vpc_ref = subnet.get("vpc_reference") or ""
+      if not subnet_id:
+        network["vpc"] = {
+            "ext_id": "",
+            "name": "",
+            "categories": [],
+            "category_ids": [],
+            "subnet_categories": [],
+        }
+        network["vm_categories"] = vm_cat_names
+        network["vm_category_ids"] = vm_cat_ids
+        network["vm_subnet_categories"] = []
+        network["vpc_categories"] = []
+        network["vpc_subnet_categories"] = []
+        continue
+      if vpc_ref == ALL_VLAN_VPC_UUID or str(subnet_type).upper() == "VLAN":
+        vpc_ref = ALL_VLAN_VPC_UUID
+        vlan_nics += 1
+        vpc_subnet_cats = cat_names
+      else:
+        overlay_nics += 1
+        vpc_subnet_cats = _category_names(
+            vpc_subnet_cat_ids.get(vpc_ref, []), cat_map)
+      if vpc_subnet_cats:
+        with_vpc_subnet_cats += 1
+      vpc = vpc_by_id.get(vpc_ref) or _all_vlan_vpc()
+      vpc_cat_ids, vpc_cat_names = _resolved_cats(vpc)
+      vpc_name = _vpc_display_name(
+          vpc_ref, subnet.get("name"), vpc.get("name"))
+      vpc["name"] = vpc_name
+      network["subnet"] = {
+          "ext_id": subnet_id,
+          "name": subnet.get("name") or "",
+          "subnet_type": subnet_type,
+          "is_advanced_networking": advanced,
+          "categories": cat_names,
+          "category_ids": cat_ids,
+      }
+      network["vpc"] = {
+          "ext_id": vpc_ref,
+          "name": vpc_name,
+          "categories": vpc_cat_names,
+          "category_ids": vpc_cat_ids,
+          "subnet_categories": vpc_subnet_cats,
+      }
+      network["vm_categories"] = vm_cat_names
+      network["vm_category_ids"] = vm_cat_ids
+      network["vm_subnet_categories"] = cat_names
+      network["vpc_categories"] = vpc_cat_names
+      network["vpc_subnet_categories"] = vpc_subnet_cats
+  LOG.info(
+      "DUMP nic enrich vlan=%s overlay=%s vm_categories=%s "
+      "vm_subnet_categories=%s vpc_subnet_categories=%s vpcs=%s",
+      vlan_nics, overlay_nics, vms_with_cats, with_subnet_cats,
+      with_vpc_subnet_cats, len(vpcs))
 
 
 def fetch_clusters(_interfaces):
@@ -1210,10 +1673,25 @@ def fetch_projects(_interfaces):
 
 def fetch_categories(_interfaces):
   LOG.info("DUMP start categories")
-  rows, errors = _idf_mapped(("category", "abac_category", "category_key"), _map_category)
-  for err in errors:
-    LOG.warning("categories fallback: %s", err)
-  LOG.info("DUMP done categories count=%s", len(rows))
+  by_id = {}
+  for entity_type in ("abac_category", "category"):
+    rows, errors = _idf_mapped((entity_type,), _map_category)
+    for err in errors:
+      LOG.warning("categories fallback: %s", err)
+    for row in rows:
+      ext_id = row.get("ext_id")
+      if not ext_id:
+        continue
+      prev = by_id.get(ext_id)
+      if prev is None:
+        by_id[ext_id] = row
+        continue
+      prev["key"] = _prefer_human_key(prev.get("key"), row.get("key"))
+      if not prev.get("value"):
+        prev["value"] = row.get("value") or ""
+  rows = list(by_id.values())
+  filled = sum(1 for row in rows if row.get("key") and row.get("value"))
+  LOG.info("DUMP done categories count=%s key_value=%s", len(rows), filled)
   return rows
 
 
@@ -1431,13 +1909,18 @@ def detect_msp_platform():
       "detection_method": "no_flow_smsp_signals",
       "smsp_cluster_uuid": "",
   }
-  clusters = _mspctl_cluster_list()
+  with ThreadPoolExecutor(max_workers=3) as pool:
+    list_fut = pool.submit(_mspctl_cluster_list)
+    get_fut = pool.submit(_mspctl_flow_cluster)
+    zk_fut = pool.submit(_zk_node_exists, "/appliance/logical/flow_smsp")
+    clusters = list_fut.result()
+    flow_get = get_fut.result()
+    zk_smsp = zk_fut.result()
   names = [
       str(item.get("cluster_name") or item.get("name") or "")
       for item in clusters if isinstance(item, dict)]
   LOG.info("mspctl clusters: %s", names or "<none>")
   flow = _flow_cluster_from_list(clusters)
-  flow_get = _mspctl_flow_cluster()
   smsp_uuid = _cluster_uuid(flow)
   if not smsp_uuid and isinstance(flow_get, dict):
     smsp_uuid = _cluster_uuid(flow_get)
@@ -1452,8 +1935,10 @@ def detect_msp_platform():
     return info
 
   not_found = isinstance(flow_get, dict) and flow_get.get("_not_found")
-  atlas_pids = _genesis_atlas_pids()
-  zk_smsp = _zk_node_exists("/appliance/logical/flow_smsp")
+  no_flow = not_found or (clusters and not flow)
+  atlas_pids = []
+  if not no_flow:
+    atlas_pids = _genesis_atlas_pids()
   LOG.info(
       "SMSP probes: flow_cluster=%s flow_404=%s genesis_atlas_pids=%s "
       "zk_flow_smsp=%s",
@@ -1467,9 +1952,9 @@ def detect_msp_platform():
         "atlas_cli -u cannot be formed")
     return info
 
-  if (not_found or (clusters and not flow)) and atlas_pids:
+  if no_flow and atlas_pids:
     info["detection_method"] = "mspctl_no_flow_cluster+genesis_atlas"
-  elif not_found or (clusters and not flow):
+  elif no_flow:
     info["detection_method"] = "mspctl_no_flow_cluster"
   elif atlas_pids:
     info["detection_method"] = "genesis_atlas"
@@ -1590,7 +2075,7 @@ def fetch_port_set_get(platform_info, uuids, workers, timeout_secs, errors):
   if not uuids:
     LOG.info("DUMP skip port_set_get (no UUIDs from port_set.list)")
     return gets
-  per_timeout = max(30, min(90, int(timeout_secs)))
+  per_timeout = max(15, min(45, int(timeout_secs)))
   LOG.info("DUMP start port_set_get count=%s workers=%s", len(uuids), workers)
 
   def _one(ps_uuid):
@@ -1646,14 +2131,16 @@ def _write_json_file(path, value):
   if parent:
     os.makedirs(parent, exist_ok=True)
   with open(path, "w") as handle:
-    json.dump(value, handle, indent=2, default=_json_default)
+    json.dump(value, handle, separators=(",", ":"), default=_json_default)
   size = os.path.getsize(path)
   LOG.info("Wrote %s (%s bytes)", path, size)
   return path, size
 
 
-def _write_outputs(payload, output_dir, combined_path, workers):
+def _write_outputs(payload, output_dir, combined_path, workers,
+                   skip_keys=None, write_combined=True):
   os.makedirs(output_dir, exist_ok=True)
+  skip_keys = set(skip_keys or ())
   scalar = {
       "source": payload.get("source"),
       "dumped_at": payload.get("dumped_at"),
@@ -1665,12 +2152,14 @@ def _write_outputs(payload, output_dir, combined_path, workers):
   }
   jobs = [(os.path.join(output_dir, "meta.json"), scalar)]
   for key in DATASET_FILES:
-    if key in payload:
+    if key in payload and key not in skip_keys:
       jobs.append((os.path.join(output_dir, "%s.json" % key), payload[key]))
-  jobs.append((combined_path, payload))
+  if write_combined:
+    jobs.append((combined_path, payload))
 
-  LOG.info("Writing %s dataset files under %s plus combined %s",
-           len(jobs) - 1, output_dir, combined_path)
+  LOG.info("Writing %s files under %s%s",
+           len(jobs), output_dir,
+           (" plus combined %s" % combined_path) if write_combined else "")
   with ThreadPoolExecutor(max_workers=max(1, min(workers, len(jobs)))) as pool:
     list(pool.map(lambda item: _write_json_file(item[0], item[1]), jobs))
 
@@ -1740,26 +2229,28 @@ def main(argv):
     LOG.info("Split complete under %s", output_dir)
     return 0
 
-  platform_info = detect_msp_platform()
+  timeout_secs = max(15, int(FLAGS.dataset_timeout_secs))
+  atlas_timeout_secs = max(30, int(FLAGS.atlas_timeout_secs))
+  atlas_get_workers = max(1, int(FLAGS.atlas_get_workers))
+  LOG.info("FlowInterfaces + platform detect in parallel (no v4_client)")
+  LOG.info(
+      "workers=%s atlas_get_workers=%s timeout=%ss atlas_timeout=%ss "
+      "skip_atlas=%s",
+      workers, atlas_get_workers, timeout_secs, atlas_timeout_secs,
+      FLAGS.skip_atlas)
+  with ThreadPoolExecutor(max_workers=1) as pool:
+    plat_fut = pool.submit(detect_msp_platform)
+    interfaces = FlowInterfaces()
+    platform_info = plat_fut.result()
   LOG.info(
       "Platform %s (method=%s smsp_uuid=%s)",
       platform_info.get("platform"),
       platform_info.get("detection_method"),
       platform_info.get("smsp_cluster_uuid") or "<none>")
-
-  LOG.info("FlowInterfaces managers + parallel idfcli infra (no v4_client)")
-  LOG.info("workers=%s timeout=%ss atlas_timeout=%ss skip_atlas=%s",
-           workers, FLAGS.dataset_timeout_secs, FLAGS.atlas_timeout_secs,
-           FLAGS.skip_atlas)
-  interfaces = FlowInterfaces()
   LOG.info("FlowInterfaces ready")
 
   errors = {}
-  timeout_secs = max(15, int(FLAGS.dataset_timeout_secs))
-  atlas_timeout_secs = max(30, int(FLAGS.atlas_timeout_secs))
-  workers = max(1, int(FLAGS.workers))
-
-  flow_jobs = [
+  jobs = [
       ("address_groups", lambda: fetch_address_groups(interfaces)),
       ("service_groups", lambda: fetch_service_groups(interfaces)),
       ("entity_groups", lambda: fetch_entity_groups(interfaces)),
@@ -1767,8 +2258,6 @@ def main(argv):
       ("hosts", lambda: fetch_hosts(interfaces)),
       ("unique_uuids", fetch_unique_uuids),
       ("fqdn_to_ip_map", lambda: fetch_fqdn_map(interfaces)),
-  ]
-  infra_jobs = [
       ("vms", lambda: fetch_vms(interfaces)),
       ("subnets", lambda: fetch_subnets(interfaces)),
       ("vpcs", lambda: fetch_vpcs(interfaces)),
@@ -1776,7 +2265,25 @@ def main(argv):
       ("projects", lambda: fetch_projects(interfaces)),
       ("categories", lambda: fetch_categories(interfaces)),
       ("network_functions", lambda: fetch_network_functions(interfaces)),
+      ("entity_capabilities", lambda: fetch_entity_capabilities(interfaces)),
   ]
+
+  def _atlas_list_and_get():
+    rows = fetch_port_set_list(platform_info, atlas_timeout_secs)
+    uuids = []
+    seen = set()
+    for item in rows or []:
+      ps_uuid = _port_set_uuid(item)
+      if ps_uuid and ps_uuid not in seen:
+        seen.add(ps_uuid)
+        uuids.append(ps_uuid)
+    gets = {}
+    if uuids:
+      gets = fetch_port_set_get(
+          platform_info, uuids, atlas_get_workers, atlas_timeout_secs, errors)
+    else:
+      LOG.info("Skipping port_set.get (no UUIDs from port_set.list)")
+    return rows or [], gets
 
   payload = {
       "source": "flow_pc_dump_for_neo4j",
@@ -1785,43 +2292,54 @@ def main(argv):
       "platform_detection_method": platform_info.get("detection_method"),
       "smsp_cluster_uuid": platform_info.get("smsp_cluster_uuid") or "",
   }
-  payload.update(_run_jobs_parallel(flow_jobs, workers, timeout_secs, errors))
-  payload.update(_run_jobs_parallel(infra_jobs, workers, timeout_secs, errors))
-
-  unique = payload.pop("unique_uuids", {}) or {}
-  payload["vlan_unique_uuid"] = unique.get("vlan_unique_uuid", "")
-  payload["global_unique_uuid"] = unique.get("global_unique_uuid", "")
-  payload["network_function_by_id"] = fetch_network_function_by_id(
-      interfaces, payload.get("network_functions") or [])
-
   payload["port_set_list"] = []
   payload["port_set_get"] = {}
-  if FLAGS.skip_atlas:
-    LOG.info("Skipping atlas_cli port_set dumps (--skip_atlas)")
-  else:
-    try:
-      payload["port_set_list"] = fetch_port_set_list(
-          platform_info, atlas_timeout_secs)
-    except Exception as err:
-      errors["port_set_list"] = str(err)
-      LOG.error("DATASET port_set_list FAILED: %s", err)
-    uuids = []
-    seen = set()
-    for item in payload.get("port_set_list") or []:
-      ps_uuid = _port_set_uuid(item)
-      if ps_uuid and ps_uuid not in seen:
-        seen.add(ps_uuid)
-        uuids.append(ps_uuid)
-    try:
-      payload["port_set_get"] = fetch_port_set_get(
-          platform_info, uuids, workers, atlas_timeout_secs, errors)
-    except Exception as err:
-      errors["port_set_get"] = str(err)
-      LOG.error("DATASET port_set_get FAILED: %s", err)
+  write_fut = None
+
+  with ThreadPoolExecutor(max_workers=3) as coordinator:
+    fetch_fut = coordinator.submit(
+        _run_jobs_parallel, jobs, workers, timeout_secs, errors)
+    atlas_fut = None
+    if FLAGS.skip_atlas:
+      LOG.info("Skipping atlas_cli port_set dumps (--skip_atlas)")
+    else:
+      atlas_fut = coordinator.submit(_atlas_list_and_get)
+    payload.update(fetch_fut.result())
+
+    unique = payload.pop("unique_uuids", {}) or {}
+    payload["vlan_unique_uuid"] = unique.get("vlan_unique_uuid", "")
+    payload["global_unique_uuid"] = unique.get("global_unique_uuid", "")
+    payload["network_function_by_id"] = fetch_network_function_by_id(
+        interfaces, payload.get("network_functions") or [])
+    _enrich_nics_and_vlan_vpc(payload)
+
+    skip_late = ("port_set_list", "port_set_get", "dump_errors")
+    write_fut = None
+    if atlas_fut is not None and not atlas_fut.done():
+      write_fut = coordinator.submit(
+          _write_outputs, payload, output_dir, combined_path, workers,
+          skip_late, False)
+    if atlas_fut is not None:
+      try:
+        payload["port_set_list"], payload["port_set_get"] = atlas_fut.result()
+      except Exception as err:
+        errors["port_set_list"] = str(err)
+        LOG.error("DATASET port_set_list/get FAILED: %s", err)
+    if write_fut is not None:
+      write_fut.result()
 
   payload["dump_errors"] = errors
-
-  _write_outputs(payload, output_dir, combined_path, workers)
+  if write_fut is not None:
+    _write_json_file(
+        os.path.join(output_dir, "port_set_list.json"),
+        payload.get("port_set_list") or [])
+    _write_json_file(
+        os.path.join(output_dir, "port_set_get.json"),
+        payload.get("port_set_get") or {})
+    _write_json_file(os.path.join(output_dir, "dump_errors.json"), errors)
+    _write_json_file(combined_path, payload)
+  else:
+    _write_outputs(payload, output_dir, combined_path, workers)
 
   LOG.info("===== DUMP SUMMARY =====")
   for key in (

@@ -36,8 +36,10 @@ Writes **one file per dataset** under `--output_dir` (default `/tmp/flow_pc_neo4
 ```bash
 /home/nutanix/.venvs/flow/bin/python3 /tmp/flow_pc_dump_for_neo4j.py \
   --output_dir /tmp/flow_pc_neo4j_prefetch \
-  --workers 12 \
-  --dataset_timeout_secs 90
+  --workers 16 \
+  --atlas_get_workers 32 \
+  --dataset_timeout_secs 90 \
+  --atlas_timeout_secs 600
 ```
 
 Output layout:
@@ -90,11 +92,12 @@ Flags are parsed **before** `FlowInterfaces()` is created. That is required on P
 | `--output` | `<output_dir>/all.json` | Combined JSON path |
 | `--log_file` | `<output_dir>/dump.log` | Log file |
 | `--from_json` | unset | Split an existing combined JSON; skip live fetch |
-| `--workers` | `12` | Parallel workers for fetch + conversion + writes |
+| `--workers` | `16` | Parallel workers for dataset fetch + writes |
 | `--dataset_timeout_secs` | `90` | Per-batch timeout; hung datasets are skipped |
 | `--fail_on_error` | off | Exit non-zero if any dataset fails |
 | `--skip_atlas` | off | Skip `atlas_cli port_set.list` / `port_set.get` |
 | `--atlas_timeout_secs` | `300` | Timeout for `port_set.list` and the `port_set.get` batch |
+| `--atlas_get_workers` | `32` | Parallel `atlas_cli port_set.get` processes |
 
 **SMSP vs CMSP (auto-detected, no flag):** `mspctl cluster list` / `mspctl cluster get flow --verbose`. A cluster named `flow` with a UUID is SMSP → every `atlas_cli` uses `-u ws://smsp-<uuid>.ntnx-ikat.svc:2060/atlas_cli`. No `flow` cluster (404 / only `controller_msp`) plus a local `genesis status` Atlas process is CMSP → `atlas_cli` on the PCVM. `port_set.list` → `port_set_list.json`; each `port_set.get <uuid>` → `port_set_get.json`.
 
@@ -115,9 +118,10 @@ Logged as `DUMP start` / `DUMP done` / `DATASET … dumped N records`, then `===
 | `entity_groups` | `interfaces.entity_group_manager.iter_all()` | `create_entity_group_map` |
 | `policies` | `interfaces.network_security_policy_manager.iter_all()` | `insert_policy_graph` (`policy["data"]`) |
 | `hosts` | `host_manager`, else `idfcli` `node` | `load_infrastructure_data` |
-| `vms` | `idfcli` `mh_vm` / `vm` | `_fetch_vms` |
-| `subnets` | `idfcli` `subnet` / `virtual_network` | `_fetch_subnets` |
-| `vpcs` | `idfcli` `vpc` (falls back to `virtual_network`) | `create_vpc_map` |
+| `vms` | `idfcli` `vm` / `mh_vm`; NIC join from `virtual_nic`; VM categories from `abac_entity_capability` (`kind=vm`) | `_fetch_vms` |
+| `subnets` | `idfcli` `virtual_network` / `subnet` (`overlay_network_uuid`, `advanced_networking`); subnet categories from `abac_entity_capability` | `_fetch_subnets` |
+| `vpcs` | Overlay stubs from `overlay_network_uuid` plus ALL_VLAN `00000000-0000-0000-0000-000000000001` named `VLAN` | `create_vpc_map` |
+| `categories` | `idfcli` `abac_category` merged with `category` (`key:value`) | `create_category_map` |
 | `clusters` | `idfcli` `cluster` | `load_infrastructure_data` |
 | `projects` | `idfcli` `project` | `load_projects_data` |
 | `categories` | `idfcli` `category` | `create_category_map` |
@@ -127,10 +131,16 @@ Logged as `DUMP start` / `DUMP done` / `DATASET … dumped N records`, then `===
 | `port_set_list` | `atlas_cli -o json port_set.list` (SMSP/CMSP wrapped) | Atlas port-set inventory |
 | `port_set_get` | `atlas_cli -o json port_set.get <uuid>` for each listed UUID | Atlas port-set details (`virtual_nic_uuid_list`, …) |
 
-Two parallel batches:
+Each VM NIC `nic_network_info` includes:
 
-1. Flow managers + hosts + zkcat + FQDN
-2. VMs / subnets / VPCs / clusters / projects / categories / network functions
+- `vm_categories` / `vm_category_ids` — this VM's categories (`key:value`)
+- `subnet.ext_id`, `subnet.name`, `subnet.subnet_type`, `subnet.is_advanced_networking`
+- `subnet.categories` (`key:value`) and `subnet.category_ids`
+- `vpc.ext_id`, `vpc.name` (never empty; overlay name inferred from subnet prefix), `vpc.categories`, `vpc.category_ids`
+
+The IDF `vm` entity has no `category_id_list`. VM/subnet/VPC categories are joined from `idfcli abac_entity_capability` (`kind` + `kind_id` / `uuid` + `category_id_list`).
+
+VLAN NICs use the same ALL_VLAN VPC as `neo4j_db_insert.py`: uuid `00000000-0000-0000-0000-000000000001`, name `VLAN`. Overlay NICs use `overlay_network_uuid`.
 
 Manager object conversion also runs in a thread pool.
 
@@ -153,7 +163,7 @@ Exact prefetch CLI flag names come from `neo4j_prefetcher.add_prefetch_cli_argum
 ## Logs to expect
 
 ```text
-INFO FlowInterfaces managers + parallel idfcli infra (no v4_client)
+INFO FlowInterfaces + platform detect in parallel (no v4_client)
 INFO FlowInterfaces ready
 INFO Parallel batch: ['address_groups', 'service_groups', ...]
 INFO DUMP start address_groups
