@@ -20,6 +20,7 @@ from collections import defaultdict
 CH_HOST = "127.0.0.1"
 CH_NATIVE = "19000"
 BATCH = 10_000
+U_SG_NS = uuid_lib.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
 ZERO = "00000000-0000-0000-0000-000000000000"
 ALL_VLAN_VPC = "00000000-0000-0000-0000-000000000001"
 DEFAULT_PROJECT_EXT_ID = ZERO
@@ -42,6 +43,8 @@ DROP VIEW IF EXISTS flow_policy.v_port_set_nic_diff;
 DROP TABLE IF EXISTS flow_policy.atlas_port_set;
 DROP TABLE IF EXISTS flow_policy.computed_port_set;
 DROP TABLE IF EXISTS flow_policy.portset;
+DROP TABLE IF EXISTS flow_policy.u_sg;
+DROP TABLE IF EXISTS flow_policy.sg;
 DROP TABLE IF EXISTS flow_policy.vm_nic;
 DROP TABLE IF EXISTS flow_policy.category;
 CREATE TABLE flow_policy.portset
@@ -49,6 +52,7 @@ CREATE TABLE flow_policy.portset
     port_set_uuid              UUID,
     computed_port_set_uuid     UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
     atlas_port_set_uuid        UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+    applied_to_port_set_uuid   UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
     policy_uuid                UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
     rule_uuid                  UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
     role                       LowCardinality(String) DEFAULT '',
@@ -65,10 +69,26 @@ CREATE TABLE flow_policy.portset
     subnet_ext_ids             Array(UUID) DEFAULT [],
     subnet_list                Array(String) DEFAULT [],
     exception_list             Array(String) DEFAULT [],
+    applied_to_entity_group_uuid UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+    applied_to_vm_category_refs  Array(UUID) DEFAULT [],
+    applied_to_subnet_category_refs Array(UUID) DEFAULT [],
+    applied_to_vpc_category_refs Array(UUID) DEFAULT [],
+    applied_to_vm_ext_ids        Array(UUID) DEFAULT [],
+    applied_to_subnet_ext_ids    Array(UUID) DEFAULT [],
+    applied_to_subnet_list       Array(String) DEFAULT [],
+    applied_to_exception_list    Array(String) DEFAULT [],
+    applied_to_entity_group_name String DEFAULT '',
+    applied_to_vm_category_names Array(String) DEFAULT [],
+    applied_to_subnet_category_names Array(String) DEFAULT [],
+    applied_to_vpc_category_names Array(String) DEFAULT [],
     effective_vpc_refs         Array(UUID) DEFAULT [],
     effective_vpc_names        Array(String) DEFAULT [],
     eg_address_grp             Array(String) DEFAULT [],
     eg_exception_address_grp   Array(String) DEFAULT [],
+    rule_uuids                 Array(UUID) DEFAULT [],
+    rule_u_sg Array(Tuple(
+        rule_uuid UUID, u_sg_id UUID, rule_priority Int32
+    )) DEFAULT [],
     computed_nic_uuids         Array(UUID) DEFAULT [],
     atlas_nic_uuids            Array(UUID) DEFAULT [],
     policy_name                String DEFAULT '',
@@ -80,24 +100,55 @@ CREATE TABLE flow_policy.portset
     vpc_category_names         Array(String) DEFAULT [],
     reference_names            Array(String) DEFAULT [],
     computed_nics Array(Tuple(
-        vm_name String, nic_uuid UUID, subnet String, vpc String, ip String
+        vm_name String, nic_uuid UUID, subnet String, vpc String, ip String,
+        host_uuid UUID, host String, cluster_uuid UUID, cluster String
     )) DEFAULT [],
     atlas_nics Array(Tuple(
-        vm_name String, nic_uuid UUID, subnet String, vpc String, ip String
+        vm_name String, nic_uuid UUID, subnet String, vpc String, ip String,
+        host_uuid UUID, host String, cluster_uuid UUID, cluster String
     )) DEFAULT [],
     match_status               LowCardinality(String) DEFAULT '',
     mismatch_kind              LowCardinality(String) DEFAULT '',
     only_computed_nics Array(Tuple(
-        vm_name String, nic_uuid UUID, subnet String, vpc String, ip String
+        vm_name String, nic_uuid UUID, subnet String, vpc String, ip String,
+        host_uuid UUID, host String, cluster_uuid UUID, cluster String
     )) DEFAULT [],
     only_atlas_nics Array(Tuple(
-        vm_name String, nic_uuid UUID, subnet String, vpc String, ip String
+        vm_name String, nic_uuid UUID, subnet String, vpc String, ip String,
+        host_uuid UUID, host String, cluster_uuid UUID, cluster String
     )) DEFAULT [],
     all_ports                  UInt8 DEFAULT 0,
     updated_at                 DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
 ORDER BY (entity_type, port_set_uuid, policy_uuid, component_id);
+CREATE TABLE flow_policy.u_sg
+(
+    u_sg_id                    UUID,
+    sg_id                      UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+    kind                       LowCardinality(String) DEFAULT '',
+    sg_uuids                   Array(UUID) DEFAULT [],
+    sg_names                   Array(String) DEFAULT [],
+    tcp_ports                  Array(String) DEFAULT [],
+    udp_ports                  Array(String) DEFAULT [],
+    icmp_types                 Array(String) DEFAULT [],
+    icmp_v6_types              Array(String) DEFAULT [],
+    is_inline                  UInt8 DEFAULT 0,
+    is_all_ports               UInt8 DEFAULT 0,
+    secured_group_action       LowCardinality(String) DEFAULT '',
+    network_function_uuid      UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+    network_function_name      String DEFAULT '',
+    network_function_failure_handling LowCardinality(String) DEFAULT '',
+    network_function_traffic_forwarding_mode LowCardinality(String) DEFAULT '',
+    network_function_high_availability_mode LowCardinality(String) DEFAULT '',
+    network_function_nic_pairs Array(Tuple(
+        vm_uuid UUID, ingress_nic_uuid UUID, egress_nic_uuid UUID,
+        high_availability_state String, data_plane_health_status String
+    )) DEFAULT [],
+    updated_at                 DateTime64(3) DEFAULT now64()
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY u_sg_id;
 CREATE TABLE flow_policy.vm_nic
 (
     nic_uuid               UUID,
@@ -108,6 +159,10 @@ CREATE TABLE flow_policy.vm_nic
     vpc_uuid               UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
     vpc                    LowCardinality(String) DEFAULT '',
     ip                     String DEFAULT '',
+    host_uuid              UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+    host                   LowCardinality(String) DEFAULT '',
+    cluster_uuid           UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+    cluster                LowCardinality(String) DEFAULT '',
     updated_at             DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
@@ -1065,8 +1120,44 @@ def vpc_uuid_for_subnet(subnet, vpc_names):
     return best_uid
 
 
-def collect_nics(vms, subnets=None, vpc_names=None):
+def parse_dump_uuid(value):
+    """Dump host/cluster UUID. Host cluster may be '<uuid>::<id>'."""
+    if isinstance(value, dict):
+        value = value.get("ext_id") or value.get("uuid") or value.get("id")
+    text = str(value or "").strip()
+    if "::" in text:
+        text = text.split("::", 1)[0]
+    return as_uuid(text)
+
+
+def host_cluster_map(hosts, clusters):
+    """host_uuid -> host name + cluster uuid/name from dump hosts.json / clusters.json."""
+    cluster_names = {}
+    for row in clusters or []:
+        rec = unwrap(row)
+        uid = parse_dump_uuid(rec.get("ext_id") or rec.get("uuid"))
+        if uid:
+            cluster_names[uid] = str(rec.get("name") or "")
+    out = {}
+    for row in hosts or []:
+        rec = unwrap(row)
+        uid = parse_dump_uuid(rec.get("ext_id"))
+        if not uid:
+            continue
+        cluster = rec.get("cluster")
+        cluster_uuid = parse_dump_uuid(cluster)
+        out[uid] = {
+            "host_uuid": uid,
+            "host": str(rec.get("host_name") or rec.get("name") or ""),
+            "cluster_uuid": cluster_uuid or ZERO,
+            "cluster": cluster_names.get(cluster_uuid, ""),
+        }
+    return out
+
+
+def collect_nics(vms, subnets=None, vpc_names=None, host_map=None):
     nics = []
+    host_map = host_map or {}
     sub_by = {}
     for row in subnets or []:
         uid = as_uuid(row.get("ext_id"))
@@ -1074,6 +1165,7 @@ def collect_nics(vms, subnets=None, vpc_names=None):
             sub_by[uid] = row
     vpc_names = vpc_names or {}
     for vm in vms or []:
+        vm = unwrap(vm)
         name = str(vm.get("name") or "")
         if (name.startswith("VMx_") or name.startswith("VMx")
                 or name.startswith("flow-") or name.startswith("auto_pc_")):
@@ -1111,6 +1203,8 @@ def collect_nics(vms, subnets=None, vpc_names=None):
             flags.update(net)
             flags.update(subnet)
             advanced = nic_advanced_networking(flags)
+            host_uuid = parse_dump_uuid(vm.get("host"))
+            host_rec = host_map.get(host_uuid) or {}
             nics.append({
                 "nic_uuid": nic_uuid,
                 "vm_uuid": vm_uuid or ZERO,
@@ -1124,6 +1218,10 @@ def collect_nics(vms, subnets=None, vpc_names=None):
                 "is_advanced_networking": advanced,
                 "vpc_uuid": vpc_uuid,
                 "vpc": str(vpc.get("name") or ""),
+                "host_uuid": host_uuid or ZERO,
+                "host": host_rec.get("host") or "",
+                "cluster_uuid": host_rec.get("cluster_uuid") or ZERO,
+                "cluster": host_rec.get("cluster") or "",
                 "project_uuid": (
                     entity_project_uuid(nic)
                     or entity_project_uuid(net)
@@ -1150,6 +1248,65 @@ def expand_selector(sel, eg_map):
                 expanded[key] = value
         return expanded
     return sel
+
+
+def empty_applied_to_columns():
+    """FLEX applied_to_* defaults. Zero UUID / empty arrays when not FLEX."""
+    return {
+        "applied_to_port_set_uuid": ZERO,
+        "applied_to_entity_group_uuid": ZERO,
+        "applied_to_vm_category_refs": [],
+        "applied_to_subnet_category_refs": [],
+        "applied_to_vpc_category_refs": [],
+        "applied_to_vm_ext_ids": [],
+        "applied_to_subnet_ext_ids": [],
+        "applied_to_subnet_list": [],
+        "applied_to_exception_list": [],
+        "applied_to_entity_group_name": "",
+        "applied_to_vm_category_names": [],
+        "applied_to_subnet_category_names": [],
+        "applied_to_vpc_category_names": [],
+    }
+
+
+def applied_to_columns_from_row(row):
+    """Second port-set UUID + expanded applied_to EG selector on src/dest."""
+    cols = empty_applied_to_columns()
+    cols["applied_to_port_set_uuid"] = row.get("port_set_uuid") or ZERO
+    cols["applied_to_entity_group_uuid"] = (
+        row.get("entity_group_uuid") or ZERO)
+    cols["applied_to_vm_category_refs"] = list(
+        row.get("vm_category_refs") or [])
+    cols["applied_to_subnet_category_refs"] = list(
+        row.get("subnet_category_refs") or [])
+    cols["applied_to_vpc_category_refs"] = list(
+        row.get("vpc_category_refs") or [])
+    cols["applied_to_vm_ext_ids"] = list(row.get("vm_ext_ids") or [])
+    cols["applied_to_subnet_ext_ids"] = list(row.get("subnet_ext_ids") or [])
+    cols["applied_to_subnet_list"] = list(row.get("subnet_list") or [])
+    cols["applied_to_exception_list"] = list(row.get("exception_list") or [])
+    cols["applied_to_entity_group_name"] = row.get("entity_group_name") or ""
+    cols["applied_to_vm_category_names"] = list(
+        row.get("vm_category_names") or [])
+    cols["applied_to_subnet_category_names"] = list(
+        row.get("subnet_category_names") or [])
+    cols["applied_to_vpc_category_names"] = list(
+        row.get("vpc_category_names") or [])
+    return cols
+
+
+def attach_applied_to_on_peers(rows):
+    """Copy applied_to EG onto FLEX src/dest (two port-set UUIDs)."""
+    applied = None
+    for row in rows:
+        if row.get("role") == "applied_to":
+            applied = row
+            break
+    if not applied:
+        return
+    payload = applied_to_columns_from_row(applied)
+    for row in rows:
+        row.update(payload)
 
 
 def nic_match_key(comp, sel):
@@ -1238,9 +1395,11 @@ def add_component(
         "subnet_ext_ids": uuid_list(sel.get("subnet_ext_ids")),
         "subnet_list": list(sel.get("subnet_list") or []),
         "exception_list": list(sel.get("exception_list") or []),
+        **empty_applied_to_columns(),
         "eg_address_grp": list(sel.get("eg_address_grp") or []),
         "eg_exception_address_grp": list(
             sel.get("eg_exception_address_grp") or []),
+        **empty_rule_service_columns(),
         "vm_category_names": list(sel.get("vm_category_names") or []),
         "subnet_category_names": list(sel.get("subnet_category_names") or []),
         "vpc_category_names": list(sel.get("vpc_category_names") or []),
@@ -1306,6 +1465,299 @@ def apply_rule_service_defaults(rule):
         spec["icmpTypes"] = ["any:any"]
         spec["icmpv6Types"] = ["any:any"]
     return spec
+
+
+def unique_strings(values):
+    out = []
+    seen = set()
+    for value in values or []:
+        text = str(value).strip() if value is not None else ""
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def port_range_strings(services, kind):
+    """Dump tcp_services / icmp_services -> 'start-end' or 'type:code'."""
+    out = []
+    for ports in services or []:
+        if isinstance(ports, str):
+            if ports.strip():
+                out.append(ports.strip())
+            continue
+        if not isinstance(ports, dict):
+            continue
+        if ports.get("is_all_allowed"):
+            out.append("0-65535" if kind in ("tcp", "udp") else "any:any")
+            continue
+        if kind in ("tcp", "udp"):
+            start = ports.get("start_port", 0)
+            end = ports.get("end_port", start)
+            out.append(str(start) if start == end else "%s-%s" % (start, end))
+        else:
+            out.append("%s:%s" % (ports.get("type", 0), ports.get("code", 0)))
+    return unique_strings(out)
+
+
+def nf_pair_rows(pairs):
+    out = []
+    for pair in pairs or []:
+        if not isinstance(pair, dict):
+            continue
+        out.append({
+            "vm_uuid": as_uuid(
+                pair.get("vm_reference") or pair.get("vm_uuid")) or ZERO,
+            "ingress_nic_uuid": as_uuid(
+                pair.get("ingress_nic_reference")
+                or pair.get("ingress_nic_uuid")) or ZERO,
+            "egress_nic_uuid": as_uuid(
+                pair.get("egress_nic_reference")
+                or pair.get("egress_nic_uuid")) or ZERO,
+            "high_availability_state": str(
+                pair.get("high_availability_state") or ""),
+            "data_plane_health_status": str(
+                pair.get("data_plane_health_status") or ""),
+        })
+    return out
+
+
+def rule_priority_value(rule, spec=None):
+    """FLEX dump spec.priority (rule_priority). APPLICATION has none → 0."""
+    spec = spec if spec is not None else ((rule or {}).get("spec") or {})
+    raw = spec.get("priority")
+    if raw is None:
+        raw = (rule or {}).get("priority")
+    try:
+        return int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def empty_rule_service_columns():
+    return {"rule_uuids": [], "rule_u_sg": []}
+
+
+def load_service_group_map(rows):
+    out = {}
+    for row in rows or []:
+        sg = unwrap(row)
+        uid = as_uuid(sg.get("ext_id"))
+        if not uid:
+            continue
+        out[uid] = {
+            "name": str(sg.get("name") or ""),
+            "tcp_ports": port_range_strings(
+                sg.get("tcp_services") or sg.get("tcpPort"), "tcp"),
+            "udp_ports": port_range_strings(
+                sg.get("udp_services") or sg.get("udpPort"), "udp"),
+            "icmp_types": port_range_strings(
+                sg.get("icmp_services") or sg.get("icmpTypes"), "icmp"),
+            "icmp_v6_types": port_range_strings(
+                sg.get("icmp_v6_services") or sg.get("icmpv6Types"), "icmpv6"),
+        }
+    return out
+
+
+def load_network_function_map(nf_rows, by_id):
+    out = {}
+
+    def add(nf):
+        if not isinstance(nf, dict):
+            return
+        rec = unwrap(nf)
+        uid = as_uuid(rec.get("ext_id"))
+        if uid:
+            out[uid] = rec
+
+    for row in nf_rows or []:
+        add(row)
+    if isinstance(by_id, dict):
+        for uid, wrapped in by_id.items():
+            detailed = wrapped
+            if isinstance(wrapped, dict) and isinstance(wrapped.get("data"), dict):
+                detailed = wrapped["data"]
+            if isinstance(detailed, dict) and not detailed.get("ext_id"):
+                detailed = dict(detailed)
+                detailed["ext_id"] = uid
+            add(detailed)
+    return out
+
+
+def sg_row(kind, refs, names, tcp, udp, icmp, icmp6):
+    """Dump SG UUID, list of dump SG UUIDs, or inline ports. No synthetic sg_id."""
+    refs = list(refs or [])
+    sg_id = refs[0] if kind == "sg" and refs else ZERO
+    return {
+        "sg_id": sg_id,
+        "kind": kind,
+        "sg_uuids": refs,
+        "sg_names": list(names or []),
+        "tcp_ports": list(tcp or []),
+        "udp_ports": list(udp or []),
+        "icmp_types": list(icmp or []),
+        "icmp_v6_types": list(icmp6 or []),
+        "is_inline": 1 if kind == "inline" else 0,
+    }
+
+
+def sg_row_key(row):
+    return (
+        row.get("kind") or "",
+        row.get("sg_id") or ZERO,
+        tuple(row.get("sg_uuids") or []),
+        tuple(row.get("tcp_ports") or []),
+        tuple(row.get("udp_ports") or []),
+        tuple(row.get("icmp_types") or []),
+        tuple(row.get("icmp_v6_types") or []),
+    )
+
+
+def unique_service(spec, sg_map, nf_map):
+    """u_sg_id = sg identity + service function (dump network_function_reference).
+
+    sg_id is the dump UUID when the rule names one SG. Lists and inline
+    ports keep sg_id zero (no synthetic SG UUID).
+    """
+    spec = spec or {}
+    sg_map = sg_map or {}
+    nf_map = nf_map or {}
+    refs = uuid_list(spec.get("service_group_references"))
+    for uid in uuid_list(spec.get("secured_group_service_references")):
+        if uid not in refs:
+            refs.append(uid)
+    names = []
+    tcp = list(spec.get("tcpPort") or [])
+    udp = list(spec.get("udpPort") or [])
+    icmp = list(spec.get("icmpTypes") or [])
+    icmp6 = list(spec.get("icmpv6Types") or [])
+    details = spec.get("service_group_details") or []
+    if details:
+        tcp, udp, icmp, icmp6 = [], [], [], []
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+            uid = as_uuid(detail.get("ext_id"))
+            if uid and uid not in refs:
+                refs.append(uid)
+            if uid or str(detail.get("name") or ""):
+                names.append(str(detail.get("name") or ""))
+            tcp.extend(detail.get("tcpPort") or port_range_strings(
+                detail.get("tcp_services"), "tcp"))
+            udp.extend(detail.get("udpPort") or port_range_strings(
+                detail.get("udp_services"), "udp"))
+            icmp.extend(detail.get("icmpTypes") or port_range_strings(
+                detail.get("icmp_services"), "icmp"))
+            icmp6.extend(detail.get("icmpv6Types") or port_range_strings(
+                detail.get("icmp_v6_services"), "icmpv6"))
+    elif refs:
+        tcp, udp, icmp, icmp6 = [], [], [], []
+        for uid in refs:
+            rec = sg_map.get(uid) or {}
+            names.append(str(rec.get("name") or ""))
+            tcp.extend(rec.get("tcp_ports") or [])
+            udp.extend(rec.get("udp_ports") or [])
+            icmp.extend(rec.get("icmp_types") or [])
+            icmp6.extend(rec.get("icmp_v6_types") or [])
+    if spec.get("tcp_services"):
+        tcp = port_range_strings(spec.get("tcp_services"), "tcp")
+    if spec.get("udp_services"):
+        udp = port_range_strings(spec.get("udp_services"), "udp")
+    if spec.get("icmp_services"):
+        icmp = port_range_strings(spec.get("icmp_services"), "icmp")
+    if spec.get("icmp_v6_services"):
+        icmp6 = port_range_strings(spec.get("icmp_v6_services"), "icmpv6")
+    tcp = unique_strings(tcp)
+    udp = unique_strings(udp)
+    icmp = unique_strings(icmp)
+    icmp6 = unique_strings(icmp6)
+    if len(refs) > 1:
+        kind = "sg_list"
+    elif refs:
+        kind = "sg"
+    else:
+        kind = "inline"
+    action = spec.get("secured_group_action") or spec.get("action") or ""
+    if isinstance(action, list):
+        action = action[0] if action else ""
+    action = str(action or "")
+    nf_uid = as_uuid(spec.get("network_function_reference"))
+    nf = {}
+    details_nf = spec.get("network_function_details")
+    if isinstance(details_nf, dict) and details_nf:
+        nf = unwrap(details_nf)
+        nf_uid = as_uuid(nf.get("ext_id")) or nf_uid
+    elif nf_uid:
+        nf = nf_map.get(nf_uid) or {}
+    sg = sg_row(kind, refs, names, tcp, udp, icmp, icmp6)
+    inline_ports = kind == "inline"
+    body = "|".join((
+        kind,
+        ",".join(refs),
+        ",".join(tcp if inline_ports else []),
+        ",".join(udp if inline_ports else []),
+        ",".join(icmp if inline_ports else []),
+        ",".join(icmp6 if inline_ports else []),
+        nf_uid or "",
+        action,
+    ))
+    u_sg_id = str(uuid_lib.uuid5(U_SG_NS, "u_sg:" + body))
+    all_ports = int(
+        tcp == ["0-65535"] and udp == ["0-65535"]
+        and icmp == ["any:any"] and icmp6 == ["any:any"])
+    return u_sg_id, {
+        "u_sg_id": u_sg_id,
+        "sg_id": sg["sg_id"],
+        "kind": kind,
+        "sg_uuids": refs,
+        "sg_names": names,
+        "tcp_ports": tcp,
+        "udp_ports": udp,
+        "icmp_types": icmp,
+        "icmp_v6_types": icmp6,
+        "is_inline": sg["is_inline"],
+        "is_all_ports": all_ports,
+        "secured_group_action": action,
+        "network_function_uuid": nf_uid or ZERO,
+        "network_function_name": str(nf.get("name") or ""),
+        "network_function_failure_handling": str(
+            nf.get("failure_handling") or ""),
+        "network_function_traffic_forwarding_mode": str(
+            nf.get("traffic_forwarding_mode") or ""),
+        "network_function_high_availability_mode": str(
+            nf.get("high_availability_mode") or ""),
+        "network_function_nic_pairs": nf_pair_rows(nf.get("nic_pairs")),
+    }
+
+
+def attach_portset_rules(components):
+    """Same port-set UUID can belong to many rules; each rule has its u_sg_id."""
+    by_ps = defaultdict(list)
+    for row in components:
+        rid = row.get("rule_uuid") or ZERO
+        uid = row.get("_u_sg_id") or ZERO
+        prio = int(row.get("_rule_priority") or 0)
+        if rid and rid != ZERO:
+            by_ps[row["port_set_uuid"]].append((rid, uid, prio))
+    for row in components:
+        pairs = []
+        seen = set()
+        for rid, uid, prio in by_ps.get(row["port_set_uuid"], []):
+            key = (rid, uid)
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append({
+                "rule_uuid": rid,
+                "u_sg_id": uid,
+                "rule_priority": prio,
+            })
+        row["rule_uuids"] = list(dict.fromkeys(
+            pair["rule_uuid"] for pair in pairs))
+        row["rule_u_sg"] = pairs
+        row.pop("_u_sg_id", None)
+        row.pop("_rule_priority", None)
 
 
 def _side_eg_uuid(spec, prefix):
@@ -1575,7 +2027,7 @@ def effective_vpc_refs(vpc_cat_refs, vpc_cat_map):
 
 def nic_tuples(uuids, by_uuid, ipv4_only=None, ipv6_only=None,
                is_ipv6_traffic_allowed=False, link_local=True):
-    """(vm_name, nic_uuid, subnet, vpc, ip) per NIC.
+    """(vm_name, nic_uuid, subnet, vpc, ip, host_uuid, host, cluster_uuid, cluster).
 
     When ipv4_only/ipv6_only are set, IP text follows those dump flags.
     Atlas rows pass neither so every learned IP is kept.
@@ -1596,6 +2048,10 @@ def nic_tuples(uuids, by_uuid, ipv4_only=None, ipv6_only=None,
             "subnet": rec.get("subnet") or "",
             "vpc": rec.get("vpc") or "",
             "ip": ",".join(ips),
+            "host_uuid": rec.get("host_uuid") or ZERO,
+            "host": rec.get("host") or "",
+            "cluster_uuid": rec.get("cluster_uuid") or ZERO,
+            "cluster": rec.get("cluster") or "",
         })
     return out
 
@@ -1677,7 +2133,16 @@ def main():
             eg, ag_map, fqdn_map, vms, subnet_rows)
         for eg in egs}
     eg_map.pop("", None)
-    nics = collect_nics(vms, subnet_rows, atlas_vpc_names(atlas_get))
+    sg_map = load_service_group_map(
+        load_json(os.path.join(dump_dir, "service_groups.json"), []))
+    nf_map = load_network_function_map(
+        load_json(os.path.join(dump_dir, "network_functions.json"), []),
+        load_json(os.path.join(dump_dir, "network_function_by_id.json"), {}) or {})
+    nics = collect_nics(
+        vms, subnet_rows, atlas_vpc_names(atlas_get),
+        host_cluster_map(
+            load_json(os.path.join(dump_dir, "hosts.json"), []),
+            load_json(os.path.join(dump_dir, "clusters.json"), [])))
     insert_json("flow_policy.vm_nic", [{
         "nic_uuid": nic["nic_uuid"],
         "vm_uuid": nic["vm_uuid"] or ZERO,
@@ -1687,10 +2152,15 @@ def main():
         "vpc_uuid": nic["vpc_uuid"] or ZERO,
         "vpc": nic["vpc"],
         "ip": nic["ip"],
+        "host_uuid": nic.get("host_uuid") or ZERO,
+        "host": nic.get("host") or "",
+        "cluster_uuid": nic.get("cluster_uuid") or ZERO,
+        "cluster": nic.get("cluster") or "",
     } for nic in nics])
     atlas = atlas_by_uuid(atlas_list, atlas_get)
 
     components = []
+    u_sg_rows = {}
     verify = {
         "save": 0, "allow_all": 0, "ag_na": 0, "no_hash": 0, "ok": 0,
         "dump_should_allow_any": 0, "dump_should_allow_any_src": 0,
@@ -1716,7 +2186,10 @@ def main():
             if orig.get("is_all_protocol_allowed"):
                 verify["dump_all_protocol"] += 1
             spec = apply_rule_service_defaults(rule)
+            u_sg_id, u_sg_row = unique_service(spec, sg_map, nf_map)
             rule_type = str(rule.get("type") or "")
+            rule_start = len(components)
+            hashed_ok = False
             for role, sel in selectors_from_spec(spec, ag_map, rule_type):
                 reason = add_component(
                     components, role, sel, policy, rule, namespace, scope,
@@ -1725,7 +2198,16 @@ def main():
                 if role == "applied_to":
                     key = "applied_to_%s" % reason
                     verify[key] = verify.get(key, 0) + 1
+                if reason == "ok":
+                    components[-1]["_u_sg_id"] = u_sg_id
+                    components[-1]["_rule_priority"] = rule_priority_value(
+                        rule, spec)
+                    hashed_ok = True
+            if hashed_ok:
+                u_sg_rows[u_sg_id] = u_sg_row
+            attach_applied_to_on_peers(components[rule_start:])
 
+    attach_portset_rules(components)
     attach_nics(components, nics, vlan_uuid, global_uuid)
     nic_by_uuid = {nic["nic_uuid"]: nic for nic in nics}
 
@@ -1766,6 +2248,19 @@ def main():
         row["vpc_category_names"] = category_names(
             row.get("vpc_category_refs") or [], cat_map,
             row.get("vpc_category_names"))
+        row["applied_to_entity_group_name"] = (
+            row.get("applied_to_entity_group_name")
+            or eg_names.get(row.get("applied_to_entity_group_uuid"), "")
+            or "")
+        row["applied_to_vm_category_names"] = category_names(
+            row.get("applied_to_vm_category_refs") or [], cat_map,
+            row.get("applied_to_vm_category_names"))
+        row["applied_to_subnet_category_names"] = category_names(
+            row.get("applied_to_subnet_category_refs") or [], cat_map,
+            row.get("applied_to_subnet_category_names"))
+        row["applied_to_vpc_category_names"] = category_names(
+            row.get("applied_to_vpc_category_refs") or [], cat_map,
+            row.get("applied_to_vpc_category_names"))
         if row.get("role") or (row.get("computed_port_set_uuid") or ZERO) != ZERO:
             vpc_refs = effective_vpc_refs(
                 row.get("vpc_category_refs"), vpc_cat_map)
@@ -1838,16 +2333,19 @@ def main():
             "subnet_ext_ids": [],
             "subnet_list": [],
             "exception_list": [],
+            **empty_applied_to_columns(),
             "effective_vpc_refs": [],
             "effective_vpc_names": [],
             "eg_address_grp": [],
             "eg_exception_address_grp": [],
+            **empty_rule_service_columns(),
             "computed_nic_uuids": [],
             "atlas_nic_uuids": list(atlas_rec.get("atlas_nic_uuids") or []),
             "all_ports": 0,
         }
         fill_names(row, atlas_rec)
         rows.append(row)
+    insert_json("flow_policy.u_sg", list(u_sg_rows.values()))
     insert_json("flow_policy.portset", rows)
 
     print("nics", len(nics))
@@ -1894,8 +2392,25 @@ def main():
     print("eg_direct_vm", sum(
         1 for sel in eg_map.values() if sel.get("has_direct_vm")))
     print("computed_uuids", len(seen))
+    print("service_groups", len(sg_map))
+    print("network_functions", len(nf_map))
+    print("u_sg", len(u_sg_rows))
+    print("u_sg_sg", sum(1 for row in u_sg_rows.values() if row.get("kind") == "sg"))
+    print("u_sg_sg_list", sum(
+        1 for row in u_sg_rows.values() if row.get("kind") == "sg_list"))
+    print("u_sg_inline", sum(
+        1 for row in u_sg_rows.values() if row.get("kind") == "inline"))
+    print("u_sg_with_nf", sum(
+        1 for row in u_sg_rows.values()
+        if (row.get("network_function_uuid") or ZERO) != ZERO))
+    print("nics_with_host", sum(
+        1 for nic in nics if (nic.get("host_uuid") or ZERO) != ZERO))
+    print("nics_with_cluster", sum(
+        1 for nic in nics if (nic.get("cluster_uuid") or ZERO) != ZERO))
     print("rows", len(rows))
-    print("inserted_into", "flow_policy.portset,flow_policy.vm_nic,flow_policy.category")
+    print("inserted_into",
+          "flow_policy.portset,flow_policy.u_sg,"
+          "flow_policy.vm_nic,flow_policy.category")
 
 
 if __name__ == "__main__":

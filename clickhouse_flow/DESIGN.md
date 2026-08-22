@@ -7,9 +7,23 @@ One ClickHouse table. Each row has two port-set UUID columns:
 
 Zero UUID means not present. Port-set matching is UUID-only.
 
-NIC membership is `Array(Tuple(vm_name, nic_uuid, subnet, vpc, ip))` on
-`computed_nics` and `atlas_nics` so one NIC is one tuple. `flow_policy.vm_nic`
-is the NIC lookup table for mismatch diffs.
+FLEX dest/src keep the selector arrays **and** `applied_to_*` from the
+applied_to entity group. That is two port-set UUIDs on the same row:
+`port_set_uuid` (src/dest) and `applied_to_port_set_uuid`. `role =
+'applied_to'` is the second UUID as its own Atlas-matching row.
+
+One port-set UUID can belong to many rules, and each rule can have a
+different service. `rule_uuids` lists those rules. `rule_u_sg` is
+`Array(Tuple(rule_uuid, u_sg_id, rule_priority))`. FLEX dump
+`spec.priority` (rule_priority) is per-rule on that tuple.
+`flow_policy.u_sg` maps a unique service: dump `sg_id`, a list of dump
+SG UUIDs (`sg_uuids`), or inline ports.
+
+NIC membership is
+`Array(Tuple(vm_name, nic_uuid, subnet, vpc, ip, host_uuid, host, cluster_uuid, cluster))`
+on `computed_nics` and `atlas_nics`. Host comes from dump VM `host.ext_id`;
+cluster comes from `hosts.json` → `clusters.json`. `flow_policy.vm_nic`
+is the NIC lookup table.
 
 ## Workload Summary
 
