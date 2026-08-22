@@ -5,7 +5,8 @@
 # Dump Flow policy + infra objects for neo4j_db_insert.py prefetch JSON.
 # Run on PCVM:
 #   /home/nutanix/.venvs/flow/bin/python3 flow_pc_dump_for_neo4j.py \
-#       --output /tmp/flow_neo4j_dump.json
+#       --output_dir /tmp/flow_pc_neo4j_prefetch
+# Writes per-dataset JSON files plus all.json (not /tmp/flow_neo4j_dump.json).
 #
 
 import json
@@ -37,8 +38,18 @@ from flow.flow_types_pb2 import (
 FLAGS = gflags.FLAGS
 
 gflags.DEFINE_string(
-    "output", "/tmp/flow_neo4j_dump.json",
-    "Output JSON path for neo4j_db_insert prefetch payload.")
+    "output_dir", "/tmp/flow_pc_neo4j_prefetch",
+    "Directory for per-dataset JSON files plus all.json (not the old "
+    "/tmp/flow_neo4j_dump.json).")
+gflags.DEFINE_string(
+    "output", "",
+    "Combined JSON path. Default: <output_dir>/all.json")
+gflags.DEFINE_string(
+    "log_file", "",
+    "Log file path. Default: <output_dir>/dump.log")
+gflags.DEFINE_string(
+    "from_json", "",
+    "If set, skip fetch and split this combined JSON into output_dir files.")
 gflags.DEFINE_integer(
     "workers", 12,
     "Parallel worker count for dataset fetch and conversion.")
@@ -86,11 +97,20 @@ IP_VERSION = {1: "IPV4", 2: "IPV6", 3: "IPV4_IPV6"}
 APP_DIR = {1: "INBOUND", 2: "OUTBOUND"}
 
 
-def _setup_logging():
-  logging.basicConfig(
-      level=logging.INFO,
-      format="%(asctime)s %(levelname)s %(message)s",
-      datefmt="%Y-%m-%d %H:%M:%S")
+def _setup_logging(log_file=None):
+  log_format = logging.Formatter(
+      "%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
+  root = logging.getLogger()
+  root.setLevel(logging.INFO)
+  for handler in list(root.handlers):
+    root.removeHandler(handler)
+  stream = logging.StreamHandler(sys.stdout)
+  stream.setFormatter(log_format)
+  root.addHandler(stream)
+  if log_file:
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(log_format)
+    root.addHandler(file_handler)
 
 
 def _uuid_str(value):
@@ -1205,6 +1225,13 @@ def fetch_fqdn_map(interfaces):
   return mapping
 
 
+DATASET_FILES = (
+    "address_groups", "service_groups", "entity_groups", "policies",
+    "vms", "subnets", "vpcs", "hosts", "clusters", "projects",
+    "categories", "network_functions", "network_function_by_id",
+    "fqdn_to_ip_map", "dump_errors")
+
+
 def _json_default(value):
   if hasattr(value, "hex"):
     return _uuid_str(value)
@@ -1213,6 +1240,37 @@ def _json_default(value):
   if hasattr(value, "isoformat"):
     return value.isoformat()
   return str(value)
+
+
+def _write_json_file(path, value):
+  parent = os.path.dirname(path)
+  if parent:
+    os.makedirs(parent, exist_ok=True)
+  with open(path, "w") as handle:
+    json.dump(value, handle, indent=2, default=_json_default)
+  size = os.path.getsize(path)
+  LOG.info("Wrote %s (%s bytes)", path, size)
+  return path, size
+
+
+def _write_outputs(payload, output_dir, combined_path, workers):
+  os.makedirs(output_dir, exist_ok=True)
+  scalar = {
+      "source": payload.get("source"),
+      "dumped_at": payload.get("dumped_at"),
+      "vlan_unique_uuid": payload.get("vlan_unique_uuid", ""),
+      "global_unique_uuid": payload.get("global_unique_uuid", ""),
+  }
+  jobs = [(os.path.join(output_dir, "meta.json"), scalar)]
+  for key in DATASET_FILES:
+    if key in payload:
+      jobs.append((os.path.join(output_dir, "%s.json" % key), payload[key]))
+  jobs.append((combined_path, payload))
+
+  LOG.info("Writing %s dataset files under %s plus combined %s",
+           len(jobs) - 1, output_dir, combined_path)
+  with ThreadPoolExecutor(max_workers=max(1, min(workers, len(jobs)))) as pool:
+    list(pool.map(lambda item: _write_json_file(item[0], item[1]), jobs))
 
 
 def _empty_for(name):
@@ -1255,7 +1313,6 @@ def _run_jobs_parallel(jobs, workers, timeout_secs, errors):
 
 
 def main(argv):
-  _setup_logging()
   try:
     argv = FLAGS(argv)
   except gflags.FlagsError as err:
@@ -1263,9 +1320,26 @@ def main(argv):
     return 1
   del argv
 
+  output_dir = FLAGS.output_dir or "/tmp/flow_pc_neo4j_prefetch"
+  os.makedirs(output_dir, exist_ok=True)
+  combined_path = FLAGS.output or os.path.join(output_dir, "all.json")
+  log_file = FLAGS.log_file or os.path.join(output_dir, "dump.log")
+  _setup_logging(log_file)
+  workers = max(1, int(FLAGS.workers))
+
+  LOG.info("logs=%s combined=%s output_dir=%s",
+           log_file, combined_path, output_dir)
+
+  if FLAGS.from_json:
+    LOG.info("Splitting existing dump %s (no live fetch)", FLAGS.from_json)
+    with open(FLAGS.from_json, "r") as handle:
+      payload = json.load(handle)
+    _write_outputs(payload, output_dir, combined_path, workers)
+    LOG.info("Split complete under %s", output_dir)
+    return 0
+
   LOG.info("FlowInterfaces managers + parallel idfcli infra (no v4_client)")
-  LOG.info("output=%s workers=%s timeout=%ss",
-           FLAGS.output, FLAGS.workers, FLAGS.dataset_timeout_secs)
+  LOG.info("workers=%s timeout=%ss", workers, FLAGS.dataset_timeout_secs)
   interfaces = FlowInterfaces()
   LOG.info("FlowInterfaces ready")
 
@@ -1306,10 +1380,7 @@ def main(argv):
       interfaces, payload.get("network_functions") or [])
   payload["dump_errors"] = errors
 
-  LOG.info("Writing %s", FLAGS.output)
-  with open(FLAGS.output, "w") as handle:
-    json.dump(payload, handle, indent=2, default=_json_default)
-  LOG.info("Wrote %s bytes", os.path.getsize(FLAGS.output))
+  _write_outputs(payload, output_dir, combined_path, workers)
 
   LOG.info("===== DUMP SUMMARY =====")
   for key in (
@@ -1327,7 +1398,8 @@ def main(argv):
     LOG.warning("Failed datasets: %s", ", ".join(sorted(errors)))
     if FLAGS.fail_on_error:
       return 2
-  LOG.info("Done. Use with neo4j_db_insert.py prefetch JSON.")
+  LOG.info("Done. Combined file: %s", combined_path)
+  LOG.info("Per-dataset files: %s/*.json", output_dir)
   return 0
 
 

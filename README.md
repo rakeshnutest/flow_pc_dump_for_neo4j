@@ -31,11 +31,51 @@ Place it anywhere readable by `nutanix` (for example `/tmp`).
 
 ## Run
 
+Writes **one file per dataset** under `--output_dir` (default `/tmp/flow_pc_neo4j_prefetch/`), plus a combined `all.json` and `dump.log`. This is **not** `/tmp/flow_neo4j_dump.json`.
+
 ```bash
 /home/nutanix/.venvs/flow/bin/python3 /tmp/flow_pc_dump_for_neo4j.py \
-  --output /tmp/flow_neo4j_dump.json \
+  --output_dir /tmp/flow_pc_neo4j_prefetch \
   --workers 12 \
   --dataset_timeout_secs 90
+```
+
+Output layout:
+
+```text
+/tmp/flow_pc_neo4j_prefetch/
+  all.json                 # combined prefetch payload
+  dump.log                 # run log
+  meta.json                # source, timestamps, unique uuids
+  address_groups.json
+  service_groups.json
+  entity_groups.json
+  policies.json
+  vms.json
+  subnets.json
+  vpcs.json
+  hosts.json
+  clusters.json
+  projects.json
+  categories.json
+  network_functions.json
+  network_function_by_id.json
+  fqdn_to_ip_map.json
+  dump_errors.json
+```
+
+Combined file override:
+
+```bash
+--output /home/nutanix/flow_pc_neo4j_prefetch_all.json
+```
+
+Split an existing combined dump (no live fetch):
+
+```bash
+/home/nutanix/.venvs/flow/bin/python3 /tmp/flow_pc_dump_for_neo4j.py \
+  --from_json /tmp/flow_neo4j_dump.json \
+  --output_dir /tmp/flow_pc_neo4j_prefetch
 ```
 
 Flags are parsed **before** `FlowInterfaces()` is created. That is required on PC; accessing Flow clients before `FLAGS(argv)` triggers `UnparsedFlagAccessError` and Zeus/ZK retry loops.
@@ -44,8 +84,11 @@ Flags are parsed **before** `FlowInterfaces()` is created. That is required on P
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--output` | `/tmp/flow_neo4j_dump.json` | Prefetch JSON path |
-| `--workers` | `12` | Parallel workers for fetch + conversion |
+| `--output_dir` | `/tmp/flow_pc_neo4j_prefetch` | Directory for per-dataset JSON + `all.json` + `dump.log` |
+| `--output` | `<output_dir>/all.json` | Combined JSON path |
+| `--log_file` | `<output_dir>/dump.log` | Log file |
+| `--from_json` | unset | Split an existing combined JSON; skip live fetch |
+| `--workers` | `12` | Parallel workers for fetch + conversion + writes |
 | `--dataset_timeout_secs` | `90` | Per-batch timeout; hung datasets are skipped |
 | `--fail_on_error` | off | Exit non-zero if any dataset fails |
 
@@ -85,18 +128,16 @@ Manager object conversion also runs in a thread pool.
 
 ## Use with neo4j_db_insert.py
 
-Copy the JSON off the PC, then run the inserter with prefetch (same keys as `_fetch_from_source`):
+Copy the combined file off the PC, then run the inserter with prefetch:
 
 ```bash
-# on PC, after dump
-ls -lh /tmp/flow_neo4j_dump.json
-scp nutanix@<PC_IP>:/tmp/flow_neo4j_dump.json .
+ls -lh /tmp/flow_pc_neo4j_prefetch/
+scp -r nutanix@<PC_IP>:/tmp/flow_pc_neo4j_prefetch .
 
-# on the machine that runs neo4j_db_insert.py
 python neo4j_db_insert.py \
   --pc-ip <PC_IP> \
   --neo4j-ip <NEO4J_IP> \
-  --prefetch-json /tmp/flow_neo4j_dump.json
+  --prefetch-json /tmp/flow_pc_neo4j_prefetch/all.json
 ```
 
 Exact prefetch CLI flag names come from `neo4j_prefetcher.add_prefetch_cli_arguments` in your tree. The JSON keys above are what `PolicyGraphInserter` reads (`address_groups`, `service_groups`, `entity_groups`, `policies`, `vms`, …).
