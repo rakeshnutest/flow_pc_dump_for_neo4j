@@ -1115,6 +1115,20 @@ def _all_vlan_vpc():
   }
 
 
+def _collect_ips(*groups):
+  """Merge IP field lists from IDF, preserving order and dropping empties."""
+  out = []
+  seen = set()
+  for group in groups:
+    for ip in _as_list(group):
+      text = str(ip).strip()
+      if not text or text in seen:
+        continue
+      seen.add(text)
+      out.append(text)
+  return out
+
+
 def _learned_ips(ips):
   ipv4 = []
   ipv6 = []
@@ -1157,7 +1171,12 @@ def _map_vm(row):
       row, "node", "host_uuid", "node_uuid", "host"))
   project_id = _uuid_str(_first_attr(row, "project_uuid", "project_reference", "project"))
   nics = []
-  ips = _as_list(_first_attr(row, "ip_addresses", "ipv4_addresses", "vm_ipv4_addresses", default=[]))
+  ips = _collect_ips(
+      row.get("ip_addresses"),
+      row.get("ipv4_addresses"),
+      row.get("vm_ipv4_addresses"),
+      row.get("ipv6_addresses"),
+      row.get("vm_ipv6_addresses"))
   subnet_id = _uuid_str(_first_attr(row, "subnet_uuid", "virtual_network_uuid"))
   mac = _first_attr(row, "mac_address", "mac")
   nic_ids = _as_list(_first_attr(row, "virtual_nic_uuids", "nic_uuid", default=[]))
@@ -1186,8 +1205,12 @@ def _map_virtual_nic(row):
       "subnet_id": _uuid_str(_first_attr(
           row, "virtual_network", "subnet_uuid", "network_uuid")),
       "mac": _first_attr(row, "mac_address", "mac") or "",
-      "ips": _as_list(_first_attr(
-          row, "ipv4_addresses", "assigned_ipv4_addresses", default=[])),
+      "ips": _collect_ips(
+          row.get("ipv4_addresses"),
+          row.get("assigned_ipv4_addresses"),
+          row.get("ipv6_addresses"),
+          row.get("assigned_ipv6_addresses"),
+          row.get("ip_addresses")),
   }
 
 
@@ -1198,14 +1221,21 @@ def _attach_virtual_nics(vms, nic_rows=None, nic_errors=None):
     LOG.warning("virtual_nic: %s", err)
   by_vm = {}
   with_subnet = 0
+  with_ipv4 = 0
+  with_ipv6 = 0
   for nic in nic_rows:
     vm_id = nic.get("vm")
     if not vm_id:
       continue
     payload = _nic_payload(
         nic.get("ext_id"), nic.get("mac"), nic.get("subnet_id"), nic.get("ips"))
-    if payload["nic_network_info"].get("subnet"):
+    network = payload["nic_network_info"]
+    if network.get("subnet"):
       with_subnet += 1
+    if network.get("ipv4_info"):
+      with_ipv4 += 1
+    if network.get("ipv6_info"):
+      with_ipv6 += 1
     by_vm.setdefault(vm_id, []).append(payload)
   attached = 0
   for vm in vms:
@@ -1214,8 +1244,9 @@ def _attach_virtual_nics(vms, nic_rows=None, nic_errors=None):
       vm["nics"] = nics
       attached += 1
   LOG.info(
-      "DUMP virtual_nic mapped=%s vms_attached=%s nics_with_subnet=%s",
-      len(nic_rows), attached, with_subnet)
+      "DUMP virtual_nic mapped=%s vms_attached=%s nics_with_subnet=%s "
+      "nics_with_ipv4=%s nics_with_ipv6=%s",
+      len(nic_rows), attached, with_subnet, with_ipv4, with_ipv6)
   return vms
 
 

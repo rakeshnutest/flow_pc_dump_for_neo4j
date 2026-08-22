@@ -413,10 +413,13 @@ def match_nics(sel, index, namespace, vlan_uuid, global_uuid, scope):
     return scope_nics(matched, index, namespace, vlan_uuid, global_uuid, scope)
 
 
-def learned_ips(nic):
-    info = (nic.get("nic_network_info") or {}).get("ipv4_info") or {}
+def ip_values(items):
+    if items is None:
+        return []
+    if isinstance(items, dict):
+        items = [items]
     out = []
-    for item in info.get("learned_ip_addresses") or []:
+    for item in items or []:
         if isinstance(item, dict):
             val = item.get("value")
             if val:
@@ -424,6 +427,29 @@ def learned_ips(nic):
         elif item:
             out.append(str(item))
     return out
+
+
+def learned_ips(nic):
+    """IPv4 + every IPv6 (link-local and global) from learned and config."""
+    network = nic.get("nic_network_info") or {}
+    out = []
+    ipv4_info = network.get("ipv4_info") or {}
+    ipv4_config = network.get("ipv4_config") or {}
+    ipv6_info = network.get("ipv6_info") or {}
+    ipv6_config = network.get("ipv6_config") or {}
+    out.extend(ip_values(ipv4_info.get("learned_ip_addresses")))
+    out.extend(ip_values(ipv4_config.get("ip_address")))
+    out.extend(ip_values(ipv4_config.get("secondary_ip_address_list")))
+    out.extend(ip_values(ipv6_info.get("learned_ipv6_addresses")))
+    out.extend(ip_values(ipv6_config.get("ip_address")))
+    out.extend(ip_values(ipv6_config.get("secondary_ipv6_address_list")))
+    seen = set()
+    uniq = []
+    for ip in out:
+        if ip not in seen:
+            seen.add(ip)
+            uniq.append(ip)
+    return uniq
 
 
 def collect_nics(vms):
