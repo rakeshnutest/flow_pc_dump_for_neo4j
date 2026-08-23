@@ -9,19 +9,47 @@
 #       --workers 16 --atlas_get_workers 32
 # Writes per-dataset JSON files plus compact all.json.
 #
+# Host OVS/OVN/virsh is collected from PC via AHV Gateway (mTLS :7030),
+# never SSH to AHV. Per PE hypervisor, the dump loops until these exist:
+#   ovs-vsctl show, ovs-dpctl -s show, ovs-ofctl dump-flows brAtlas
+#   (plus other brAtlas ofctl outputs), virsh list --all, virsh dumpxml
+#   (tap/MAC), tap devices, OVN/OVS DB (ovn*.db / conf.db).
+# Classes: networking + avm (+ ovn if the gateway advertises it).
+# Cert: /home/certs/ClusterHealthService/ (ClusterHealthService).
+#
+# Where files land:
+#   AHV Gateway: <output_dir>/ahv_gateway/<hypervisor_ip>/
+#   CMSP OVN:    <output_dir>/cmsp_ovn/{anc-ovn,anc-ovn-ic-db,anc-policydb}/
+# On CMSP, OVN Northbound/Southbound live in kubectl pods on the PC
+# (anc-ovn-0 / container anc-ovn), not on AHV. Collect with:
+#   sudo kubectl exec anc-ovn-0 -c anc-ovn -- \
+#     ovsdb-client dump unix:/var/run/ovn/ovnnb_db.sock
+#   sudo kubectl exec anc-ovn-0 -c anc-ovn -- \
+#     ovsdb-client dump unix:/var/run/ovn/ovnsb_db.sock
+# Do not pass -it (this dump has no TTY). Loop until both dumps exist.
+#
 
 import codecs
+import hashlib
 import json
 import logging
 import os
 import re
+import shutil
+import ssl
 import subprocess
 import sys
+import tarfile
 import threading
+import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime
+try:
+  from urllib.request import Request, urlopen
+except ImportError:
+  from urllib2 import Request, urlopen
 
 import gflags
 
@@ -70,6 +98,37 @@ gflags.DEFINE_integer(
 gflags.DEFINE_integer(
     "atlas_get_workers", 32,
     "Parallel atlas_cli port_set.get processes.")
+gflags.DEFINE_boolean(
+    "skip_ahv_gateway", False,
+    "Skip AHV Gateway host collect (OVS/virsh/tap/brAtlas/OVN DB). "
+    "Default is to pull every PE hypervisor via mTLS :7030, no AHV SSH.")
+gflags.DEFINE_integer(
+    "ahv_gateway_timeout_secs", 1800,
+    "Deadline for AHV Gateway collect across all hosts (retries until "
+    "every required artifact exists or this budget is spent).")
+gflags.DEFINE_integer(
+    "ahv_gateway_class_timeout_secs", 300,
+    "Per-class HTTP timeout when streaming a bugtool tarball.")
+gflags.DEFINE_integer(
+    "ahv_gateway_workers", 8,
+    "Parallel PE hypervisor AHV Gateway collects.")
+gflags.DEFINE_integer(
+    "ahv_gateway_port", 7030,
+    "AHV Gateway HTTPS port.")
+gflags.DEFINE_string(
+    "ahv_gateway_cert_dir",
+    "/home/certs/ClusterHealthService",
+    "Directory with <name>.crt and <name>.key for AHV Gateway mTLS.")
+gflags.DEFINE_boolean(
+    "skip_cmsp_ovn", False,
+    "Skip CMSP kubectl OVN Northbound/Southbound dump "
+    "(anc-ovn / anc-ovn-ic-db / anc-policydb). Default is to collect.")
+gflags.DEFINE_integer(
+    "cmsp_ovn_timeout_secs", 1800,
+    "Retry budget for CMSP kubectl OVN NB/SB collect (dump + backup).")
+gflags.DEFINE_string(
+    "cmsp_ovn_namespace", "",
+    "Kubernetes namespace for ANC/OVN pods. Empty searches all namespaces.")
 
 LOG = logging.getLogger("flow_pc_dump")
 
@@ -1542,12 +1601,23 @@ def _map_host(row):
 
 
 def _map_cluster(row):
-  ext_id = _uuid_str(_first_attr(row, "ext_id", "uuid", "id")) or ""
-  ip_addr = _first_attr(row, "ip_address", "external_ip", "cluster_external_ip") or ""
+  ext_id = _uuid_str(_first_attr(
+      row, "ext_id", "uuid", "id", "cluster_uuid", "clusterUuid")) or ""
+  ip_addr = _first_attr(
+      row,
+      "ip_address", "external_ip", "cluster_external_ip",
+      "cluster_external_ip_address", "external_ip_address",
+      "cluster_external_address", "clusterExternalIPAddress",
+      "cluster_ip", "external_address") or ""
+  if isinstance(ip_addr, dict):
+    nested = _first_attr(ip_addr, "ipv4", "value", "ip") or ""
+    if isinstance(nested, dict):
+      nested = nested.get("value") or ""
+    ip_addr = nested
   return {
       "ext_id": ext_id,
-      "name": _first_attr(row, "name", "cluster_name") or "",
-      "network": {"external_address": {"ipv4": {"value": str(ip_addr)}}},
+      "name": _first_attr(row, "name", "cluster_name", "clusterName") or "",
+      "network": {"external_address": {"ipv4": {"value": str(ip_addr or "")}}},
   }
 
 
@@ -2476,53 +2546,71 @@ def fetch_clusters(_interfaces):
   rows, errors = _idf_mapped(("cluster",), _map_cluster)
   for err in errors:
     LOG.warning("clusters fallback: %s", err)
+  ncli_rows = []
+  try:
+    ncli_rows = _ncli_registered_clusters()
+  except Exception as err:
+    LOG.debug("clusters ncli vip enrich skipped: %s", err)
+  by_uuid = {}
+  by_name = {}
+  for rec in ncli_rows:
+    uid = rec.get("ext_id") or ""
+    name = rec.get("name") or ""
+    if uid:
+      by_uuid[uid] = rec
+    if name and name not in by_name:
+      by_name[name] = rec
+  have = set(row.get("ext_id") for row in rows if row.get("ext_id"))
+  for row in rows:
+    net = row.setdefault("network", {}).setdefault(
+        "external_address", {}).setdefault("ipv4", {})
+    if net.get("value"):
+      continue
+    rec = by_uuid.get(row.get("ext_id") or "") or by_name.get(row.get("name") or "")
+    if rec and rec.get("vip"):
+      net["value"] = rec["vip"]
+  for rec in ncli_rows:
+    uid = rec.get("ext_id") or ""
+    if not uid or uid in have:
+      continue
+    rows.append({
+        "ext_id": uid,
+        "name": rec.get("name") or "",
+        "network": {
+            "external_address": {"ipv4": {"value": rec.get("vip") or ""}},
+        },
+    })
+    have.add(uid)
   LOG.info("DUMP done clusters count=%s", len(rows))
   return rows
 
 
 def fetch_projects(interfaces):
   LOG.info("DUMP start projects")
-  manager = _get_manager(
-      interfaces, "project_manager", "projects_manager", "iam_project_manager")
-  if manager is None:
-    _log_matching_managers(interfaces, "project")
-  rows = []
-  if manager:
-    rows = _dump_manager("projects", manager, convert_project)
-  if not rows:
-    mapped, errors = _idf_mapped(
-        ("project", "projects", "iam_project", "xi_project", "abac_project"),
-        _map_project)
-    for err in errors:
-      LOG.warning("projects fallback: %s", err)
-    rows = mapped
-    LOG.info("DUMP done projects count=%s (idf)", len(rows))
-  return rows
+  # Skip FlowInterfaces.project_manager getattr: Zeus can FATAL the process.
+  mapped, errors = _idf_mapped(
+      ("project", "projects", "iam_project", "xi_project", "abac_project"),
+      _map_project)
+  for err in errors:
+    LOG.warning("projects fallback: %s", err)
+  LOG.info("DUMP done projects count=%s (idf)", len(mapped))
+  return mapped
 
 
 def fetch_network_functions(interfaces):
   LOG.info("DUMP start network_functions")
-  manager = _get_manager(
-      interfaces, "network_function_manager", "service_function_manager")
-  if manager is None:
-    _log_matching_managers(interfaces, "function")
-  rows = []
-  if manager:
-    rows = _dump_manager("network_functions", manager, convert_network_function)
-  if not rows:
-    mapped, errors = _idf_mapped(
-        ("atlas_network_function", "network_function", "flow_network_function"),
-        _map_nf)
-    for err in errors:
-      LOG.warning("network_functions fallback: %s", err)
-    rows = mapped
-    LOG.info("DUMP done network_functions count=%s (idf)", len(rows))
-  return rows
+  # Skip FlowInterfaces.network_function_manager getattr: Zeus can FATAL.
+  mapped, errors = _idf_mapped(
+      ("atlas_network_function", "network_function", "flow_network_function"),
+      _map_nf)
+  for err in errors:
+    LOG.warning("network_functions fallback: %s", err)
+  LOG.info("DUMP done network_functions count=%s (idf)", len(mapped))
+  return mapped
 
 
 def fetch_network_function_by_id(interfaces, nf_rows, extra_uuids=None):
-  manager = _get_manager(
-      interfaces, "network_function_manager", "service_function_manager")
+  manager = None
   by_id = {}
   seen = set()
   for nf in nf_rows or []:
@@ -2983,11 +3071,1218 @@ def fetch_port_set_get(platform_info, uuids, workers, timeout_secs, errors):
   return gets
 
 
+# Host OVS via AHV Gateway mTLS; OVN NB/SB via kubectl on CMSP PC.
+NCLI_BIN_CANDIDATES = (
+    "/usr/local/nutanix/bin/ncli",
+    "/home/nutanix/prism/cli/ncli",
+    "/usr/local/nutanix/cluster/bin/ncli",
+    "/usr/bin/ncli")
+_IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+_NCLI_CLUSTER_ID_RE = re.compile(
+    r"Cluster Id\s*:\s*([0-9a-fA-F-]{36})", re.I)
+
+def _ncli_bin():
+  for path in NCLI_BIN_CANDIDATES:
+    if os.path.exists(path) and os.access(path, os.X_OK):
+      return path
+  return "ncli"
+
+
+def _run_cmd_argv(argv, timeout_secs, cwd=None, stdout_path=None, binary=False):
+  if not argv:
+    return -1, "", "empty argv"
+  timeout_secs = max(5, int(timeout_secs))
+  try:
+    if stdout_path:
+      os.makedirs(os.path.dirname(stdout_path) or ".", exist_ok=True)
+      mode = "wb" if binary else "w"
+      with open(stdout_path, mode) as handle:
+        proc = subprocess.run(
+            argv, stdout=handle, stderr=subprocess.PIPE, check=False,
+            timeout=timeout_secs, stdin=subprocess.DEVNULL, cwd=cwd,
+            text=not binary)
+      stderr = proc.stderr or (b"" if binary else "")
+      if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", "replace")
+      return proc.returncode, "", stderr
+    proc = subprocess.run(
+        argv, capture_output=True, text=True, check=False,
+        timeout=timeout_secs, stdin=subprocess.DEVNULL, cwd=cwd)
+  except subprocess.TimeoutExpired as err:
+    out = err.stdout or ""
+    if isinstance(out, bytes):
+      out = out.decode("utf-8", "replace")
+    return -1, out or "", "timed out after %ss: %s" % (
+        timeout_secs, " ".join(str(x) for x in argv))
+  except Exception as err:
+    return -1, "", str(err)
+  return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+def _clean_ipv4(raw):
+  text = str(raw or "").strip().strip("[],;\"'")
+  if text.lower() in ("", "-", "none", "null", "n/a"):
+    return ""
+  if isinstance(raw, dict):
+    text = str(raw.get("value") or raw.get("ipv4") or raw.get("ip") or "")
+    if isinstance(text, dict):
+      text = str(text.get("value") or "")
+    text = text.strip()
+  if _IPV4_RE.match(text):
+    return text
+  return ""
+
+
+def _ncli_run(args, timeout_secs=60):
+  binary = _ncli_bin()
+  argv = [binary] + list(args)
+  rc, stdout, stderr = _run_cmd_argv(argv, timeout_secs)
+  if rc == 0 or stdout:
+    return rc, stdout, stderr
+  cmd = " ".join(["ncli"] + list(args))
+  out, err, prc = _run_profile_cmd(cmd, timeout=timeout_secs)
+  return prc, out, err
+
+
+def _ncli_local_cluster():
+  rec = {"ext_id": "", "name": "", "vip": ""}
+  for args in (
+      ["cluster", "info"],
+      ["cluster", "get-params", "json=true"],
+      ["cluster", "get-params", "-json=true"],
+  ):
+    rc, stdout, stderr = _ncli_run(args, timeout_secs=45)
+    text = "%s\n%s" % (stdout, stderr)
+    parsed = _safe_json_loads(stdout)
+    if isinstance(parsed, dict):
+      data = parsed.get("data") or parsed.get("clusterInfo") or parsed
+      if isinstance(data, list) and data:
+        data = data[0]
+      if isinstance(data, dict):
+        rec["ext_id"] = rec["ext_id"] or _uuid_str(
+            data.get("clusterUuid") or data.get("uuid") or
+            data.get("id") or data.get("cluster_uuid")) or ""
+        rec["name"] = rec["name"] or str(
+            data.get("clusterName") or data.get("name") or "")
+        rec["vip"] = rec["vip"] or _clean_ipv4(
+            data.get("clusterExternalIPAddress")
+            or data.get("clusterExternalIp")
+            or data.get("externalIp"))
+    uid_match = _NCLI_CLUSTER_ID_RE.search(text)
+    if uid_match:
+      rec["ext_id"] = rec["ext_id"] or (_uuid_str(uid_match.group(1)) or "")
+    name_match = re.search(r"Cluster Name\s*:\s*(.+)", text, re.I)
+    if name_match and not rec["name"]:
+      rec["name"] = name_match.group(1).strip()
+    vip_match = re.search(
+        r"Cluster External IP(?: Address)?\s*:\s*(\S+)", text, re.I)
+    if vip_match and not rec["vip"]:
+      rec["vip"] = _clean_ipv4(vip_match.group(1))
+    if rec["ext_id"]:
+      break
+  return rec
+
+
+def _parse_ncli_multicluster_json(parsed):
+  rows = []
+  if isinstance(parsed, dict):
+    data = parsed.get("data") or parsed.get("clusters") or parsed.get("items")
+    if data is None:
+      data = [parsed]
+  elif isinstance(parsed, list):
+    data = parsed
+  else:
+    return rows
+  for entry in data:
+    if not isinstance(entry, dict):
+      continue
+    details = entry.get("clusterDetails") or entry.get("cluster_details") or {}
+    if not isinstance(details, dict):
+      details = {}
+    uid = _uuid_str(
+        entry.get("clusterUuid") or entry.get("cluster_uuid")
+        or entry.get("uuid") or entry.get("id")
+        or details.get("clusterUuid") or details.get("uuid")) or ""
+    if not uid:
+      continue
+    name = (
+        entry.get("clusterName") or entry.get("cluster_name")
+        or entry.get("name") or details.get("clusterName")
+        or details.get("name") or "")
+    vip = _clean_ipv4(
+        entry.get("clusterExternalIPAddress")
+        or entry.get("clusterExternalIp")
+        or entry.get("externalIp")
+        or details.get("clusterExternalIPAddress")
+        or details.get("clusterExternalIp")
+        or details.get("externalIp"))
+    ips_raw = (
+        details.get("ipAddresses") or details.get("ip_addresses")
+        or entry.get("ipAddresses") or entry.get("controllerVmIps")
+        or [])
+    cvm_ips = []
+    for ip in _as_list(ips_raw):
+      cleaned = _clean_ipv4(ip)
+      if cleaned and cleaned not in cvm_ips:
+        cvm_ips.append(cleaned)
+    rows.append({
+        "ext_id": uid,
+        "name": str(name or ""),
+        "vip": vip,
+        "cvm_ips": cvm_ips,
+        "cluster_type": str(
+            entry.get("clusterType") or entry.get("clusterFunction")
+            or details.get("clusterType") or ""),
+        "source": "ncli_multicluster_json",
+    })
+  return rows
+
+
+def _parse_ncli_multicluster_text(text):
+  rows = []
+  blocks = re.split(r"(?=Cluster Id\s*:)", text or "", flags=re.I)
+  for block in blocks:
+    uid_match = _NCLI_CLUSTER_ID_RE.search(block)
+    if not uid_match:
+      continue
+    uid = _uuid_str(uid_match.group(1)) or ""
+    if not uid:
+      continue
+    name_match = re.search(r"Cluster Name\s*:\s*(.+)", block, re.I)
+    vip_match = re.search(
+        r"Cluster External IP(?: Address)?\s*:\s*(\S+)", block, re.I)
+    if not vip_match:
+      vip_match = re.search(
+          r"External (?:or Masquerading )?IP(?: Address)?\s*:\s*(\S+)",
+          block, re.I)
+    cvm_match = re.search(
+        r"Controller VM IP Addre[^:]*:\s*\[([^\]]*)\]", block, re.I)
+    ctype_match = re.search(
+        r"Cluster (?:Type|Function)\s*:\s*(\S+)", block, re.I)
+    cvm_ips = []
+    if cvm_match:
+      for part in cvm_match.group(1).split(","):
+        cleaned = _clean_ipv4(part)
+        if cleaned and cleaned not in cvm_ips:
+          cvm_ips.append(cleaned)
+    rows.append({
+        "ext_id": uid,
+        "name": (name_match.group(1).strip() if name_match else ""),
+        "vip": _clean_ipv4(vip_match.group(1) if vip_match else ""),
+        "cvm_ips": cvm_ips,
+        "cluster_type": (ctype_match.group(1).strip() if ctype_match else ""),
+        "source": "ncli_multicluster_text",
+    })
+  return rows
+
+
+def _ncli_registered_clusters():
+  rows = []
+  for args in (
+      ["multicluster", "get-cluster-state", "json=true"],
+      ["multicluster", "get-cluster-state", "--json=true"],
+      ["multicluster", "get-cluster-state", "-json=true"],
+      ["multicluster", "get-cluster-state"],
+      ["cluster", "list"],
+  ):
+    rc, stdout, stderr = _ncli_run(args, timeout_secs=60)
+    text = "%s\n%s" % (stdout, stderr)
+    parsed = _safe_json_loads(stdout)
+    found = []
+    if parsed is not None:
+      found = _parse_ncli_multicluster_json(parsed)
+    if not found:
+      found = _parse_ncli_multicluster_text(text)
+    if found:
+      rows = found
+      break
+  return rows
+
+
+def _cluster_from_dump_row(row):
+  if not isinstance(row, dict):
+    return {}
+  uid = _uuid_str(row.get("ext_id") or row.get("uuid") or row.get("id")) or ""
+  name = row.get("name") or ""
+  net = ((row.get("network") or {}).get("external_address") or {})
+  ipv4 = net.get("ipv4") if isinstance(net, dict) else {}
+  vip = ""
+  if isinstance(ipv4, dict):
+    vip = _clean_ipv4(ipv4.get("value"))
+  elif ipv4:
+    vip = _clean_ipv4(ipv4)
+  if not vip:
+    vip = _clean_ipv4(row.get("vip") or row.get("ip_address"))
+  return {
+      "ext_id": uid,
+      "name": str(name or ""),
+      "vip": vip,
+      "cvm_ips": list(row.get("cvm_ips") or []),
+      "cluster_type": str(row.get("cluster_type") or ""),
+      "source": row.get("source") or "dump",
+  }
+
+
+def _is_pc_cluster(rec, local_uuid=""):
+  uid = (rec.get("ext_id") or "").lower()
+  if local_uuid and uid and uid == local_uuid.lower():
+    return True
+  name = str(rec.get("name") or "").strip()
+  if re.match(r"^PC[_\-\s]", name, re.I):
+    return True
+  if name.lower() in ("prism central", "prism_central", "prismcentral"):
+    return True
+  ctype = str(rec.get("cluster_type") or rec.get("cluster_function") or "")
+  if re.search(
+      r"multicluster|prism.?central|kprismcentral|\bkpc\b", ctype, re.I):
+    return True
+  return False
+
+
+def _merge_pe_rec(dst, src):
+  if not dst:
+    return dict(src)
+  for key in ("name", "vip", "cluster_type", "source"):
+    if not dst.get(key) and src.get(key):
+      dst[key] = src[key]
+  cvms = list(dst.get("cvm_ips") or [])
+  for ip in src.get("cvm_ips") or []:
+    if ip and ip not in cvms:
+      cvms.append(ip)
+  dst["cvm_ips"] = cvms
+  return dst
+
+
+def _discover_pe_clusters(dump_clusters=None):
+  local = _ncli_local_cluster()
+  local_uuid = local.get("ext_id") or ""
+  found = {}
+  errors = []
+  sources = []
+
+  def _add(rec, source):
+    if not rec:
+      return
+    rec = dict(rec)
+    rec["source"] = source
+    uid = rec.get("ext_id") or ""
+    if not uid:
+      return
+    if _is_pc_cluster(rec, local_uuid):
+      return
+    found[uid] = _merge_pe_rec(found.get(uid), rec)
+
+  if dump_clusters:
+    sources.append("dump_clusters")
+    for row in dump_clusters:
+      _add(_cluster_from_dump_row(row), "dump_clusters")
+  try:
+    ncli_rows = _ncli_registered_clusters()
+    if ncli_rows:
+      sources.append("ncli")
+      for rec in ncli_rows:
+        _add(rec, rec.get("source") or "ncli")
+  except Exception as err:
+    errors.append("ncli: %s" % err)
+  try:
+    idf_rows, idf_errs = _idf_mapped(("cluster",), _map_cluster)
+    for err in idf_errs:
+      errors.append("idf: %s" % err)
+    if idf_rows:
+      sources.append("idf")
+      for row in idf_rows:
+        _add(_cluster_from_dump_row(row), "idf")
+  except Exception as err:
+    errors.append("idf: %s" % err)
+  pes = list(found.values())
+  pes.sort(key=lambda item: item.get("ext_id") or "")
+  LOG.info(
+      "DUMP PE discovery count=%s local_pc=%s sources=%s",
+      len(pes), local_uuid or "<none>", ",".join(sources) or "<none>")
+  return pes, errors, sources, local
+
+
+# AHV Gateway (PC → PE hypervisor :7030 mTLS). Never SSH to AHV.
+AHV_GW_REQUIRED = (
+    "ovs-vsctl_show",
+    "ovs-dpctl_-s_show",
+    "ovs-ofctl_dump-flows_brAtlas",
+    "virsh_list",
+    "virsh_dumpxml",
+    "tap_interface",
+    "ovn_or_ovs_db",
+)
+AHV_GW_CERT_FALLBACKS = (
+    "/home/certs/ClusterHealthService",
+    "/home/certs/PanaceaService",
+    "/home/certs/GenesisService",
+)
+
+
+def _ahv_gw_port():
+  try:
+    return int(getattr(FLAGS, "ahv_gateway_port", 7030) or 7030)
+  except (TypeError, ValueError):
+    return 7030
+
+
+def _ahv_gw_cert_pair():
+  dirs = []
+  flagged = str(getattr(FLAGS, "ahv_gateway_cert_dir", "") or "").strip()
+  if flagged:
+    dirs.append(flagged)
+  dirs.extend(AHV_GW_CERT_FALLBACKS)
+  seen = set()
+  for directory in dirs:
+    directory = os.path.abspath(directory)
+    if directory in seen or not os.path.isdir(directory):
+      continue
+    seen.add(directory)
+    name = os.path.basename(directory.rstrip("/"))
+    crt = os.path.join(directory, name + ".crt")
+    key = os.path.join(directory, name + ".key")
+    if os.path.isfile(crt) and os.path.isfile(key):
+      return crt, key, directory
+  return "", "", ""
+
+
+def _ahv_gw_ssl_context(crt, key):
+  ctx = ssl._create_unverified_context()  # AHV GW SAN omits 192.168.5.1
+  ctx.load_cert_chain(crt, key)
+  return ctx
+
+
+def _ahv_gw_open(host, path, crt, key, timeout_secs, accept="application/octet-stream"):
+  if not path.startswith("/"):
+    path = "/" + path
+  url = "https://%s:%s/api%s" % (host, _ahv_gw_port(), path)
+  req = Request(url, headers={"Accept": accept, "Accept-Encoding": "identity"})
+  return urlopen(
+      req, context=_ahv_gw_ssl_context(crt, key), timeout=timeout_secs)
+
+
+def _ahv_gw_safe_relpath(member_name):
+  text = str(member_name or "").replace("\\", "/").lstrip("/")
+  parts = [p for p in text.split("/") if p and p not in (".", "..")]
+  return os.path.join(*parts) if parts else ""
+
+
+def _ahv_gw_write_member(dest_dir, member_name, data):
+  rel = _ahv_gw_safe_relpath(member_name)
+  if not rel:
+    return ""
+  path = os.path.join(dest_dir, rel)
+  parent = os.path.dirname(path)
+  if parent:
+    os.makedirs(parent, exist_ok=True)
+  with open(path, "wb") as handle:
+    handle.write(data or b"")
+  return path
+
+
+def _ahv_gw_keep_networking(name):
+  n = str(name or "").replace("\\", "/")
+  base = n.split("/")[-1]
+  low = n.lower()
+  if "bratlas" in low and n.endswith((".stdout", ".stderr", ".rc", ".timeout")):
+    return True
+  if base in ("ovs-vsctl_show.stdout", "ovs-dpctl_-s_show.stdout"):
+    return True
+  if base.endswith(".db") and (
+      "ovn" in low or "openvswitch" in low or base == "conf.db"):
+    return True
+  if any(tok in low for tok in (
+      "ovn-nbctl", "ovn-sbctl", "ovnnb", "ovnsb", "ovn-controller")):
+    return n.endswith(".stdout") or n.endswith(".db")
+  return False
+
+
+def _ahv_gw_keep_avm(name):
+  n = str(name or "").replace("\\", "/").lower()
+  if "virsh" in n and "list_--all" in n and n.endswith(
+      (".stdout", ".stderr", ".rc")):
+    return True
+  if "dumpxml" in n and n.endswith(".stdout") and "net-dumpxml" not in n:
+    return True
+  if n.endswith(".stdout") and any(
+      tok in n for tok in ("tuntap", "domiflist")):
+    return True
+  return False
+
+
+def _ahv_gw_keep_ovn(name):
+  n = str(name or "").replace("\\", "/").lower()
+  return n.endswith(".db") or "ovn" in n
+
+
+def _ahv_gw_keep_for_class(cls, name):
+  if cls == "networking":
+    return _ahv_gw_keep_networking(name)
+  if cls == "avm":
+    return _ahv_gw_keep_avm(name)
+  if "ovn" in str(cls or "").lower():
+    return _ahv_gw_keep_ovn(name)
+  return False
+
+
+def _ahv_gw_classify_saved(path, member_name):
+  n = str(member_name or path or "").replace("\\", "/")
+  low = n.lower()
+  keys = []
+  size = 0
+  try:
+    size = os.path.getsize(path) if path and os.path.isfile(path) else 0
+  except OSError:
+    size = 0
+  if low.endswith("ovs-vsctl_show.stdout") and size > 0:
+    keys.append("ovs-vsctl_show")
+  if "ovs-dpctl_-s_show.stdout" in low and size > 0:
+    keys.append("ovs-dpctl_-s_show")
+  if "dump-flows_bratlas.stdout" in low and size > 100:
+    keys.append("ovs-ofctl_dump-flows_brAtlas")
+  if "virsh" in low and "list_--all.stdout" in low and size > 0:
+    keys.append("virsh_list")
+  if "dumpxml" in low and low.endswith(".stdout") and "net-dumpxml" not in low:
+    if size > 0:
+      keys.append("virsh_dumpxml")
+      blob = b""
+      try:
+        blob = open(path, "rb").read(65536)
+      except Exception:
+        pass
+      if b"<target" in blob and b"tap" in blob.lower():
+        keys.append("tap_interface")
+  if low.endswith(".stdout") and any(
+      tok in low for tok in ("tuntap", "domiflist")) and size > 0:
+    keys.append("tap_interface")
+  if size > 0 and (
+      (low.endswith(".db") and ("ovn" in low or "openvswitch" in low or
+                                low.endswith("conf.db"))) or
+      any(tok in low for tok in ("ovnnb", "ovnsb", "ovn-nb", "ovn-sb"))):
+    keys.append("ovn_or_ovs_db")
+  return keys
+
+
+def _ahv_gw_scan_collected(host_dir):
+  found = set()
+  files = []
+  if not host_dir or not os.path.isdir(host_dir):
+    return found, files
+  for root, _, names in os.walk(host_dir):
+    for name in names:
+      if name == "host.json":
+        continue
+      path = os.path.join(root, name)
+      rel = os.path.relpath(path, host_dir).replace("\\", "/")
+      files.append(rel)
+      found.update(_ahv_gw_classify_saved(path, rel))
+  return found, files
+
+
+def _ahv_gw_list_classes(host, crt, key, timeout_secs):
+  names = []
+  try:
+    resp = _ahv_gw_open(
+        host, "/host/v1/bugtool-classes", crt, key, min(timeout_secs, 30),
+        accept="application/json")
+    raw = resp.read()
+    resp.close()
+    data = json.loads(raw.decode("utf-8", "replace") or "{}")
+    for item in data.get("classes") or []:
+      if isinstance(item, dict) and item.get("name"):
+        names.append(str(item.get("name")))
+      elif item:
+        names.append(str(item))
+  except Exception as err:
+    LOG.debug("AHV GW class list %s failed: %s", host, err)
+  return names
+
+
+def _ahv_gw_extract_class(host, cls, dest_dir, crt, key, timeout_secs):
+  saved = []
+  resp = None
+  try:
+    resp = _ahv_gw_open(
+        host, "/host/v1/bugtool/%s" % cls, crt, key, timeout_secs)
+    tar = tarfile.open(fileobj=resp, mode="r|*")
+    for member in tar:
+      if not getattr(member, "isfile", lambda: False)():
+        continue
+      if not _ahv_gw_keep_for_class(cls, member.name):
+        continue
+      handle = tar.extractfile(member)
+      data = handle.read() if handle is not None else b""
+      path = _ahv_gw_write_member(dest_dir, member.name, data)
+      if path:
+        saved.append(path)
+  finally:
+    if resp is not None:
+      try:
+        resp.close()
+      except Exception:
+        pass
+  return saved
+
+
+def _host_hypervisor_ip(row):
+  if not isinstance(row, dict):
+    return ""
+  hyp = row.get("hypervisor") or {}
+  addr = hyp.get("external_address") if isinstance(hyp, dict) else {}
+  ipv4 = addr.get("ipv4") if isinstance(addr, dict) else {}
+  ip_addr = ""
+  if isinstance(ipv4, dict):
+    ip_addr = ipv4.get("value") or ""
+  return _clean_ipv4(
+      ip_addr
+      or row.get("hypervisor_ip")
+      or row.get("hypervisor_address")
+      or row.get("host_ip"))
+
+
+def _ncli_hypervisor_ips(cluster_uuid=""):
+  ips = []
+  arg_sets = []
+  if cluster_uuid:
+    arg_sets.extend((
+        ["host", "list", "cluster-uuid=%s" % cluster_uuid],
+        ["host", "list", "cluster-id=%s" % cluster_uuid],
+    ))
+  arg_sets.append(["host", "list"])
+  for args in arg_sets:
+    _rc, stdout, stderr = _ncli_run(args, timeout_secs=60)
+    text = "%s\n%s" % (stdout, stderr)
+    found = []
+    for match in re.finditer(
+        r"Hypervisor(?: IP)?(?: Address)?\s*:\s*(\S+)", text, re.I):
+      ip_addr = _clean_ipv4(match.group(1))
+      if ip_addr:
+        found.append(ip_addr)
+    if found:
+      ips.extend(found)
+      break
+  out = []
+  seen = set()
+  for ip_addr in ips:
+    if ip_addr not in seen:
+      seen.add(ip_addr)
+      out.append(ip_addr)
+  return out
+
+
+def _ahv_gw_discover_hosts(dump_hosts=None, dump_clusters=None):
+  pes, disc_errors, disc_sources, local_pc = _discover_pe_clusters(
+      dump_clusters)
+  local_uuid = (local_pc or {}).get("ext_id") or ""
+  pe_uuids = set(
+      (rec.get("ext_id") or "").lower()
+      for rec in pes if rec.get("ext_id"))
+  hosts = {}
+
+  def _add(ip_addr, name="", cluster_uuid="", source=""):
+    ip_addr = _clean_ipv4(ip_addr)
+    if not ip_addr:
+      return
+    rec = hosts.get(ip_addr) or {
+        "ip": ip_addr, "name": "", "cluster_uuid": "", "sources": []}
+    if name and not rec["name"]:
+      rec["name"] = name
+    if cluster_uuid and not rec["cluster_uuid"]:
+      rec["cluster_uuid"] = cluster_uuid
+    if source and source not in rec["sources"]:
+      rec["sources"].append(source)
+    hosts[ip_addr] = rec
+
+  for row in dump_hosts or []:
+    cluster_uuid = ""
+    cluster = row.get("cluster") if isinstance(row, dict) else None
+    if isinstance(cluster, dict):
+      cluster_uuid = _uuid_str(
+          cluster.get("uuid") or cluster.get("ext_id")) or ""
+    if local_uuid and cluster_uuid and cluster_uuid.lower() == local_uuid.lower():
+      continue
+    if pe_uuids and cluster_uuid and cluster_uuid.lower() not in pe_uuids:
+      continue
+    _add(
+        _host_hypervisor_ip(row),
+        name=str((row or {}).get("host_name") or (row or {}).get("name") or ""),
+        cluster_uuid=cluster_uuid,
+        source="dump_hosts")
+  for rec in pes:
+    uid = rec.get("ext_id") or ""
+    for ip_addr in _ncli_hypervisor_ips(uid):
+      _add(ip_addr, cluster_uuid=uid, source="ncli_host_list")
+  rows = list(hosts.values())
+  rows.sort(key=lambda item: item.get("ip") or "")
+  LOG.info(
+      "DUMP AHV GW hosts=%s pe_clusters=%s sources=%s",
+      len(rows), len(pes), ",".join(disc_sources) or "<none>")
+  return rows, disc_errors, disc_sources, local_pc
+
+
+def _ahv_gw_classes_for_missing(missing, advertised):
+  classes = []
+  if missing & set((
+      "ovs-vsctl_show", "ovs-dpctl_-s_show",
+      "ovs-ofctl_dump-flows_brAtlas", "ovn_or_ovs_db")):
+    classes.append("networking")
+  if missing & set(("virsh_list", "virsh_dumpxml", "tap_interface")):
+    classes.append("avm")
+  for name in advertised or []:
+    if "ovn" in name.lower() and name not in classes:
+      if "ovn_or_ovs_db" in missing:
+        classes.append(name)
+  out = []
+  seen = set()
+  for cls in classes:
+    if cls not in seen:
+      seen.add(cls)
+      out.append(cls)
+  return out or ["networking", "avm"]
+
+
+def _ahv_gw_collect_one_host(host_rec, dest_root, crt, key, deadline):
+  ip_addr = host_rec.get("ip") or ""
+  host_dir = os.path.join(dest_root, ip_addr)
+  os.makedirs(host_dir, exist_ok=True)
+  rec = {
+      "ip": ip_addr,
+      "name": host_rec.get("name") or "",
+      "cluster_uuid": host_rec.get("cluster_uuid") or "",
+      "attempts": 0,
+      "classes": [],
+      "collected": [],
+      "missing": list(AHV_GW_REQUIRED),
+      "complete": False,
+      "error": "",
+      "files": [],
+  }
+  advertised = []
+  class_timeout = max(30, int(getattr(
+      FLAGS, "ahv_gateway_class_timeout_secs", 300) or 300))
+  backoff = 5
+  while time.time() < deadline:
+    found, files = _ahv_gw_scan_collected(host_dir)
+    missing = [key for key in AHV_GW_REQUIRED if key not in found]
+    rec["collected"] = sorted(found)
+    rec["missing"] = missing
+    rec["files"] = files
+    if not missing:
+      rec["complete"] = True
+      rec["error"] = ""
+      return rec
+    if not advertised:
+      advertised = _ahv_gw_list_classes(
+          ip_addr, crt, key, min(30, max(5, int(deadline - time.time()))))
+      rec["advertised_classes"] = advertised
+    rec["attempts"] += 1
+    classes = _ahv_gw_classes_for_missing(set(missing), advertised)
+    rec["classes"] = classes
+    LOG.info(
+        "DUMP AHV GW %s attempt=%s missing=%s classes=%s",
+        ip_addr, rec["attempts"], ",".join(missing), ",".join(classes))
+    errors = []
+    for cls in classes:
+      if time.time() >= deadline:
+        break
+      remain = max(15, int(deadline - time.time()))
+      try:
+        _ahv_gw_extract_class(
+            ip_addr, cls, host_dir, crt, key, min(class_timeout, remain))
+      except Exception as err:
+        errors.append("%s:%s" % (cls, err))
+        LOG.warning("DUMP AHV GW %s class %s failed: %s", ip_addr, cls, err)
+    rec["error"] = "; ".join(errors)[:2000]
+    found, files = _ahv_gw_scan_collected(host_dir)
+    missing = [key for key in AHV_GW_REQUIRED if key not in found]
+    rec["collected"] = sorted(found)
+    rec["missing"] = missing
+    rec["files"] = files
+    if not missing:
+      rec["complete"] = True
+      rec["error"] = ""
+      return rec
+    sleep_for = min(backoff, max(0, int(deadline - time.time())))
+    if sleep_for <= 0:
+      break
+    time.sleep(sleep_for)
+    backoff = min(30, backoff * 2)
+  rec["complete"] = False
+  if not rec["error"]:
+    rec["error"] = "deadline with missing: %s" % ",".join(
+        rec.get("missing") or [])
+  return rec
+
+
+def fetch_ahv_gateway_host_state(output_dir, dump_hosts=None, dump_clusters=None,
+                                 timeout_secs=1800):
+  dest_root = os.path.join(output_dir, "ahv_gateway")
+  os.makedirs(dest_root, exist_ok=True)
+  timeout_secs = max(60, int(timeout_secs or 1800))
+  payload = {
+      "ran": False,
+      "complete": False,
+      "transport": "ahv_gateway_mtls",
+      "ssh_to_ahv": False,
+      "port": _ahv_gw_port(),
+      "required": list(AHV_GW_REQUIRED),
+      "hosts": [],
+      "hosts_total": 0,
+      "hosts_ok": 0,
+      "error": "",
+      "cert_dir": "",
+  }
+  crt, key, cert_dir = _ahv_gw_cert_pair()
+  payload["cert_dir"] = cert_dir
+  if not crt:
+    payload["error"] = (
+        "AHV Gateway client certs not found under %s" % (
+            getattr(FLAGS, "ahv_gateway_cert_dir", "") or
+            AHV_GW_CERT_FALLBACKS[0]))
+    LOG.warning("DUMP AHV GW: %s", payload["error"])
+    _write_json_file(os.path.join(dest_root, "index.json"), payload)
+    return payload
+  hosts, disc_errors, disc_sources, local_pc = _ahv_gw_discover_hosts(
+      dump_hosts, dump_clusters)
+  payload["discovery"] = {
+      "sources": disc_sources,
+      "errors": disc_errors,
+      "local_pc": local_pc,
+  }
+  payload["hosts_total"] = len(hosts)
+  if not hosts:
+    payload["error"] = "no PE hypervisor IPs for AHV Gateway collect"
+    LOG.warning("DUMP AHV GW: %s", payload["error"])
+    _write_json_file(os.path.join(dest_root, "index.json"), payload)
+    return payload
+  payload["ran"] = True
+  deadline = time.time() + timeout_secs
+  workers = max(1, int(getattr(FLAGS, "ahv_gateway_workers", 8) or 8))
+  LOG.info(
+      "DUMP AHV GW start hosts=%s workers=%s timeout=%ss cert=%s",
+      len(hosts), workers, timeout_secs, cert_dir)
+  recs = []
+  if workers == 1 or len(hosts) == 1:
+    for host_rec in hosts:
+      recs.append(_ahv_gw_collect_one_host(
+          host_rec, dest_root, crt, key, deadline))
+  else:
+    with ThreadPoolExecutor(max_workers=min(workers, len(hosts))) as pool:
+      futs = [
+          pool.submit(
+              _ahv_gw_collect_one_host, host_rec, dest_root, crt, key,
+              deadline)
+          for host_rec in hosts
+      ]
+      for fut in futs:
+        recs.append(fut.result())
+  recs.sort(key=lambda item: item.get("ip") or "")
+  payload["hosts"] = recs
+  payload["hosts_ok"] = sum(1 for rec in recs if rec.get("complete"))
+  payload["complete"] = bool(recs) and payload["hosts_ok"] == len(recs)
+  if not payload["complete"]:
+    bad = [
+        "%s:%s" % (rec.get("ip"), ",".join(rec.get("missing") or []))
+        for rec in recs if not rec.get("complete")
+    ]
+    payload["error"] = (
+        "AHV Gateway incomplete %s/%s hosts: %s" % (
+            payload["hosts_ok"], len(recs), "; ".join(bad[:12])))
+    LOG.warning("DUMP AHV GW: %s", payload["error"][:500])
+  else:
+    LOG.info("DUMP AHV GW complete hosts=%s", len(recs))
+  _write_json_file(os.path.join(dest_root, "index.json"), payload)
+  return payload
+
+
+KUBECTL_BIN_CANDIDATES = (
+    "/usr/bin/kubectl",
+    "/usr/local/bin/kubectl",
+    "/home/nutanix/bin/kubectl",
+)
+
+# CMSP: dump live OVN NB/SB from the ANC northd pod. Same as:
+#   sudo kubectl exec anc-ovn-0 -c anc-ovn -- \
+#     ovsdb-client dump unix:/var/run/ovn/ovnnb_db.sock
+#   sudo kubectl exec anc-ovn-0 -c anc-ovn -- \
+#     ovsdb-client dump unix:/var/run/ovn/ovnsb_db.sock
+CMSP_OVN_POD = "anc-ovn-0"
+CMSP_OVN_CONTAINER = "anc-ovn"
+CMSP_OVN_NB_SOCK = "unix:/var/run/ovn/ovnnb_db.sock"
+CMSP_OVN_SB_SOCK = "unix:/var/run/ovn/ovnsb_db.sock"
+
+CMSP_OVN_TARGETS = (
+    {
+        "key": "anc-ovn",
+        "app": "anc-ovn",
+        "pod": CMSP_OVN_POD,
+        "container": CMSP_OVN_CONTAINER,
+        "dumps": (
+            ("ovsdb-client_dump_nb",
+             ["ovsdb-client", "dump", CMSP_OVN_NB_SOCK],
+             ("Logical_Switch", "ACL", "NB_Global", "Logical_Router")),
+            ("ovsdb-client_dump_sb",
+             ["ovsdb-client", "dump", CMSP_OVN_SB_SOCK],
+             ("Chassis", "Port_Binding", "Datapath_Binding", "SB_Global")),
+        ),
+        "files": (
+            ("/etc/openvswitch/ovnnb_db.db", "ovnnb_db.db"),
+            ("/etc/openvswitch/ovnsb_db.db", "ovnsb_db.db"),
+        ),
+        "commands": (
+            ("ovn-nbctl_show",
+             ["ovn-nbctl", "--db=%s" % CMSP_OVN_NB_SOCK, "show"]),
+            ("ovn-nbctl_ls-list",
+             ["ovn-nbctl", "--db=%s" % CMSP_OVN_NB_SOCK, "ls-list"]),
+            ("ovn-nbctl_lr-list",
+             ["ovn-nbctl", "--db=%s" % CMSP_OVN_NB_SOCK, "lr-list"]),
+            ("ovn-sbctl_show",
+             ["ovn-sbctl", "--db=%s" % CMSP_OVN_SB_SOCK, "show"]),
+            ("ovn-sbctl_list_Chassis",
+             ["ovn-sbctl", "--db=%s" % CMSP_OVN_SB_SOCK, "list", "Chassis"]),
+        ),
+        "required": ("ovsdb-client_dump_nb", "ovsdb-client_dump_sb"),
+    },
+    {
+        "key": "anc-ovn-ic-db",
+        "app": "anc-ovn-ic-db",
+        "pod": "anc-ovn-ic-db-0",
+        "container": "anc-ovn-ic-db",
+        "dumps": (),
+        "files": (
+            ("/etc/openvswitch/ovn_ic_nb_db.db", "ovn_ic_nb_db.db"),
+            ("/etc/openvswitch/ovn_ic_sb_db.db", "ovn_ic_sb_db.db"),
+        ),
+        "commands": (
+            ("ovn-ic-nbctl_show",
+             ["ovn-ic-nbctl",
+              "--db=unix:/var/run/ovn/ovn_ic_nb_db.sock", "show"]),
+            ("ovn-ic-sbctl_show",
+             ["ovn-ic-sbctl",
+              "--db=unix:/var/run/ovn/ovn_ic_sb_db.sock", "show"]),
+        ),
+        "required": (),
+    },
+    {
+        "key": "anc-policydb",
+        "app": "anc-policydb",
+        "pod": "anc-policydb-0",
+        "container": "anc-policydb",
+        "dumps": (),
+        "files": (
+            ("/etc/openvswitch/ovs-policy-config.db",
+             "ovs-policy-config.db"),
+        ),
+        "commands": (),
+        "required": (),
+    },
+)
+
+_KUBECTL_PREFIX_CACHE = []
+
+
+def _kubectl_bin():
+  for path in KUBECTL_BIN_CANDIDATES:
+    if os.path.exists(path) and os.access(path, os.X_OK):
+      return path
+  return "kubectl"
+
+
+def _kubectl_prefix():
+  """Prefer passwordless sudo kubectl, matching the CMSP runbook command."""
+  global _KUBECTL_PREFIX_CACHE
+  if _KUBECTL_PREFIX_CACHE:
+    return list(_KUBECTL_PREFIX_CACHE)
+  kubectl = _kubectl_bin()
+  for prefix in (["sudo", "-n", kubectl], ["sudo", kubectl], [kubectl]):
+    rc, _stdout, _stderr = _run_cmd_argv(prefix + ["get", "ns"], 20)
+    if rc == 0:
+      _KUBECTL_PREFIX_CACHE = list(prefix)
+      LOG.info("kubectl via %s", " ".join(prefix))
+      return list(prefix)
+  _KUBECTL_PREFIX_CACHE = ["sudo", "-n", kubectl]
+  return list(_KUBECTL_PREFIX_CACHE)
+
+
+def _kubectl_argv(extra):
+  return _kubectl_prefix() + list(extra)
+
+
+def _cmsp_ovn_namespace():
+  return str(getattr(FLAGS, "cmsp_ovn_namespace", "") or "").strip()
+
+
+def _kubectl_ns_args(namespace):
+  if namespace:
+    return ["-n", namespace]
+  return []
+
+
+def _kubectl_dump_looks_ok(path, markers):
+  if not os.path.isfile(path) or os.path.getsize(path) < 64:
+    return False
+  try:
+    with open(path, "r") as handle:
+      head = handle.read(65536)
+  except Exception:
+    return False
+  low = head.lower()
+  if low.startswith("error") or "unable to connect" in low:
+    return False
+  if any(token in head for token in markers):
+    return True
+  return os.path.getsize(path) > 4096 and "table" in low
+
+
+def _kubectl_find_pod(app, preferred_name, namespace=""):
+  """Find a Running pod. Prefer anc-ovn-0 as in the runbook."""
+  ns_flag = ["-n", namespace] if namespace else ["-A"]
+  argv = _kubectl_argv([
+      "get", "pods"] + ns_flag + [
+      "-o",
+      "jsonpath={range .items[*]}{.metadata.namespace}{\"\\t\"}"
+      "{.metadata.name}{\"\\t\"}{.status.phase}{\"\\t\"}"
+      "{.metadata.labels.app}{\"\\n\"}{end}",
+  ])
+  rc, stdout, stderr = _run_cmd_argv(argv, 45)
+  if rc != 0:
+    return "", "", (stderr or stdout or "kubectl get pods failed").strip()[:400]
+  matches = []
+  for line in (stdout or "").splitlines():
+    parts = line.split("\t")
+    if len(parts) < 3:
+      continue
+    ns, name, phase = parts[0].strip(), parts[1].strip(), parts[2].strip()
+    label = parts[3].strip() if len(parts) > 3 else ""
+    if phase != "Running":
+      continue
+    if name == preferred_name or label == app or name.startswith(app + "-"):
+      matches.append((ns, name))
+  if not matches:
+    return "", "", "no Running pod %s / app=%s" % (preferred_name, app)
+  for ns, name in matches:
+    if name == preferred_name:
+      return ns, name, ""
+  for ns, name in matches:
+    if name.endswith("-0"):
+      return ns, name, ""
+  return matches[0][0], matches[0][1], ""
+
+
+def _kubectl_cp_file(namespace, pod, container, remote_path, dest_path,
+                     timeout_secs):
+  os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+  extra = ["cp"]
+  extra.extend(_kubectl_ns_args(namespace))
+  extra.extend(["%s:%s" % (pod, remote_path), dest_path, "-c", container])
+  rc, stdout, stderr = _run_cmd_argv(_kubectl_argv(extra), timeout_secs)
+  if rc == 0 and os.path.isfile(dest_path) and os.path.getsize(dest_path) > 0:
+    return True, ""
+  src = "%s/%s:%s" % (namespace or "default", pod, remote_path)
+  rc, stdout, stderr = _run_cmd_argv(
+      _kubectl_argv(["cp", src, dest_path, "-c", container]), timeout_secs)
+  if rc == 0 and os.path.isfile(dest_path) and os.path.getsize(dest_path) > 0:
+    return True, ""
+  return False, (stderr or stdout or "kubectl cp failed rc=%s" % rc).strip()[:400]
+
+
+def _kubectl_exec_to_file(namespace, pod, container, remote_argv, dest_path,
+                          timeout_secs):
+  """sudo kubectl exec POD -c CONTAINER -- CMD  (never -it)."""
+  os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+  extra = ["exec"]
+  extra.extend(_kubectl_ns_args(namespace))
+  extra.extend([pod, "-c", container, "--"] + list(remote_argv))
+  rc, _stdout, stderr = _run_cmd_argv(
+      _kubectl_argv(extra), timeout_secs, stdout_path=dest_path)
+  if rc == 0 and os.path.isfile(dest_path) and os.path.getsize(dest_path) > 0:
+    return True, ""
+  return False, (stderr or "kubectl exec failed rc=%s" % rc).strip()[:400]
+
+
+def _cmsp_ovn_ovsdb_name(path):
+  try:
+    with open(path, "r") as handle:
+      handle.readline()
+      schema_line = handle.readline()
+  except Exception:
+    return ""
+  try:
+    schema = json.loads(schema_line)
+  except Exception:
+    return ""
+  return str(schema.get("name") or "")
+
+
+def _collect_cmsp_ovn_target(target, dest_root, namespace, timeout_secs):
+  rec = {
+      "key": target["key"],
+      "app": target["app"],
+      "namespace": namespace,
+      "pod": "",
+      "complete": False,
+      "dumps": {},
+      "files": {},
+      "commands": {},
+      "missing": [],
+      "error": "",
+  }
+  dest_dir = os.path.join(dest_root, target["key"])
+  cmd_dir = os.path.join(dest_dir, "commands")
+  os.makedirs(cmd_dir, exist_ok=True)
+  preferred = target.get("pod") or ""
+  found_ns, pod, err = _kubectl_find_pod(
+      target["app"], preferred, namespace)
+  rec["namespace"] = found_ns or namespace
+  rec["pod"] = pod or preferred
+  if not rec["pod"]:
+    rec["error"] = err or "pod not found"
+    rec["missing"] = list(target.get("required") or [])
+    rec["complete"] = not rec["missing"]
+    return rec
+  dump_timeout = max(60, min(600, int(timeout_secs)))
+  for dump_name, remote_argv, markers in target.get("dumps") or ():
+    dest = os.path.join(cmd_dir, dump_name + ".txt")
+    ok, dump_err = _kubectl_exec_to_file(
+        rec["namespace"], rec["pod"], target["container"], remote_argv,
+        dest, dump_timeout)
+    looks = bool(ok) and _kubectl_dump_looks_ok(dest, markers)
+    rec["dumps"][dump_name] = {
+        "ok": looks,
+        "bytes": os.path.getsize(dest) if os.path.isfile(dest) else 0,
+        "argv": list(remote_argv),
+        "error": "" if looks else (
+            dump_err or err or "dump missing expected OVN tables"),
+    }
+    rec["commands"][dump_name] = rec["dumps"][dump_name]
+  per_cmd = max(30, min(180, int(timeout_secs)))
+  for remote_path, local_name in target.get("files") or ():
+    dest = os.path.join(dest_dir, local_name)
+    ok, cp_err = _kubectl_cp_file(
+        rec["namespace"], rec["pod"], target["container"], remote_path,
+        dest, per_cmd)
+    rec["files"][local_name] = {
+        "ok": ok,
+        "bytes": os.path.getsize(dest) if ok else 0,
+        "ovsdb_name": _cmsp_ovn_ovsdb_name(dest) if ok else "",
+        "error": "" if ok else cp_err,
+    }
+  for cmd_name, remote_argv in target.get("commands") or ():
+    dest = os.path.join(cmd_dir, cmd_name + ".txt")
+    ok, cmd_err = _kubectl_exec_to_file(
+        rec["namespace"], rec["pod"], target["container"], remote_argv,
+        dest, per_cmd)
+    rec["commands"][cmd_name] = {
+        "ok": ok,
+        "bytes": os.path.getsize(dest) if os.path.isfile(dest) else 0,
+        "argv": list(remote_argv),
+        "error": "" if ok else cmd_err,
+    }
+  missing = []
+  for name in target.get("required") or ():
+    if name in rec["dumps"]:
+      if not rec["dumps"][name].get("ok"):
+        missing.append(name)
+    elif name in rec["files"]:
+      if not rec["files"][name].get("ok"):
+        missing.append(name)
+    elif name in rec["commands"]:
+      if not rec["commands"][name].get("ok"):
+        missing.append(name)
+    else:
+      missing.append(name)
+  rec["missing"] = missing
+  rec["complete"] = not missing
+  if missing:
+    rec["error"] = "missing: %s" % ",".join(missing)
+  return rec
+
+
+def fetch_cmsp_ovn_nb_sb(output_dir, timeout_secs=1800):
+  """Dump OVN NB/SB via: sudo kubectl exec anc-ovn-0 -c anc-ovn -- ovsdb-client dump ..."""
+  dest_root = os.path.join(output_dir, "cmsp_ovn")
+  os.makedirs(dest_root, exist_ok=True)
+  timeout_secs = max(60, int(timeout_secs or 1800))
+  namespace = _cmsp_ovn_namespace()
+  payload = {
+      "ran": False,
+      "complete": False,
+      "transport": "kubectl",
+      "platform": "cmsp",
+      "namespace": namespace,
+      "pod": CMSP_OVN_POD,
+      "container": CMSP_OVN_CONTAINER,
+      "method": (
+          "sudo kubectl exec %s -c %s -- ovsdb-client dump %s"
+          % (CMSP_OVN_POD, CMSP_OVN_CONTAINER, CMSP_OVN_NB_SOCK)),
+      "ssh_to_ahv": False,
+      "pods": [],
+      "error": "",
+      "bundle_dir": dest_root,
+  }
+  kubectl = _kubectl_bin()
+  if not os.path.exists(kubectl) and kubectl == "kubectl":
+    which_rc, which_out, _err = _run_cmd_argv(["which", "kubectl"], 10)
+    if which_rc != 0 and not which_out.strip():
+      payload["error"] = "kubectl not found on this node"
+      _write_json_file(os.path.join(dest_root, "index.json"), payload)
+      return payload
+
+  deadline = time.time() + timeout_secs
+  backoff = 2
+  last = []
+  while time.time() < deadline:
+    last = []
+    for target in CMSP_OVN_TARGETS:
+      remain = max(60, int(deadline - time.time()))
+      last.append(_collect_cmsp_ovn_target(
+          target, dest_root, namespace, remain))
+    payload["pods"] = last
+    payload["ran"] = True
+    if last:
+      payload["namespace"] = last[0].get("namespace") or namespace
+      payload["pod"] = last[0].get("pod") or CMSP_OVN_POD
+    if all(rec.get("complete") for rec in last):
+      payload["complete"] = True
+      payload["error"] = ""
+      _write_json_file(os.path.join(dest_root, "index.json"), payload)
+      LOG.info(
+          "CMSP OVN NB/SB dumped via sudo kubectl exec %s -c %s -- ovsdb-client dump",
+          payload.get("pod"), CMSP_OVN_CONTAINER)
+      return payload
+    missing = []
+    for rec in last:
+      missing.extend(
+          "%s:%s" % (rec.get("key"), name)
+          for name in rec.get("missing") or [])
+    LOG.info(
+        "CMSP OVN collect incomplete (%s); retrying",
+        ",".join(missing) or "unknown")
+    sleep_for = min(backoff, max(0, int(deadline - time.time())))
+    if sleep_for <= 0:
+      break
+    time.sleep(sleep_for)
+    backoff = min(20, backoff * 2)
+
+  payload["pods"] = last
+  payload["ran"] = True
+  payload["complete"] = False
+  missing = []
+  for rec in last:
+    missing.extend(
+        "%s:%s" % (rec.get("key"), name)
+        for name in rec.get("missing") or [])
+  payload["error"] = "deadline with missing: %s" % (
+      ",".join(missing) or "unknown")
+  _write_json_file(os.path.join(dest_root, "index.json"), payload)
+  return payload
+
+
 DATASET_FILES = (
     "address_groups", "service_groups", "entity_groups", "policies",
     "vms", "subnets", "vpcs", "hosts", "clusters", "projects",
     "categories", "network_functions", "network_function_by_id",
-    "fqdn_to_ip_map", "port_set_list", "port_set_get", "dump_errors")
+    "fqdn_to_ip_map", "port_set_list", "port_set_get",
+    "ahv_gateway", "cmsp_ovn", "dump_errors")
 
 
 def _json_default(value):
@@ -3041,7 +4336,9 @@ def _write_outputs(payload, output_dir, combined_path, workers,
 def _empty_for(name):
   if name == "unique_uuids":
     return {"vlan_unique_uuid": "", "global_unique_uuid": ""}
-  if name in ("fqdn_to_ip_map", "network_function_by_id", "port_set_get"):
+  if name in (
+      "fqdn_to_ip_map", "network_function_by_id", "port_set_get",
+      "ahv_gateway", "cmsp_ovn"):
     return {}
   return []
 
@@ -3133,24 +4430,134 @@ def main(argv):
   timeout_secs = max(15, int(FLAGS.dataset_timeout_secs))
   atlas_timeout_secs = max(30, int(FLAGS.atlas_timeout_secs))
   atlas_get_workers = max(1, int(FLAGS.atlas_get_workers))
-  LOG.info("FlowInterfaces + platform detect in parallel (no v4_client)")
+  skip_ahv = getattr(FLAGS, "skip_ahv_gateway", False)
+  skip_cmsp = getattr(FLAGS, "skip_cmsp_ovn", False)
+  ahv_gw_timeout = max(
+      60, int(getattr(FLAGS, "ahv_gateway_timeout_secs", 1800) or 1800))
+  cmsp_ovn_timeout = max(
+      60, int(getattr(FLAGS, "cmsp_ovn_timeout_secs", 1800) or 1800))
   LOG.info(
       "workers=%s atlas_get_workers=%s timeout=%ss atlas_timeout=%ss "
-      "skip_atlas=%s",
+      "skip_atlas=%s skip_ahv_gateway=%s skip_cmsp_ovn=%s "
+      "ahv_gw_timeout=%ss cmsp_ovn_timeout=%ss",
       workers, atlas_get_workers, timeout_secs, atlas_timeout_secs,
-      FLAGS.skip_atlas)
-  with ThreadPoolExecutor(max_workers=1) as pool:
-    plat_fut = pool.submit(detect_msp_platform)
-    interfaces = FlowInterfaces()
-    platform_info = plat_fut.result()
+      FLAGS.skip_atlas, skip_ahv, skip_cmsp,
+      ahv_gw_timeout, cmsp_ovn_timeout)
+
+  errors = {}
+  payload = {
+      "source": "flow_pc_dump_for_neo4j",
+      "dumped_at": datetime.utcnow().isoformat() + "Z",
+      "platform": "",
+      "platform_detection_method": "",
+      "smsp_cluster_uuid": "",
+  }
+  payload["port_set_list"] = []
+  payload["port_set_get"] = {}
+  payload["ahv_gateway"] = {}
+  payload["cmsp_ovn"] = {}
+  write_fut = None
+
+  # Finish OVS/OVN before FlowInterfaces so a Zeus abort still leaves dumps.
+  LOG.info("Collecting AHV Gateway OVS + CMSP OVN NB/SB first")
+  with ThreadPoolExecutor(max_workers=2) as ovn_ovs:
+    ahv_gw_fut = None
+    cmsp_ovn_fut = None
+    if skip_ahv:
+      LOG.info("Skipping AHV Gateway collect (--skip_ahv_gateway)")
+      payload["ahv_gateway"] = {
+          "ran": False,
+          "complete": False,
+          "error": "skipped (--skip_ahv_gateway)",
+          "ssh_to_ahv": False,
+      }
+    else:
+      ahv_gw_fut = ovn_ovs.submit(
+          fetch_ahv_gateway_host_state, output_dir, None, None, ahv_gw_timeout)
+    if skip_cmsp:
+      LOG.info("Skipping CMSP OVN NB/SB kubectl dump (--skip_cmsp_ovn)")
+      payload["cmsp_ovn"] = {
+          "ran": False,
+          "complete": False,
+          "error": "skipped (--skip_cmsp_ovn)",
+          "ssh_to_ahv": False,
+          "transport": "kubectl",
+      }
+    else:
+      cmsp_ovn_fut = ovn_ovs.submit(
+          fetch_cmsp_ovn_nb_sb, output_dir, cmsp_ovn_timeout)
+    if ahv_gw_fut is not None:
+      try:
+        payload["ahv_gateway"] = ahv_gw_fut.result()
+      except Exception as err:
+        errors["ahv_gateway"] = str(err)
+        payload["ahv_gateway"] = {
+            "ran": False,
+            "complete": False,
+            "error": str(err),
+            "ssh_to_ahv": False,
+        }
+        LOG.error("DATASET ahv_gateway FAILED: %s", err)
+      else:
+        gw = payload.get("ahv_gateway") or {}
+        if gw.get("complete"):
+          LOG.info("AHV Gateway complete; OVS/virsh/tap captured")
+        elif gw.get("error"):
+          errors["ahv_gateway"] = gw["error"]
+    if cmsp_ovn_fut is not None:
+      try:
+        payload["cmsp_ovn"] = cmsp_ovn_fut.result()
+      except Exception as err:
+        errors["cmsp_ovn"] = str(err)
+        payload["cmsp_ovn"] = {
+            "ran": False,
+            "complete": False,
+            "error": str(err),
+            "transport": "kubectl",
+            "ssh_to_ahv": False,
+        }
+        LOG.error("DATASET cmsp_ovn FAILED: %s", err)
+      else:
+        cmsp = payload.get("cmsp_ovn") or {}
+        if not cmsp.get("complete") and cmsp.get("error"):
+          errors["cmsp_ovn"] = cmsp["error"]
+  _write_json_file(
+      os.path.join(output_dir, "ahv_gateway.json"),
+      payload.get("ahv_gateway") or {})
+  _write_json_file(
+      os.path.join(output_dir, "cmsp_ovn.json"),
+      payload.get("cmsp_ovn") or {})
+
+  LOG.info("FlowInterfaces + platform detect in parallel (no v4_client)")
+  try:
+    with ThreadPoolExecutor(max_workers=1) as pool:
+      plat_fut = pool.submit(detect_msp_platform)
+      interfaces = FlowInterfaces()
+      platform_info = plat_fut.result()
+  except Exception as err:
+    LOG.error("FlowInterfaces/platform detect FAILED: %s", err)
+    errors["flow_interfaces"] = str(err)
+    interfaces = None
+    platform_info = {
+        "platform": "",
+        "detection_method": "failed",
+        "smsp_cluster_uuid": "",
+    }
+  payload["platform"] = platform_info.get("platform")
+  payload["platform_detection_method"] = platform_info.get("detection_method")
+  payload["smsp_cluster_uuid"] = platform_info.get("smsp_cluster_uuid") or ""
   LOG.info(
       "Platform %s (method=%s smsp_uuid=%s)",
       platform_info.get("platform"),
       platform_info.get("detection_method"),
       platform_info.get("smsp_cluster_uuid") or "<none>")
+  if interfaces is None:
+    LOG.warning("Skipping Flow/Atlas datasets; OVN/OVS already written")
+    payload["dump_errors"] = errors
+    _write_outputs(payload, output_dir, combined_path, workers)
+    return 1 if FLAGS.fail_on_error else 0
   LOG.info("FlowInterfaces ready")
 
-  errors = {}
   jobs = [
       ("address_groups", lambda: fetch_address_groups(interfaces)),
       ("service_groups", lambda: fetch_service_groups(interfaces)),
@@ -3186,18 +4593,7 @@ def main(argv):
       LOG.info("Skipping port_set.get (no UUIDs from port_set.list)")
     return rows or [], gets
 
-  payload = {
-      "source": "flow_pc_dump_for_neo4j",
-      "dumped_at": datetime.utcnow().isoformat() + "Z",
-      "platform": platform_info.get("platform"),
-      "platform_detection_method": platform_info.get("detection_method"),
-      "smsp_cluster_uuid": platform_info.get("smsp_cluster_uuid") or "",
-  }
-  payload["port_set_list"] = []
-  payload["port_set_get"] = {}
-  write_fut = None
-
-  with ThreadPoolExecutor(max_workers=3) as coordinator:
+  with ThreadPoolExecutor(max_workers=6) as coordinator:
     fetch_fut = coordinator.submit(
         _run_jobs_parallel, jobs, workers, timeout_secs, errors)
     atlas_fut = None
@@ -3210,14 +4606,23 @@ def main(argv):
     unique = payload.pop("unique_uuids", {}) or {}
     payload["vlan_unique_uuid"] = unique.get("vlan_unique_uuid", "")
     payload["global_unique_uuid"] = unique.get("global_unique_uuid", "")
-    payload["network_function_by_id"] = fetch_network_function_by_id(
-        interfaces, payload.get("network_functions") or [],
-        _policy_nf_uuids(payload))
-    _post_fetch_enrich(payload)
+    try:
+      payload["network_function_by_id"] = fetch_network_function_by_id(
+          interfaces, payload.get("network_functions") or [],
+          _policy_nf_uuids(payload))
+      _post_fetch_enrich(payload)
+    except Exception as err:
+      errors["post_fetch_enrich"] = str(err)
+      LOG.error("post_fetch_enrich FAILED: %s", err)
 
-    skip_late = ("port_set_list", "port_set_get", "dump_errors")
+    skip_late = (
+        "port_set_list", "port_set_get", "ahv_gateway",
+        "cmsp_ovn", "dump_errors")
     write_fut = None
-    if atlas_fut is not None and not atlas_fut.done():
+    late_pending = [
+        fut for fut in (atlas_fut,)
+        if fut is not None and not fut.done()]
+    if late_pending:
       write_fut = coordinator.submit(
           _write_outputs, payload, output_dir, combined_path, workers,
           skip_late, False)
@@ -3238,6 +4643,12 @@ def main(argv):
     _write_json_file(
         os.path.join(output_dir, "port_set_get.json"),
         payload.get("port_set_get") or {})
+    _write_json_file(
+        os.path.join(output_dir, "ahv_gateway.json"),
+        payload.get("ahv_gateway") or {})
+    _write_json_file(
+        os.path.join(output_dir, "cmsp_ovn.json"),
+        payload.get("cmsp_ovn") or {})
     _write_json_file(os.path.join(output_dir, "dump_errors.json"), errors)
     _write_json_file(combined_path, payload)
   else:
@@ -3295,6 +4706,41 @@ def main(argv):
   LOG.info("  %-22s %s", "platform", payload.get("platform") or "<empty>")
   LOG.info("  %-22s %s", "port_set_list", len(payload.get("port_set_list") or []))
   LOG.info("  %-22s %s", "port_set_get", len(payload.get("port_set_get") or {}))
+  gw = payload.get("ahv_gateway") or {}
+  LOG.info(
+      "  %-22s ran=%s complete=%s hosts=%s/%s error=%s",
+      "ahv_gateway",
+      gw.get("ran"),
+      gw.get("complete"),
+      gw.get("hosts_ok"),
+      gw.get("hosts_total"),
+      (gw.get("error") or "")[:80] or "<none>")
+  for host_rec in gw.get("hosts") or []:
+    LOG.info(
+        "  %-22s ip=%s name=%s ok=%s missing=%s err=%s",
+        "",
+        host_rec.get("ip") or "",
+        host_rec.get("name") or "",
+        host_rec.get("complete"),
+        ",".join(host_rec.get("missing") or []) or "<none>",
+        (host_rec.get("error") or "")[:50] or "<none>")
+  cmsp = payload.get("cmsp_ovn") or {}
+  LOG.info(
+      "  %-22s ran=%s complete=%s pods=%s error=%s",
+      "cmsp_ovn",
+      cmsp.get("ran"),
+      cmsp.get("complete"),
+      len(cmsp.get("pods") or []),
+      (cmsp.get("error") or "")[:80] or "<none>")
+  for pod_rec in cmsp.get("pods") or []:
+    LOG.info(
+        "  %-22s key=%s pod=%s ok=%s missing=%s err=%s",
+        "",
+        pod_rec.get("key") or "",
+        pod_rec.get("pod") or "",
+        pod_rec.get("complete"),
+        ",".join(pod_rec.get("missing") or []) or "<none>",
+        (pod_rec.get("error") or "")[:50] or "<none>")
   if errors:
     LOG.warning("Failed datasets: %s", ", ".join(sorted(errors)))
     if FLAGS.fail_on_error:
