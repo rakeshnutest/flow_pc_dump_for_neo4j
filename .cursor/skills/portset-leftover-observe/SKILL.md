@@ -22,13 +22,17 @@ After `ingest.py` / `compare.py`, or when the user asks about leftovers.
 
 ## Steps
 
-1. Run:
+1. Run from `/home/rakeshkumar.r/panacea/clickhouse_flow/` (files are synced
+   from `flow_pc_dump_github/clickhouse_flow/`):
 
 ```bash
-python3 clickhouse_flow/observe_leftovers.py \
-  --dump_dir /path/to/dump \
-  --out clickhouse_flow/leftover_observations.md
+python3 /home/rakeshkumar.r/panacea/clickhouse_flow/observe_leftovers.py \
+  --out /home/rakeshkumar.r/panacea/clickhouse_flow/leftover_observations.md
 ```
+
+`--dump_dir` is optional. If the PC dump JSON directory is present, pass it
+for reverse-hash notes. If it is missing, classify leftovers from ClickHouse
+only (Atlas leftover vs Atlas missing vs NIC UUID bugs).
 
 2. Read `leftover_observations.md`.
 3. Summarize **only**:
@@ -38,6 +42,7 @@ python3 clickhouse_flow/observe_leftovers.py \
      missing in computed.
 4. Do not explain leftovers as "same name already matched". Names are labels.
 5. Do not mention kube in the analysis write-up.
+6. Do not group leftovers by display name.
 
 ## Rules
 

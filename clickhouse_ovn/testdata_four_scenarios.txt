@@ -1,0 +1,402 @@
+## scenarios
+- same_l2: 915f1338-1aba-4c27-a016-cb9876cdc970 -> 2db09986-1e45-4591-8afd-0609a7acf641  (VMs VPC_California_SJ_Pheonix_Customer_1_subnet_2_139 <-> VPC_California_SJ_Pheonix_Customer_1_subnet_2_182 on LS network_9472b0d1-09fb-4e7e-a1cf-9536d262b6ef uuid=02d0de22-21a5-41f7-befd-75b6cb9c4cc7)
+- l2_l3_l2: 22bce434-1ef5-4792-8e57-8fa2a5e3bd71 -> e5b645fd-4ed7-4839-9966-6b99347981cd  (VMs VPC_California_SJ_Pheonix_Customer_19_FNS-L1-1_4 <-> VPC_California_SJ_Pheonix_Customer_19_FNS-L1-1_3 via LR router_818b2c20-4d1b-40b7-a951-5deb85316e68 uuid=a27e38bd-6c57-472f-80df-1a39723efe1a LS network_17fe24db-e08b-4f81-969a-e06d6f23b35c / network_ad47fb2b-5cf5-413b-9c84-708688d9bd34)
+- two_router: 915f1338-1aba-4c27-a016-cb9876cdc970 -> edba0385-d5d3-4d07-8ca5-f9253e4af298  (no two-VIF overlay across two tenant routers; closest VM VPC_California_SJ_Pheonix_Customer_1_subnet_2_139 LS network_9472b0d1-09fb-4e7e-a1cf-9536d262b6ef via router_fc433064-926d-4fc0-a1a3-7c089ad90343 -> gw-scale-out-router_nat_fc433064-926d-4fc0-a1a3-7c089ad90343_1)
+- northbound: 915f1338-1aba-4c27-a016-cb9876cdc970 -> external  (VM VPC_California_SJ_Pheonix_Customer_1_subnet_2_139 LS network_9472b0d1-09fb-4e7e-a1cf-9536d262b6ef via router_fc433064-926d-4fc0-a1a3-7c089ad90343 -> gw-scale-out-router_nat_fc433064-926d-4fc0-a1a3-7c089ad90343_1)
+
+######## same_l2: VMs VPC_California_SJ_Pheonix_Customer_1_subnet_2_139 <-> VPC_California_SJ_Pheonix_Customer_1_subnet_2_182 on LS network_9472b0d1-09fb-4e7e-a1cf-9536d262b6ef uuid=02d0de22-21a5-41f7-befd-75b6cb9c4cc7
+=== FORWARD (same_l2) ===
+src: vm=VPC_California_SJ_Pheonix_Customer_1_subnet_2_139 nic=3468ac71-d670-41a0-93af-0ec34d43f7c3 lsp=port_12a2ce8a-afb5-40e5-b5ff-a7b3f895ffc2 lsp_uuid=915f1338-1aba-4c27-a016-cb9876cdc970 mac=50:6b:8d:19:78:77 ip=192.168.2.186
+dst: vm=VPC_California_SJ_Pheonix_Customer_1_subnet_2_182 nic=421c723f-6ad7-44a2-a8af-c2e7ee645363 lsp=port_d5dc3385-4102-4618-912a-0406aa7266e1 lsp_uuid=2db09986-1e45-4591-8afd-0609a7acf641 mac=50:6b:8d:4a:f4:b3 ip=192.168.2.3
+  1. VIF vm=VPC_California_SJ_Pheonix_Customer_1_subnet_2_139 nic=3468ac71-d670-41a0-93af-0ec34d43f7c3 lsp=port_12a2ce8a-afb5-40e5-b5ff-a7b3f895ffc2 lsp_uuid=915f1338-1aba-4c27-a016-cb9876cdc970 mac=50:6b:8d:19:78:77 ip=192.168.2.186
+  2. LS network_9472b0d1-09fb-4e7e-a1cf-9536d262b6ef uuid=02d0de22-21a5-41f7-befd-75b6cb9c4cc7
+       stretch flashfire01-1:geneve:10.116.29.154, flashfire01-2:geneve:10.116.29.155, flashfire01-3:geneve:10.116.29.156, flashfire01-4:geneve:10.116.29.157, flashfire02-1:geneve:10.116.29.172, flashfire02-2:geneve:10.116.29.173, flashfire02-3:geneve:10.116.29.174, flashfire02-4:geneve:10.116.29.175 (+22)
+       ACLs from-lport (ingress): 13
+         pri=31500 allow-stateless from-lport [ls] (udp.src == 67 && udp.dst == 68) || (udp.src == 68 && udp.dst == 67)
+         pri=500 allow-related from-lport [ls] tcp || udp || icmp
+         pri=1060 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c)
+         pri=1052 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c)
+         pri=1050 allow-related from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_f412ba3b_b736_4b27_a0e6_4eeefc7220a4) && ((ip.proto == 6 && ((tcp.
+         pri=1050 allow-related from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_9c194c48_8c96_54a7_837a_81508c40ddae) && ((ip.proto == 6 && ((tcp.
+         pri=1045 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip6
+         pri=1045 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4
+         pri=1019 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4 && (ip4.dst == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506)
+         pri=1018 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4 && (ip4.dst == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506)
+         pri=1017 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4
+         pri=1015 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4
+         … 1 more
+       ACLs to-lport (egress): 14
+         pri=31500 allow-stateless to-lport [ls] (udp.src == 67 && udp.dst == 68) || (udp.src == 68 && udp.dst == 67)
+         pri=500 allow-related to-lport [ls] tcp || udp || icmp
+         pri=1060 drop to-lport [pg] ip4 && (ip4.src == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c) && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1052 drop to-lport [pg] ip4 && (ip4.src == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c) && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_ca94bdb8_7cff_5c8c_858e_ca44207c5032) && ((ip.proto == 1 && ((icmp4.type == 8 && icmp4.code == 0))) || (ip.proto == 6 && (tcp.ds
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_09687af3_486d_5381_baff_78f78a00c4b3) && ((ip.proto == 6 && ((tcp.dst >= 1152 && tcp.dst <= 1161) || (tcp.dst >= 1166 && tcp.dst
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_e88c0d4d_73b0_486e_a3fb_d95baaa35ef1) && ((ip.proto == 6 && ((tcp.dst >= 1025 && tcp.dst <= 1034) || (tcp.dst >= 1037 && tcp.dst
+         pri=1045 drop to-lport [pg] ip6 && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1045 drop to-lport [pg] ip4 && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1019 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506) && outport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133
+         pri=1018 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506) && outport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133
+         pri=1017 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_25f83796_b668_50c1_a86f_741b6495cafe) && outport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133
+         … 2 more
+  3. VIF vm=VPC_California_SJ_Pheonix_Customer_1_subnet_2_182 nic=421c723f-6ad7-44a2-a8af-c2e7ee645363 lsp=port_d5dc3385-4102-4618-912a-0406aa7266e1 lsp_uuid=2db09986-1e45-4591-8afd-0609a7acf641 mac=50:6b:8d:4a:f4:b3 ip=192.168.2.3
+=== REVERSE (same_l2) ===
+src: vm=VPC_California_SJ_Pheonix_Customer_1_subnet_2_182 nic=421c723f-6ad7-44a2-a8af-c2e7ee645363 lsp=port_d5dc3385-4102-4618-912a-0406aa7266e1 lsp_uuid=2db09986-1e45-4591-8afd-0609a7acf641 mac=50:6b:8d:4a:f4:b3 ip=192.168.2.3
+dst: vm=VPC_California_SJ_Pheonix_Customer_1_subnet_2_139 nic=3468ac71-d670-41a0-93af-0ec34d43f7c3 lsp=port_12a2ce8a-afb5-40e5-b5ff-a7b3f895ffc2 lsp_uuid=915f1338-1aba-4c27-a016-cb9876cdc970 mac=50:6b:8d:19:78:77 ip=192.168.2.186
+  1. VIF vm=VPC_California_SJ_Pheonix_Customer_1_subnet_2_182 nic=421c723f-6ad7-44a2-a8af-c2e7ee645363 lsp=port_d5dc3385-4102-4618-912a-0406aa7266e1 lsp_uuid=2db09986-1e45-4591-8afd-0609a7acf641 mac=50:6b:8d:4a:f4:b3 ip=192.168.2.3
+  2. LS network_9472b0d1-09fb-4e7e-a1cf-9536d262b6ef uuid=02d0de22-21a5-41f7-befd-75b6cb9c4cc7
+       stretch flashfire01-1:geneve:10.116.29.154, flashfire01-2:geneve:10.116.29.155, flashfire01-3:geneve:10.116.29.156, flashfire01-4:geneve:10.116.29.157, flashfire02-1:geneve:10.116.29.172, flashfire02-2:geneve:10.116.29.173, flashfire02-3:geneve:10.116.29.174, flashfire02-4:geneve:10.116.29.175 (+22)
+       ACLs from-lport (ingress): 14
+         pri=31500 allow-stateless to-lport [ls] (udp.src == 67 && udp.dst == 68) || (udp.src == 68 && udp.dst == 67)
+         pri=500 allow-related to-lport [ls] tcp || udp || icmp
+         pri=1060 drop to-lport [pg] ip4 && (ip4.src == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c) && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1052 drop to-lport [pg] ip4 && (ip4.src == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c) && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_ca94bdb8_7cff_5c8c_858e_ca44207c5032) && ((ip.proto == 1 && ((icmp4.type == 8 && icmp4.code == 0))) || (ip.proto == 6 && (tcp.ds
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_09687af3_486d_5381_baff_78f78a00c4b3) && ((ip.proto == 6 && ((tcp.dst >= 1152 && tcp.dst <= 1161) || (tcp.dst >= 1166 && tcp.dst
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_e88c0d4d_73b0_486e_a3fb_d95baaa35ef1) && ((ip.proto == 6 && ((tcp.dst >= 1025 && tcp.dst <= 1034) || (tcp.dst >= 1037 && tcp.dst
+         pri=1045 drop to-lport [pg] ip6 && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1045 drop to-lport [pg] ip4 && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1019 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506) && outport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133
+         pri=1018 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506) && outport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133
+         pri=1017 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_25f83796_b668_50c1_a86f_741b6495cafe) && outport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133
+         … 2 more
+       ACLs to-lport (egress): 13
+         pri=31500 allow-stateless from-lport [ls] (udp.src == 67 && udp.dst == 68) || (udp.src == 68 && udp.dst == 67)
+         pri=500 allow-related from-lport [ls] tcp || udp || icmp
+         pri=1060 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c)
+         pri=1052 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c)
+         pri=1050 allow-related from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_f412ba3b_b736_4b27_a0e6_4eeefc7220a4) && ((ip.proto == 6 && ((tcp.
+         pri=1050 allow-related from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_9c194c48_8c96_54a7_837a_81508c40ddae) && ((ip.proto == 6 && ((tcp.
+         pri=1045 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip6
+         pri=1045 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4
+         pri=1019 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4 && (ip4.dst == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506)
+         pri=1018 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4 && (ip4.dst == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506)
+         pri=1017 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4
+         pri=1015 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4
+         … 1 more
+  3. VIF vm=VPC_California_SJ_Pheonix_Customer_1_subnet_2_139 nic=3468ac71-d670-41a0-93af-0ec34d43f7c3 lsp=port_12a2ce8a-afb5-40e5-b5ff-a7b3f895ffc2 lsp_uuid=915f1338-1aba-4c27-a016-cb9876cdc970 mac=50:6b:8d:19:78:77 ip=192.168.2.186
+
+######## l2_l3_l2: VMs VPC_California_SJ_Pheonix_Customer_19_FNS-L1-1_4 <-> VPC_California_SJ_Pheonix_Customer_19_FNS-L1-1_3 via LR router_818b2c20-4d1b-40b7-a951-5deb85316e68 uuid=a27e38bd-6c57-472f-80df-1a39723efe1a LS network_17fe24db-e08b-4f81-969a-e06d6f23b35c / network_ad47fb2b-5cf5-413b-9c84-708688d9bd34
+=== FORWARD (l2_l3_l2) ===
+src: vm=VPC_California_SJ_Pheonix_Customer_19_FNS-L1-1_4 nic=1d6e610d-f164-4f5d-a6f3-4be6a59a4819 lsp=port_ac6485b2-02b8-492e-84ca-1e4fa3e33360 lsp_uuid=22bce434-1ef5-4792-8e57-8fa2a5e3bd71 mac=50:6b:8d:43:a5:90 ip=192.168.1.51
+dst: vm=VPC_California_SJ_Pheonix_Customer_19_FNS-L1-1_3 nic=6e86636f-26c9-40d8-8e27-e4d619c3f8a6 lsp=port_13d8e8ad-d956-4a58-afaa-ab504d8f70f6 lsp_uuid=e5b645fd-4ed7-4839-9966-6b99347981cd mac=50:6b:8d:4c:46:fd ip=192.168.4.53
+  1. VIF vm=VPC_California_SJ_Pheonix_Customer_19_FNS-L1-1_4 nic=1d6e610d-f164-4f5d-a6f3-4be6a59a4819 lsp=port_ac6485b2-02b8-492e-84ca-1e4fa3e33360 lsp_uuid=22bce434-1ef5-4792-8e57-8fa2a5e3bd71 mac=50:6b:8d:43:a5:90 ip=192.168.1.51
+  2. LS network_17fe24db-e08b-4f81-969a-e06d6f23b35c uuid=183da7a8-c33c-4247-912a-d4cb28ec8a5a
+       stretch flashfire01-3:geneve:10.116.29.156, flashfire03-2:geneve:10.116.29.191, flashfire04-1:geneve:10.116.29.208, spymaster01-2:geneve:10.116.26.72, spymaster02-3:geneve:10.116.26.91, zadkiel04-3:geneve:10.116.26.217, zadkiel04-4:geneve:10.116.26.218, zadkiel05-1:geneve:10.116.26.233 (+1)
+       ACLs from-lport (ingress): 8
+         pri=31500 allow-stateless from-lport [ls] (udp.src == 67 && udp.dst == 68) || (udp.src == 68 && udp.dst == 67)
+         pri=500 allow-related from-lport [ls] tcp || udp || icmp
+         pri=1060 drop from-lport [pg] inport == @port_group_ee4765ab_2f7d_5aa6_baef_2a4409dcd7a0 && ip4 && (ip4.dst == $address_set_1b11d438_5b2f_4b00_950b_3c355529d406)
+         pri=1052 drop from-lport [pg] inport == @port_group_ee4765ab_2f7d_5aa6_baef_2a4409dcd7a0 && ip4 && (ip4.dst == $address_set_1b11d438_5b2f_4b00_950b_3c355529d406)
+         pri=1050 allow-related from-lport [pg] inport == @port_group_ee4765ab_2f7d_5aa6_baef_2a4409dcd7a0 && ip4 && (ip4.dst == $address_set_b490212e_6951_43bf_a004_f47375039435) && ((ip.proto == 6 && ((tcp.
+         pri=1050 allow-related from-lport [pg] inport == @port_group_ee4765ab_2f7d_5aa6_baef_2a4409dcd7a0 && ip4 && (ip4.dst == $address_set_17ae1270_33aa_5acd_94b7_65b09d6bf397) && ((ip.proto == 6 && ((tcp.
+         pri=1045 drop from-lport [pg] inport == @port_group_ee4765ab_2f7d_5aa6_baef_2a4409dcd7a0 && ip6
+         pri=1045 drop from-lport [pg] inport == @port_group_ee4765ab_2f7d_5aa6_baef_2a4409dcd7a0 && ip4
+       ACLs to-lport (egress): 9
+         pri=31500 allow-stateless to-lport [ls] (udp.src == 67 && udp.dst == 68) || (udp.src == 68 && udp.dst == 67)
+         pri=500 allow-related to-lport [ls] tcp || udp || icmp
+         pri=1060 drop to-lport [pg] ip4 && (ip4.src == $address_set_1b11d438_5b2f_4b00_950b_3c355529d406) && outport == @port_group_ee4765ab_2f7d_5aa6_baef_2a4409dcd7a0
+         pri=1052 drop to-lport [pg] ip4 && (ip4.src == $address_set_1b11d438_5b2f_4b00_950b_3c355529d406) && outport == @port_group_ee4765ab_2f7d_5aa6_baef_2a4409dcd7a0
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_205229df_97dd_4f48_8888_22f75df17032) && ((ip.proto == 6 && ((tcp.dst >= 18363 && tcp.dst <= 18372) || (tcp.dst >= 18376 && tcp.
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_8bd19f47_a216_502a_b5e5_00edc3b21853) && ((ip.proto == 1 && ((icmp4.type == 8 && icmp4.code == 0))) || (ip.proto == 6 && (tcp.ds
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_f96fe67d_5c12_5b66_b6a0_6e7e91be679b) && ((ip.proto == 6 && ((tcp.dst >= 18497 && tcp.dst <= 18506) || (tcp.dst >= 18512 && tcp.
+         pri=1045 drop to-lport [pg] ip6 && outport == @port_group_ee4765ab_2f7d_5aa6_baef_2a4409dcd7a0
+         pri=1045 drop to-lport [pg] ip4 && outport == @port_group_ee4765ab_2f7d_5aa6_baef_2a4409dcd7a0
+  3. LR router_818b2c20-4d1b-40b7-a951-5deb85316e68 uuid=a27e38bd-6c57-472f-80df-1a39723efe1a has_nat=0
+       LRP lrp-router-port_17fe24db-e08b-4f81-969a-e06d6f23b35c mac=e0:19:95:59:9f:05 nets=['192.168.1.1/24']
+       PBR pri=100 allow match=ip4.dst==0.0.0.0/0 && ip4.src==0.0.0.0/0 nexthop=
+       PBR pri=10 drop match=ip4.dst==0.0.0.0/0 && ip4.src==0.0.0.0/0 nexthop=
+       PBR pri=1 drop match=ip4.dst==0.0.0.0/0 && ip4.src==0.0.0.0/0 nexthop=
+  4. LS network_ad47fb2b-5cf5-413b-9c84-708688d9bd34 uuid=375639f0-8aa0-4e50-9777-51c2bdc6247c
+       stretch flashfire01-3:geneve:10.116.29.156, flashfire03-2:geneve:10.116.29.191, flashfire04-1:geneve:10.116.29.208, spymaster01-2:geneve:10.116.26.72, spymaster02-3:geneve:10.116.26.91, zadkiel04-3:geneve:10.116.26.217, zadkiel04-4:geneve:10.116.26.218, zadkiel05-1:geneve:10.116.26.233 (+1)
+       ACLs from-lport (ingress): 8
+         pri=31500 allow-stateless from-lport [ls] (udp.src == 67 && udp.dst == 68) || (udp.src == 68 && udp.dst == 67)
+         pri=500 allow-related from-lport [ls] tcp || udp || icmp
+         pri=1060 drop from-lport [pg] inport == @port_group_816cf180_aaac_56a9_9be4_ea96c80bce26 && ip4 && (ip4.dst == $address_set_b1966041_a314_4fdd_b96a_a8128a286173)
+         pri=1052 drop from-lport [pg] inport == @port_group_816cf180_aaac_56a9_9be4_ea96c80bce26 && ip4 && (ip4.dst == $address_set_b1966041_a314_4fdd_b96a_a8128a286173)
+         pri=1050 allow-related from-lport [pg] inport == @port_group_816cf180_aaac_56a9_9be4_ea96c80bce26 && ip4 && (ip4.dst == $address_set_606a64cc_0102_585d_a638_57cd2f9fce7a) && ((ip.proto == 6 && ((tcp.
+         pri=1050 allow-related from-lport [pg] inport == @port_group_816cf180_aaac_56a9_9be4_ea96c80bce26 && ip4 && (ip4.dst == $address_set_b490212e_6951_43bf_a004_f47375039435) && ((ip.proto == 6 && ((tcp.
+         pri=1045 drop from-lport [pg] inport == @port_group_816cf180_aaac_56a9_9be4_ea96c80bce26 && ip6
+         pri=1045 drop from-lport [pg] inport == @port_group_816cf180_aaac_56a9_9be4_ea96c80bce26 && ip4
+       ACLs to-lport (egress): 9
+         pri=31500 allow-stateless to-lport [ls] (udp.src == 67 && udp.dst == 68) || (udp.src == 68 && udp.dst == 67)
+         pri=500 allow-related to-lport [ls] tcp || udp || icmp
+         pri=1060 drop to-lport [pg] ip4 && (ip4.src == $address_set_b1966041_a314_4fdd_b96a_a8128a286173) && outport == @port_group_816cf180_aaac_56a9_9be4_ea96c80bce26
+         pri=1052 drop to-lport [pg] ip4 && (ip4.src == $address_set_b1966041_a314_4fdd_b96a_a8128a286173) && outport == @port_group_816cf180_aaac_56a9_9be4_ea96c80bce26
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_2ea13950_5bb2_5d91_85f4_d0e8d559e4d1) && ((ip.proto == 6 && ((tcp.dst >= 20117 && tcp.dst <= 20126) || (tcp.dst >= 20131 && tcp.
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_8bd19f47_a216_502a_b5e5_00edc3b21853) && ((ip.proto == 1 && ((icmp4.type == 8 && icmp4.code == 0))) || (ip.proto == 6 && (tcp.ds
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_205229df_97dd_4f48_8888_22f75df17032) && ((ip.proto == 6 && ((tcp.dst >= 19983 && tcp.dst <= 19992) || (tcp.dst >= 19995 && tcp.
+         pri=1045 drop to-lport [pg] ip4 && outport == @port_group_816cf180_aaac_56a9_9be4_ea96c80bce26
+         pri=1045 drop to-lport [pg] ip6 && outport == @port_group_816cf180_aaac_56a9_9be4_ea96c80bce26
+  5. VIF vm=VPC_California_SJ_Pheonix_Customer_19_FNS-L1-1_3 nic=6e86636f-26c9-40d8-8e27-e4d619c3f8a6 lsp=port_13d8e8ad-d956-4a58-afaa-ab504d8f70f6 lsp_uuid=e5b645fd-4ed7-4839-9966-6b99347981cd mac=50:6b:8d:4c:46:fd ip=192.168.4.53
+=== REVERSE (l2_l3_l2) ===
+src: vm=VPC_California_SJ_Pheonix_Customer_19_FNS-L1-1_3 nic=6e86636f-26c9-40d8-8e27-e4d619c3f8a6 lsp=port_13d8e8ad-d956-4a58-afaa-ab504d8f70f6 lsp_uuid=e5b645fd-4ed7-4839-9966-6b99347981cd mac=50:6b:8d:4c:46:fd ip=192.168.4.53
+dst: vm=VPC_California_SJ_Pheonix_Customer_19_FNS-L1-1_4 nic=1d6e610d-f164-4f5d-a6f3-4be6a59a4819 lsp=port_ac6485b2-02b8-492e-84ca-1e4fa3e33360 lsp_uuid=22bce434-1ef5-4792-8e57-8fa2a5e3bd71 mac=50:6b:8d:43:a5:90 ip=192.168.1.51
+  1. VIF vm=VPC_California_SJ_Pheonix_Customer_19_FNS-L1-1_3 nic=6e86636f-26c9-40d8-8e27-e4d619c3f8a6 lsp=port_13d8e8ad-d956-4a58-afaa-ab504d8f70f6 lsp_uuid=e5b645fd-4ed7-4839-9966-6b99347981cd mac=50:6b:8d:4c:46:fd ip=192.168.4.53
+  2. LS network_ad47fb2b-5cf5-413b-9c84-708688d9bd34 uuid=375639f0-8aa0-4e50-9777-51c2bdc6247c
+       stretch flashfire01-3:geneve:10.116.29.156, flashfire03-2:geneve:10.116.29.191, flashfire04-1:geneve:10.116.29.208, spymaster01-2:geneve:10.116.26.72, spymaster02-3:geneve:10.116.26.91, zadkiel04-3:geneve:10.116.26.217, zadkiel04-4:geneve:10.116.26.218, zadkiel05-1:geneve:10.116.26.233 (+1)
+       ACLs from-lport (ingress): 9
+         pri=31500 allow-stateless to-lport [ls] (udp.src == 67 && udp.dst == 68) || (udp.src == 68 && udp.dst == 67)
+         pri=500 allow-related to-lport [ls] tcp || udp || icmp
+         pri=1060 drop to-lport [pg] ip4 && (ip4.src == $address_set_b1966041_a314_4fdd_b96a_a8128a286173) && outport == @port_group_816cf180_aaac_56a9_9be4_ea96c80bce26
+         pri=1052 drop to-lport [pg] ip4 && (ip4.src == $address_set_b1966041_a314_4fdd_b96a_a8128a286173) && outport == @port_group_816cf180_aaac_56a9_9be4_ea96c80bce26
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_2ea13950_5bb2_5d91_85f4_d0e8d559e4d1) && ((ip.proto == 6 && ((tcp.dst >= 20117 && tcp.dst <= 20126) || (tcp.dst >= 20131 && tcp.
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_8bd19f47_a216_502a_b5e5_00edc3b21853) && ((ip.proto == 1 && ((icmp4.type == 8 && icmp4.code == 0))) || (ip.proto == 6 && (tcp.ds
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_205229df_97dd_4f48_8888_22f75df17032) && ((ip.proto == 6 && ((tcp.dst >= 19983 && tcp.dst <= 19992) || (tcp.dst >= 19995 && tcp.
+         pri=1045 drop to-lport [pg] ip4 && outport == @port_group_816cf180_aaac_56a9_9be4_ea96c80bce26
+         pri=1045 drop to-lport [pg] ip6 && outport == @port_group_816cf180_aaac_56a9_9be4_ea96c80bce26
+       ACLs to-lport (egress): 8
+         pri=31500 allow-stateless from-lport [ls] (udp.src == 67 && udp.dst == 68) || (udp.src == 68 && udp.dst == 67)
+         pri=500 allow-related from-lport [ls] tcp || udp || icmp
+         pri=1060 drop from-lport [pg] inport == @port_group_816cf180_aaac_56a9_9be4_ea96c80bce26 && ip4 && (ip4.dst == $address_set_b1966041_a314_4fdd_b96a_a8128a286173)
+         pri=1052 drop from-lport [pg] inport == @port_group_816cf180_aaac_56a9_9be4_ea96c80bce26 && ip4 && (ip4.dst == $address_set_b1966041_a314_4fdd_b96a_a8128a286173)
+         pri=1050 allow-related from-lport [pg] inport == @port_group_816cf180_aaac_56a9_9be4_ea96c80bce26 && ip4 && (ip4.dst == $address_set_606a64cc_0102_585d_a638_57cd2f9fce7a) && ((ip.proto == 6 && ((tcp.
+         pri=1050 allow-related from-lport [pg] inport == @port_group_816cf180_aaac_56a9_9be4_ea96c80bce26 && ip4 && (ip4.dst == $address_set_b490212e_6951_43bf_a004_f47375039435) && ((ip.proto == 6 && ((tcp.
+         pri=1045 drop from-lport [pg] inport == @port_group_816cf180_aaac_56a9_9be4_ea96c80bce26 && ip6
+         pri=1045 drop from-lport [pg] inport == @port_group_816cf180_aaac_56a9_9be4_ea96c80bce26 && ip4
+  3. LR router_818b2c20-4d1b-40b7-a951-5deb85316e68 uuid=a27e38bd-6c57-472f-80df-1a39723efe1a has_nat=0
+       LRP lrp-router-port_17fe24db-e08b-4f81-969a-e06d6f23b35c mac=e0:19:95:59:9f:05 nets=['192.168.1.1/24']
+       PBR pri=100 allow match=ip4.dst==0.0.0.0/0 && ip4.src==0.0.0.0/0 nexthop=
+       PBR pri=10 drop match=ip4.dst==0.0.0.0/0 && ip4.src==0.0.0.0/0 nexthop=
+       PBR pri=1 drop match=ip4.dst==0.0.0.0/0 && ip4.src==0.0.0.0/0 nexthop=
+  4. LS network_17fe24db-e08b-4f81-969a-e06d6f23b35c uuid=183da7a8-c33c-4247-912a-d4cb28ec8a5a
+       stretch flashfire01-3:geneve:10.116.29.156, flashfire03-2:geneve:10.116.29.191, flashfire04-1:geneve:10.116.29.208, spymaster01-2:geneve:10.116.26.72, spymaster02-3:geneve:10.116.26.91, zadkiel04-3:geneve:10.116.26.217, zadkiel04-4:geneve:10.116.26.218, zadkiel05-1:geneve:10.116.26.233 (+1)
+       ACLs from-lport (ingress): 9
+         pri=31500 allow-stateless to-lport [ls] (udp.src == 67 && udp.dst == 68) || (udp.src == 68 && udp.dst == 67)
+         pri=500 allow-related to-lport [ls] tcp || udp || icmp
+         pri=1060 drop to-lport [pg] ip4 && (ip4.src == $address_set_1b11d438_5b2f_4b00_950b_3c355529d406) && outport == @port_group_ee4765ab_2f7d_5aa6_baef_2a4409dcd7a0
+         pri=1052 drop to-lport [pg] ip4 && (ip4.src == $address_set_1b11d438_5b2f_4b00_950b_3c355529d406) && outport == @port_group_ee4765ab_2f7d_5aa6_baef_2a4409dcd7a0
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_205229df_97dd_4f48_8888_22f75df17032) && ((ip.proto == 6 && ((tcp.dst >= 18363 && tcp.dst <= 18372) || (tcp.dst >= 18376 && tcp.
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_8bd19f47_a216_502a_b5e5_00edc3b21853) && ((ip.proto == 1 && ((icmp4.type == 8 && icmp4.code == 0))) || (ip.proto == 6 && (tcp.ds
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_f96fe67d_5c12_5b66_b6a0_6e7e91be679b) && ((ip.proto == 6 && ((tcp.dst >= 18497 && tcp.dst <= 18506) || (tcp.dst >= 18512 && tcp.
+         pri=1045 drop to-lport [pg] ip6 && outport == @port_group_ee4765ab_2f7d_5aa6_baef_2a4409dcd7a0
+         pri=1045 drop to-lport [pg] ip4 && outport == @port_group_ee4765ab_2f7d_5aa6_baef_2a4409dcd7a0
+       ACLs to-lport (egress): 8
+         pri=31500 allow-stateless from-lport [ls] (udp.src == 67 && udp.dst == 68) || (udp.src == 68 && udp.dst == 67)
+         pri=500 allow-related from-lport [ls] tcp || udp || icmp
+         pri=1060 drop from-lport [pg] inport == @port_group_ee4765ab_2f7d_5aa6_baef_2a4409dcd7a0 && ip4 && (ip4.dst == $address_set_1b11d438_5b2f_4b00_950b_3c355529d406)
+         pri=1052 drop from-lport [pg] inport == @port_group_ee4765ab_2f7d_5aa6_baef_2a4409dcd7a0 && ip4 && (ip4.dst == $address_set_1b11d438_5b2f_4b00_950b_3c355529d406)
+         pri=1050 allow-related from-lport [pg] inport == @port_group_ee4765ab_2f7d_5aa6_baef_2a4409dcd7a0 && ip4 && (ip4.dst == $address_set_b490212e_6951_43bf_a004_f47375039435) && ((ip.proto == 6 && ((tcp.
+         pri=1050 allow-related from-lport [pg] inport == @port_group_ee4765ab_2f7d_5aa6_baef_2a4409dcd7a0 && ip4 && (ip4.dst == $address_set_17ae1270_33aa_5acd_94b7_65b09d6bf397) && ((ip.proto == 6 && ((tcp.
+         pri=1045 drop from-lport [pg] inport == @port_group_ee4765ab_2f7d_5aa6_baef_2a4409dcd7a0 && ip6
+         pri=1045 drop from-lport [pg] inport == @port_group_ee4765ab_2f7d_5aa6_baef_2a4409dcd7a0 && ip4
+  5. VIF vm=VPC_California_SJ_Pheonix_Customer_19_FNS-L1-1_4 nic=1d6e610d-f164-4f5d-a6f3-4be6a59a4819 lsp=port_ac6485b2-02b8-492e-84ca-1e4fa3e33360 lsp_uuid=22bce434-1ef5-4792-8e57-8fa2a5e3bd71 mac=50:6b:8d:43:a5:90 ip=192.168.1.51
+
+######## two_router: no two-VIF overlay across two tenant routers; closest VM VPC_California_SJ_Pheonix_Customer_1_subnet_2_139 LS network_9472b0d1-09fb-4e7e-a1cf-9536d262b6ef via router_fc433064-926d-4fc0-a1a3-7c089ad90343 -> gw-scale-out-router_nat_fc433064-926d-4fc0-a1a3-7c089ad90343_1
+=== FORWARD (two_router) ===
+src: vm=VPC_California_SJ_Pheonix_Customer_1_subnet_2_139 nic=3468ac71-d670-41a0-93af-0ec34d43f7c3 lsp=port_12a2ce8a-afb5-40e5-b5ff-a7b3f895ffc2 lsp_uuid=915f1338-1aba-4c27-a016-cb9876cdc970 mac=50:6b:8d:19:78:77 ip=192.168.2.186
+dst: lr=gw-scale-out-router_nat_fc433064-926d-4fc0-a1a3-7c089ad90343_1 uuid=edba0385-d5d3-4d07-8ca5-f9253e4af298
+  1. VIF vm=VPC_California_SJ_Pheonix_Customer_1_subnet_2_139 nic=3468ac71-d670-41a0-93af-0ec34d43f7c3 lsp=port_12a2ce8a-afb5-40e5-b5ff-a7b3f895ffc2 lsp_uuid=915f1338-1aba-4c27-a016-cb9876cdc970 mac=50:6b:8d:19:78:77 ip=192.168.2.186
+  2. LS network_9472b0d1-09fb-4e7e-a1cf-9536d262b6ef uuid=02d0de22-21a5-41f7-befd-75b6cb9c4cc7
+       stretch flashfire01-1:geneve:10.116.29.154, flashfire01-2:geneve:10.116.29.155, flashfire01-3:geneve:10.116.29.156, flashfire01-4:geneve:10.116.29.157, flashfire02-1:geneve:10.116.29.172, flashfire02-2:geneve:10.116.29.173, flashfire02-3:geneve:10.116.29.174, flashfire02-4:geneve:10.116.29.175 (+22)
+       ACLs from-lport (ingress): 13
+         pri=31500 allow-stateless from-lport [ls] (udp.src == 67 && udp.dst == 68) || (udp.src == 68 && udp.dst == 67)
+         pri=500 allow-related from-lport [ls] tcp || udp || icmp
+         pri=1060 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c)
+         pri=1052 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c)
+         pri=1050 allow-related from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_9c194c48_8c96_54a7_837a_81508c40ddae) && ((ip.proto == 6 && ((tcp.
+         pri=1050 allow-related from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_f412ba3b_b736_4b27_a0e6_4eeefc7220a4) && ((ip.proto == 6 && ((tcp.
+         pri=1045 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip6
+         pri=1045 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4
+         pri=1019 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4 && (ip4.dst == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506)
+         pri=1018 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4 && (ip4.dst == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506)
+         pri=1017 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4
+         pri=1015 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4
+         … 1 more
+       ACLs to-lport (egress): 14
+         pri=31500 allow-stateless to-lport [ls] (udp.src == 67 && udp.dst == 68) || (udp.src == 68 && udp.dst == 67)
+         pri=500 allow-related to-lport [ls] tcp || udp || icmp
+         pri=1060 drop to-lport [pg] ip4 && (ip4.src == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c) && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1052 drop to-lport [pg] ip4 && (ip4.src == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c) && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_e88c0d4d_73b0_486e_a3fb_d95baaa35ef1) && ((ip.proto == 6 && ((tcp.dst >= 1025 && tcp.dst <= 1034) || (tcp.dst >= 1037 && tcp.dst
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_ca94bdb8_7cff_5c8c_858e_ca44207c5032) && ((ip.proto == 1 && ((icmp4.type == 8 && icmp4.code == 0))) || (ip.proto == 6 && (tcp.ds
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_09687af3_486d_5381_baff_78f78a00c4b3) && ((ip.proto == 6 && ((tcp.dst >= 1152 && tcp.dst <= 1161) || (tcp.dst >= 1166 && tcp.dst
+         pri=1045 drop to-lport [pg] ip4 && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1045 drop to-lport [pg] ip6 && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1019 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506) && outport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133
+         pri=1018 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506) && outport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133
+         pri=1017 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_25f83796_b668_50c1_a86f_741b6495cafe) && outport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133
+         … 2 more
+  3. LR router_fc433064-926d-4fc0-a1a3-7c089ad90343 uuid=cb58bbb0-4bdc-429e-9378-838e204b99f1 has_nat=0
+       LRP lrp-router-port_9472b0d1-09fb-4e7e-a1cf-9536d262b6ef mac=e0:19:95:08:22:c9 nets=['192.168.2.1/24']
+       PBR pri=100 allow match=ip4.dst==0.0.0.0/0 && ip4.src==0.0.0.0/0 nexthop=
+       PBR pri=10 drop match=ip4.dst==0.0.0.0/0 && ip4.src==0.0.0.0/0 nexthop=
+       PBR pri=1 drop match=ip4.dst==0.0.0.0/0 && ip4.src==0.0.0.0/0 nexthop=
+  4. LR gw-scale-out-router_nat_fc433064-926d-4fc0-a1a3-7c089ad90343_1 uuid=edba0385-d5d3-4d07-8ca5-f9253e4af298 has_nat=1
+       via transit_ls LS gw-scale-out-network_nat_fc433064-926d-4fc0-a1a3-7c089ad90343 uuid=df8dadd4-7138-4ea7-95da-15fab0b6838c
+       ACLs from-lport (ingress): (none)
+       ACLs to-lport (egress): (none)
+       PBR pri=1000 reroute match=ip4.src==100.64.1.6/32 nexthop=169.254.2.100
+       NAT snat ext=10.116.246.55 log=192.168.96.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.19.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.14.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.56.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.68.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.39.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.76.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.8.0/24 port=
+       … 42 more NAT
+=== REVERSE (two_router) ===
+src: lr=gw-scale-out-router_nat_fc433064-926d-4fc0-a1a3-7c089ad90343_1 uuid=edba0385-d5d3-4d07-8ca5-f9253e4af298
+dst: vm=VPC_California_SJ_Pheonix_Customer_1_subnet_2_139 nic=3468ac71-d670-41a0-93af-0ec34d43f7c3 lsp=port_12a2ce8a-afb5-40e5-b5ff-a7b3f895ffc2 lsp_uuid=915f1338-1aba-4c27-a016-cb9876cdc970 mac=50:6b:8d:19:78:77 ip=192.168.2.186
+  1. LR gw-scale-out-router_nat_fc433064-926d-4fc0-a1a3-7c089ad90343_1 uuid=edba0385-d5d3-4d07-8ca5-f9253e4af298 has_nat=1
+       via transit_ls LS gw-scale-out-network_nat_fc433064-926d-4fc0-a1a3-7c089ad90343 uuid=df8dadd4-7138-4ea7-95da-15fab0b6838c
+       ACLs from-lport (ingress): (none)
+       ACLs to-lport (egress): (none)
+       PBR pri=1000 reroute match=ip4.src==100.64.1.6/32 nexthop=169.254.2.100
+       NAT snat ext=10.116.246.55 log=192.168.96.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.19.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.14.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.56.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.68.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.39.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.76.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.8.0/24 port=
+       … 42 more NAT
+  2. LR router_fc433064-926d-4fc0-a1a3-7c089ad90343 uuid=cb58bbb0-4bdc-429e-9378-838e204b99f1 has_nat=0
+       LRP lrp-router-port_9472b0d1-09fb-4e7e-a1cf-9536d262b6ef mac=e0:19:95:08:22:c9 nets=['192.168.2.1/24']
+       PBR pri=100 allow match=ip4.dst==0.0.0.0/0 && ip4.src==0.0.0.0/0 nexthop=
+       PBR pri=10 drop match=ip4.dst==0.0.0.0/0 && ip4.src==0.0.0.0/0 nexthop=
+       PBR pri=1 drop match=ip4.dst==0.0.0.0/0 && ip4.src==0.0.0.0/0 nexthop=
+  3. LS network_9472b0d1-09fb-4e7e-a1cf-9536d262b6ef uuid=02d0de22-21a5-41f7-befd-75b6cb9c4cc7
+       stretch flashfire01-1:geneve:10.116.29.154, flashfire01-2:geneve:10.116.29.155, flashfire01-3:geneve:10.116.29.156, flashfire01-4:geneve:10.116.29.157, flashfire02-1:geneve:10.116.29.172, flashfire02-2:geneve:10.116.29.173, flashfire02-3:geneve:10.116.29.174, flashfire02-4:geneve:10.116.29.175 (+22)
+       ACLs from-lport (ingress): 14
+         pri=31500 allow-stateless to-lport [ls] (udp.src == 67 && udp.dst == 68) || (udp.src == 68 && udp.dst == 67)
+         pri=500 allow-related to-lport [ls] tcp || udp || icmp
+         pri=1060 drop to-lport [pg] ip4 && (ip4.src == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c) && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1052 drop to-lport [pg] ip4 && (ip4.src == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c) && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_e88c0d4d_73b0_486e_a3fb_d95baaa35ef1) && ((ip.proto == 6 && ((tcp.dst >= 1025 && tcp.dst <= 1034) || (tcp.dst >= 1037 && tcp.dst
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_ca94bdb8_7cff_5c8c_858e_ca44207c5032) && ((ip.proto == 1 && ((icmp4.type == 8 && icmp4.code == 0))) || (ip.proto == 6 && (tcp.ds
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_09687af3_486d_5381_baff_78f78a00c4b3) && ((ip.proto == 6 && ((tcp.dst >= 1152 && tcp.dst <= 1161) || (tcp.dst >= 1166 && tcp.dst
+         pri=1045 drop to-lport [pg] ip4 && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1045 drop to-lport [pg] ip6 && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1019 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506) && outport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133
+         pri=1018 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506) && outport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133
+         pri=1017 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_25f83796_b668_50c1_a86f_741b6495cafe) && outport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133
+         … 2 more
+       ACLs to-lport (egress): 13
+         pri=31500 allow-stateless from-lport [ls] (udp.src == 67 && udp.dst == 68) || (udp.src == 68 && udp.dst == 67)
+         pri=500 allow-related from-lport [ls] tcp || udp || icmp
+         pri=1060 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c)
+         pri=1052 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c)
+         pri=1050 allow-related from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_9c194c48_8c96_54a7_837a_81508c40ddae) && ((ip.proto == 6 && ((tcp.
+         pri=1050 allow-related from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_f412ba3b_b736_4b27_a0e6_4eeefc7220a4) && ((ip.proto == 6 && ((tcp.
+         pri=1045 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip6
+         pri=1045 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4
+         pri=1019 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4 && (ip4.dst == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506)
+         pri=1018 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4 && (ip4.dst == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506)
+         pri=1017 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4
+         pri=1015 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4
+         … 1 more
+  4. VIF vm=VPC_California_SJ_Pheonix_Customer_1_subnet_2_139 nic=3468ac71-d670-41a0-93af-0ec34d43f7c3 lsp=port_12a2ce8a-afb5-40e5-b5ff-a7b3f895ffc2 lsp_uuid=915f1338-1aba-4c27-a016-cb9876cdc970 mac=50:6b:8d:19:78:77 ip=192.168.2.186
+
+######## northbound: VM VPC_California_SJ_Pheonix_Customer_1_subnet_2_139 LS network_9472b0d1-09fb-4e7e-a1cf-9536d262b6ef via router_fc433064-926d-4fc0-a1a3-7c089ad90343 -> gw-scale-out-router_nat_fc433064-926d-4fc0-a1a3-7c089ad90343_1
+=== FORWARD (northbound) ===
+src: vm=VPC_California_SJ_Pheonix_Customer_1_subnet_2_139 nic=3468ac71-d670-41a0-93af-0ec34d43f7c3 lsp=port_12a2ce8a-afb5-40e5-b5ff-a7b3f895ffc2 lsp_uuid=915f1338-1aba-4c27-a016-cb9876cdc970 mac=50:6b:8d:19:78:77 ip=192.168.2.186
+dst: external/NAT
+  1. VIF vm=VPC_California_SJ_Pheonix_Customer_1_subnet_2_139 nic=3468ac71-d670-41a0-93af-0ec34d43f7c3 lsp=port_12a2ce8a-afb5-40e5-b5ff-a7b3f895ffc2 lsp_uuid=915f1338-1aba-4c27-a016-cb9876cdc970 mac=50:6b:8d:19:78:77 ip=192.168.2.186
+  2. LS network_9472b0d1-09fb-4e7e-a1cf-9536d262b6ef uuid=02d0de22-21a5-41f7-befd-75b6cb9c4cc7
+       stretch flashfire01-1:geneve:10.116.29.154, flashfire01-2:geneve:10.116.29.155, flashfire01-3:geneve:10.116.29.156, flashfire01-4:geneve:10.116.29.157, flashfire02-1:geneve:10.116.29.172, flashfire02-2:geneve:10.116.29.173, flashfire02-3:geneve:10.116.29.174, flashfire02-4:geneve:10.116.29.175 (+22)
+       ACLs from-lport (ingress): 13
+         pri=31500 allow-stateless from-lport [ls] (udp.src == 67 && udp.dst == 68) || (udp.src == 68 && udp.dst == 67)
+         pri=500 allow-related from-lport [ls] tcp || udp || icmp
+         pri=1060 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c)
+         pri=1052 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c)
+         pri=1050 allow-related from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_9c194c48_8c96_54a7_837a_81508c40ddae) && ((ip.proto == 6 && ((tcp.
+         pri=1050 allow-related from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_f412ba3b_b736_4b27_a0e6_4eeefc7220a4) && ((ip.proto == 6 && ((tcp.
+         pri=1045 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip6
+         pri=1045 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4
+         pri=1019 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4 && (ip4.dst == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506)
+         pri=1018 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4 && (ip4.dst == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506)
+         pri=1017 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4
+         pri=1015 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4
+         … 1 more
+       ACLs to-lport (egress): 14
+         pri=31500 allow-stateless to-lport [ls] (udp.src == 67 && udp.dst == 68) || (udp.src == 68 && udp.dst == 67)
+         pri=500 allow-related to-lport [ls] tcp || udp || icmp
+         pri=1060 drop to-lport [pg] ip4 && (ip4.src == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c) && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1052 drop to-lport [pg] ip4 && (ip4.src == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c) && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_e88c0d4d_73b0_486e_a3fb_d95baaa35ef1) && ((ip.proto == 6 && ((tcp.dst >= 1025 && tcp.dst <= 1034) || (tcp.dst >= 1037 && tcp.dst
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_ca94bdb8_7cff_5c8c_858e_ca44207c5032) && ((ip.proto == 1 && ((icmp4.type == 8 && icmp4.code == 0))) || (ip.proto == 6 && (tcp.ds
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_09687af3_486d_5381_baff_78f78a00c4b3) && ((ip.proto == 6 && ((tcp.dst >= 1152 && tcp.dst <= 1161) || (tcp.dst >= 1166 && tcp.dst
+         pri=1045 drop to-lport [pg] ip4 && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1045 drop to-lport [pg] ip6 && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1019 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506) && outport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133
+         pri=1018 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506) && outport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133
+         pri=1017 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_25f83796_b668_50c1_a86f_741b6495cafe) && outport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133
+         … 2 more
+  3. LR router_fc433064-926d-4fc0-a1a3-7c089ad90343 uuid=cb58bbb0-4bdc-429e-9378-838e204b99f1 has_nat=0
+       LRP lrp-router-port_9472b0d1-09fb-4e7e-a1cf-9536d262b6ef mac=e0:19:95:08:22:c9 nets=['192.168.2.1/24']
+       PBR pri=100 allow match=ip4.dst==0.0.0.0/0 && ip4.src==0.0.0.0/0 nexthop=
+       PBR pri=10 drop match=ip4.dst==0.0.0.0/0 && ip4.src==0.0.0.0/0 nexthop=
+       PBR pri=1 drop match=ip4.dst==0.0.0.0/0 && ip4.src==0.0.0.0/0 nexthop=
+  4. LR gw-scale-out-router_nat_fc433064-926d-4fc0-a1a3-7c089ad90343_1 uuid=edba0385-d5d3-4d07-8ca5-f9253e4af298 has_nat=1
+       via transit_ls LS gw-scale-out-network_nat_fc433064-926d-4fc0-a1a3-7c089ad90343 uuid=df8dadd4-7138-4ea7-95da-15fab0b6838c
+       ACLs from-lport (ingress): (none)
+       ACLs to-lport (egress): (none)
+       PBR pri=1000 reroute match=ip4.src==100.64.1.6/32 nexthop=169.254.2.100
+       NAT snat ext=10.116.246.55 log=192.168.96.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.19.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.14.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.56.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.68.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.39.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.76.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.8.0/24 port=
+       … 42 more NAT
+  5. EXTERNAL (NAT / ext GW)
+=== REVERSE (northbound) ===
+src: external/NAT
+dst: vm=VPC_California_SJ_Pheonix_Customer_1_subnet_2_139 nic=3468ac71-d670-41a0-93af-0ec34d43f7c3 lsp=port_12a2ce8a-afb5-40e5-b5ff-a7b3f895ffc2 lsp_uuid=915f1338-1aba-4c27-a016-cb9876cdc970 mac=50:6b:8d:19:78:77 ip=192.168.2.186
+  1. EXTERNAL (NAT / ext GW)
+  2. LR gw-scale-out-router_nat_fc433064-926d-4fc0-a1a3-7c089ad90343_1 uuid=edba0385-d5d3-4d07-8ca5-f9253e4af298 has_nat=1
+       via transit_ls LS gw-scale-out-network_nat_fc433064-926d-4fc0-a1a3-7c089ad90343 uuid=df8dadd4-7138-4ea7-95da-15fab0b6838c
+       ACLs from-lport (ingress): (none)
+       ACLs to-lport (egress): (none)
+       PBR pri=1000 reroute match=ip4.src==100.64.1.6/32 nexthop=169.254.2.100
+       NAT snat ext=10.116.246.55 log=192.168.96.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.19.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.14.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.56.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.68.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.39.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.76.0/24 port=
+       NAT snat ext=10.116.246.55 log=192.168.8.0/24 port=
+       … 42 more NAT
+  3. LR router_fc433064-926d-4fc0-a1a3-7c089ad90343 uuid=cb58bbb0-4bdc-429e-9378-838e204b99f1 has_nat=0
+       LRP lrp-router-port_9472b0d1-09fb-4e7e-a1cf-9536d262b6ef mac=e0:19:95:08:22:c9 nets=['192.168.2.1/24']
+       PBR pri=100 allow match=ip4.dst==0.0.0.0/0 && ip4.src==0.0.0.0/0 nexthop=
+       PBR pri=10 drop match=ip4.dst==0.0.0.0/0 && ip4.src==0.0.0.0/0 nexthop=
+       PBR pri=1 drop match=ip4.dst==0.0.0.0/0 && ip4.src==0.0.0.0/0 nexthop=
+  4. LS network_9472b0d1-09fb-4e7e-a1cf-9536d262b6ef uuid=02d0de22-21a5-41f7-befd-75b6cb9c4cc7
+       stretch flashfire01-1:geneve:10.116.29.154, flashfire01-2:geneve:10.116.29.155, flashfire01-3:geneve:10.116.29.156, flashfire01-4:geneve:10.116.29.157, flashfire02-1:geneve:10.116.29.172, flashfire02-2:geneve:10.116.29.173, flashfire02-3:geneve:10.116.29.174, flashfire02-4:geneve:10.116.29.175 (+22)
+       ACLs from-lport (ingress): 14
+         pri=31500 allow-stateless to-lport [ls] (udp.src == 67 && udp.dst == 68) || (udp.src == 68 && udp.dst == 67)
+         pri=500 allow-related to-lport [ls] tcp || udp || icmp
+         pri=1060 drop to-lport [pg] ip4 && (ip4.src == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c) && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1052 drop to-lport [pg] ip4 && (ip4.src == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c) && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_e88c0d4d_73b0_486e_a3fb_d95baaa35ef1) && ((ip.proto == 6 && ((tcp.dst >= 1025 && tcp.dst <= 1034) || (tcp.dst >= 1037 && tcp.dst
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_ca94bdb8_7cff_5c8c_858e_ca44207c5032) && ((ip.proto == 1 && ((icmp4.type == 8 && icmp4.code == 0))) || (ip.proto == 6 && (tcp.ds
+         pri=1050 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_09687af3_486d_5381_baff_78f78a00c4b3) && ((ip.proto == 6 && ((tcp.dst >= 1152 && tcp.dst <= 1161) || (tcp.dst >= 1166 && tcp.dst
+         pri=1045 drop to-lport [pg] ip4 && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1045 drop to-lport [pg] ip6 && outport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f
+         pri=1019 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506) && outport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133
+         pri=1018 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506) && outport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133
+         pri=1017 allow-related to-lport [pg] ip4 && (ip4.src == $address_set_25f83796_b668_50c1_a86f_741b6495cafe) && outport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133
+         … 2 more
+       ACLs to-lport (egress): 13
+         pri=31500 allow-stateless from-lport [ls] (udp.src == 67 && udp.dst == 68) || (udp.src == 68 && udp.dst == 67)
+         pri=500 allow-related from-lport [ls] tcp || udp || icmp
+         pri=1060 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c)
+         pri=1052 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_d8c26aac_c96e_46a2_a07a_a17fcd70313c)
+         pri=1050 allow-related from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_9c194c48_8c96_54a7_837a_81508c40ddae) && ((ip.proto == 6 && ((tcp.
+         pri=1050 allow-related from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4 && (ip4.dst == $address_set_f412ba3b_b736_4b27_a0e6_4eeefc7220a4) && ((ip.proto == 6 && ((tcp.
+         pri=1045 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip6
+         pri=1045 drop from-lport [pg] inport == @port_group_4b7148bb_c13c_56be_9e17_95bceba2d71f && ip4
+         pri=1019 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4 && (ip4.dst == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506)
+         pri=1018 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4 && (ip4.dst == $address_set_ddb478f9_61bb_484c_aa10_5738fabfe506)
+         pri=1017 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4
+         pri=1015 allow-related from-lport [pg] inport == @port_group_85e8b5fc_03c6_53cb_97cb_b2535b556133 && ip4
+         … 1 more
+  5. VIF vm=VPC_California_SJ_Pheonix_Customer_1_subnet_2_139 nic=3468ac71-d670-41a0-93af-0ec34d43f7c3 lsp=port_12a2ce8a-afb5-40e5-b5ff-a7b3f895ffc2 lsp_uuid=915f1338-1aba-4c27-a016-cb9876cdc970 mac=50:6b:8d:19:78:77 ip=192.168.2.186
+
