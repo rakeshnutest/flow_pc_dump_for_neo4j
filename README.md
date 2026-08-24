@@ -65,6 +65,10 @@ Output layout:
   fqdn_to_ip_map.json
   port_set_list.json          # atlas_cli -o json port_set.list
   port_set_get.json           # atlas_cli -o json port_set.get <uuid> (keyed by uuid)
+  ahv_gateway.json            # AHV Gateway OVS/virsh/tap/brAtlas index
+  ahv_gateway/<hypervisor_ip>/  # per-host OVS + virsh + tap + conf.db
+  cmsp_ovn.json               # CMSP kubectl OVN NB/SB dump index
+  cmsp_ovn/anc-ovn/           # ovsdb-client dump of NB/SB
   dump_errors.json
 ```
 
@@ -98,8 +102,46 @@ Flags are parsed **before** `FlowInterfaces()` is created. That is required on P
 | `--skip_atlas` | off | Skip `atlas_cli port_set.list` / `port_set.get` |
 | `--atlas_timeout_secs` | `300` | Timeout for `port_set.list` and the `port_set.get` batch |
 | `--atlas_get_workers` | `32` | Parallel `atlas_cli port_set.get` processes |
+| `--skip_ahv_gateway` | off | Skip AHV Gateway host collect (default **on**: OVS/virsh/tap/brAtlas from every PE hypervisor) |
+| `--ahv_gateway_timeout_secs` | `1800` | Retry budget across all hosts until every required artifact exists |
+| `--ahv_gateway_class_timeout_secs` | `300` | Per-class bugtool HTTP timeout |
+| `--ahv_gateway_workers` | `8` | Parallel hypervisor collects |
+| `--ahv_gateway_port` | `7030` | AHV Gateway HTTPS port |
+| `--ahv_gateway_cert_dir` | `/home/certs/ClusterHealthService` | mTLS cert/key directory (`<name>.crt` + `<name>.key`) |
+| `--skip_cmsp_ovn` | off | Skip CMSP kubectl OVN NB/SB dump (default **on**) |
+| `--cmsp_ovn_timeout_secs` | `1800` | Retry budget until NB and SB `ovsdb-client dump` exist |
+| `--cmsp_ovn_namespace` | empty | Kubernetes namespace; empty searches all namespaces |
 
 **SMSP vs CMSP (auto-detected, no flag):** `mspctl cluster list` / `mspctl cluster get flow --verbose`. A cluster named `flow` with a UUID is SMSP → every `atlas_cli` uses `-u ws://smsp-<uuid>.ntnx-ikat.svc:2060/atlas_cli`. No `flow` cluster (404 / only `controller_msp`) plus a local `genesis status` Atlas process is CMSP → `atlas_cli` on the PCVM. `port_set.list` → `port_set_list.json`; each `port_set.get <uuid>` → `port_set_get.json`.
+
+**AHV Gateway host collect (default on, never SSH to AHV):** runs first (before FlowInterfaces). The script mTLS-calls each PE hypervisor at `:7030` with the PC `ClusterHealthService` cert and **retries until all of these exist per host**:
+
+- `ovs-vsctl show`
+- `ovs-dpctl -s show`
+- `ovs-ofctl dump-flows brAtlas` (and any other `brAtlas` ofctl outputs in the `networking` class)
+- `virsh list --all` + `virsh dumpxml` (tap/MAC per VM)
+- tap devices
+- OVN/OVS DB (`ovn*.db` / `conf.db`, plus an `ovn` bugtool class if advertised)
+
+Layout: `<output_dir>/ahv_gateway/<hypervisor_ip>/` plus `ahv_gateway.json`. Complete when **every** PE host has the required OVS/virsh/tap artifacts.
+
+**CMSP OVN NB/SB (default on):** OVN Northbound/Southbound live in kubectl pods on the PC (`anc-ovn-0` / container `anc-ovn`), not on AHV. The dump runs (no `-it`):
+
+```bash
+sudo kubectl exec anc-ovn-0 -c anc-ovn -- ovsdb-client dump unix:/var/run/ovn/ovnnb_db.sock
+sudo kubectl exec anc-ovn-0 -c anc-ovn -- ovsdb-client dump unix:/var/run/ovn/ovnsb_db.sock
+```
+
+It retries until both dumps exist. Layout: `<output_dir>/cmsp_ovn/anc-ovn/commands/ovsdb-client_dump_{nb,sb}.txt`.
+
+**Where the files are:**
+
+| Place | What you get |
+|---|---|
+| `<output_dir>/ahv_gateway/<hypervisor_ip>/` | Per-host OVS/virsh/tap/brAtlas/conf.db from AHV Gateway |
+| `<output_dir>/ahv_gateway.json` | Per-host complete/missing index |
+| `<output_dir>/cmsp_ovn/` | OVN NB/SB (+ IC/policy) from kubectl on CMSP PC |
+| `<output_dir>/cmsp_ovn.json` | kubectl dump index |
 
 Help:
 
@@ -122,7 +164,7 @@ Logged as `DUMP start` / `DUMP done` / `DATASET … dumped N records`, then `===
 | `subnets` | `idfcli` `virtual_network` / `subnet` (`overlay_network_uuid`, `advanced_networking`); subnet categories from `abac_entity_capability` | `_fetch_subnets` |
 | `vpcs` | Overlay stubs from `overlay_network_uuid` plus ALL_VLAN `00000000-0000-0000-0000-000000000001` named `VLAN` | `create_vpc_map` |
 | `categories` | `idfcli` `abac_category` merged with `category` (`key:value`) | `create_category_map` |
-| `clusters` | `idfcli` `cluster` | `load_infrastructure_data` |
+| `clusters` | `idfcli` `cluster` plus ncli VIP enrich | `load_infrastructure_data` |
 | `projects` | `idfcli` `project` | `load_projects_data` |
 | `categories` | `idfcli` `category` | `create_category_map` |
 | `network_functions` | `idfcli` `network_function` | `load_network_functions_data` |
@@ -130,6 +172,8 @@ Logged as `DUMP start` / `DUMP done` / `DATASET … dumped N records`, then `===
 | `fqdn_to_ip_map` | `fqdn_resolution_manager` or `idfcli` `fns_fqdn_to_ip_info` | EG FQDN expansion |
 | `port_set_list` | `atlas_cli -o json port_set.list` (SMSP/CMSP wrapped) | Atlas port-set inventory |
 | `port_set_get` | `atlas_cli -o json port_set.get <uuid>` for each listed UUID | Atlas port-set details (`virtual_nic_uuid_list`, …) |
+| `ahv_gateway` | PC mTLS AHV Gateway `:7030` per hypervisor | Host OVS / virsh / tap / brAtlas |
+| `cmsp_ovn` | `sudo kubectl exec anc-ovn-0 -c anc-ovn -- ovsdb-client dump unix:/var/run/ovn/ovn{nb,sb}_db.sock` | OVN Northbound + Southbound |
 
 Each VM NIC `nic_network_info` includes:
 
