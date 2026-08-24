@@ -31,16 +31,19 @@ Src uses `_S`. Dest VIF uses `_D`. External dest: no `_D` TAP/OVS.
 
 Host subgraph (when chassis differ) wraps **VM+NIC+TAP+OVS**, not VM+NIC only.
 
+Northbound: wrap **every** scale-out GW chassis in `External GW Host` (hostname + chassis UUID). Label `active RC` vs `standby` / `standby scale-out`. IDs `TAP_GW` / `OVS_GW` (and `TAP_GW0`…) when dataplane has them. External GW hexagon: `External GW` + `IP` + `MAC`.
+
 ## Other nodes (when on path)
 
 | ID prefix | Class | Shape | When |
 |---|---|---|---|
 | `SW*` | `sw` | cylinder | every LS; label `transit` for gw-scale-out-network |
-| `RT*` | `rt` | hexagon | every LR; add `NAT` if NAT exists; add `ext-GW` if external GW |
+| `RT*` | `rt` | hexagon | every LR; External GW must show MAC + IP/CIDR |
 | `EXT` | `ext` | stadium | northbound dest only |
 | `NAT*` | `nat` | dashed rect | hangs off its router; not a hop |
 | `PBR*` | `pbr` | dashed rect | hangs off its router |
-| `RC*` | `rc` | dashed stadium | HA chassis_name + priority |
+| `RC*` | `rc` | dashed stadium | every HA member: hostname, chassis UUID, pri, active/standby |
+| `TAP_GW` / `OVS_GW` | tap/ovs | rectangle | GW host brAtlas when dataplane has it |
 | `OVL` | `ovl` | dashed rect | chassis differ; not a Switch substitute |
 | `PG*` | `pg` | dashed teal | applied-to; rewrite `@port_group_*` |
 | `AS*` | `aset` | dashed gold | dest/src IPs; rewrite `$address_set_*` |
@@ -73,4 +76,4 @@ Same chassis: drop `subgraph H1`/`H2`, **keep** TAP_* and OVS_*.
 
 ## Reject
 
-Mermaid source lacks `TAP_S`, `OVS_S`, and (VIF dest) `TAP_D`, `OVS_D`, or any OVS label omits `brAtlas`. Redraw; do not send.
+Mermaid source lacks `TAP_S`, `OVS_S`, and (VIF dest) `TAP_D`, `OVS_D`, or any OVS label omits `brAtlas`. Scale-out with a gw-scale-out router but no `External GW Host`, or External GW without MAC/IP: redraw; do not send.

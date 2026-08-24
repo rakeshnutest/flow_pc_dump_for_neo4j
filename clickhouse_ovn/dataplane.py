@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import xml.etree.ElementTree as ET
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
@@ -198,6 +199,55 @@ def ovs_for_vif(nic: Dict[str, Any], lsp: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
+def ovs_for_gw(host_ip: str, localnet_name: str) -> Dict[str, str]:
+    """brAtlas patch for a GW localnet LSP (no VM TAP)."""
+    host_ip = str(host_ip or "")
+    localnet_name = str(localnet_name or "")
+    out = {
+        "tap": "",
+        "ofport": "",
+        "dp_port": "",
+        "bridge": "brAtlas",
+        "iface_id": localnet_name,
+    }
+    if not host_ip or not localnet_name:
+        return out
+    uid = (
+        localnet_name[len("localnet_") :]
+        if localnet_name.startswith("localnet_")
+        else localnet_name
+    )
+    ifaces = _conf_ifaces(host_ip)
+    want = [
+        f"patch-brAtlas-to-localnet_{uid}",
+        f"patch-localnet_{uid}-to-brAtlas",
+        localnet_name,
+    ]
+    rec: Dict[str, Any] = {}
+    tap = ""
+    for name in want:
+        if name in ifaces:
+            rec = ifaces[name]
+            tap = name
+            break
+    if not rec:
+        for name, info in ifaces.items():
+            if uid and uid in name:
+                rec = info
+                tap = name
+                break
+            if info.get("iface_id") == localnet_name:
+                rec = info
+                tap = name
+                break
+    ofport = rec.get("ofport")
+    out["tap"] = tap
+    out["ofport"] = str(ofport) if ofport not in (None, "") else ""
+    out["dp_port"] = _dp_port(host_ip, tap) if tap else ""
+    out["iface_id"] = rec.get("iface_id") or localnet_name
+    return out
+
+
 def port_group_label(pg_name: str) -> str:
     raw = pg_name[len("port_group_") :] if pg_name.startswith("port_group_") else pg_name
     uid = _underscores_to_uuid(raw)
@@ -304,6 +354,80 @@ def refs_from_acls(acls: List[dict]) -> Tuple[List[str], List[str]]:
     return pgs, sets
 
 
+@lru_cache(maxsize=1)
+def _nb_bundle() -> Dict[str, Any]:
+    """Parse NB dump once: static routes + LS/LR options/external_ids/other_config."""
+    empty: Dict[str, Any] = {"static": {}, "lr_meta": {}, "ls_meta": {}}
+    if not os.path.isfile(NB_DUMP):
+        return empty
+    _dir = os.path.dirname(os.path.abspath(__file__))
+    if _dir not in sys.path:
+        sys.path.insert(0, _dir)
+    try:
+        from ingest import as_map, as_str, as_str_list, as_uuid, parse_dump
+    except Exception:
+        return empty
+    tables = parse_dump(
+        NB_DUMP,
+        ["Logical_Router", "Logical_Router_Static_Route", "Logical_Switch"],
+    )
+    by_uid: Dict[str, dict] = {}
+    for r in tables.get("Logical_Router_Static_Route") or []:
+        uid = as_uuid(r.get("_uuid"))
+        if not uid or uid == "00000000-0000-0000-0000-000000000000":
+            continue
+        by_uid[uid] = {
+            "uuid": uid,
+            "prefix": as_str(r.get("ip_prefix")),
+            "nexthop": as_str(r.get("nexthop")),
+            "policy": as_str(r.get("policy")),
+            "output_port": as_str(r.get("output_port")),
+        }
+    static: Dict[str, List[dict]] = {}
+    lr_meta: Dict[str, dict] = {}
+    for r in tables.get("Logical_Router") or []:
+        lr = as_uuid(r.get("_uuid"))
+        if not lr or lr == "00000000-0000-0000-0000-000000000000":
+            continue
+        rows = []
+        for sid in as_str_list(r.get("static_routes")):
+            rec = by_uid.get(sid)
+            if rec:
+                rows.append(rec)
+        if rows:
+            static[lr] = rows
+        lr_meta[lr] = {
+            "name": as_str(r.get("name")),
+            "enabled": r.get("enabled"),
+            "options": as_map(r.get("options")),
+            "external_ids": as_map(r.get("external_ids")),
+        }
+    ls_meta: Dict[str, dict] = {}
+    for r in tables.get("Logical_Switch") or []:
+        uid = as_uuid(r.get("_uuid"))
+        if not uid or uid == "00000000-0000-0000-0000-000000000000":
+            continue
+        ls_meta[uid] = {
+            "name": as_str(r.get("name")),
+            "other_config": as_map(r.get("other_config")),
+            "external_ids": as_map(r.get("external_ids")),
+        }
+    return {"static": static, "lr_meta": lr_meta, "ls_meta": ls_meta}
+
+
+def static_routes_for_lr(lr_uuid: str) -> List[dict]:
+    """All static routes on this LR (not first-match). Empty if dump has none."""
+    return list(_nb_bundle()["static"].get(str(lr_uuid or ""), []) or [])
+
+
+def nb_lr_meta(lr_uuid: str) -> dict:
+    return dict(_nb_bundle()["lr_meta"].get(str(lr_uuid or ""), {}) or {})
+
+
+def nb_ls_meta(ls_uuid: str) -> dict:
+    return dict(_nb_bundle()["ls_meta"].get(str(ls_uuid or ""), {}) or {})
+
+
 def ip_in_address_set(ip: str, as_name: str) -> bool:
     """True if ip is an exact member or is inside a CIDR listed on the set."""
     import ipaddress
@@ -333,8 +457,12 @@ def ip_in_address_set(ip: str, as_name: str) -> bool:
 
 # Names used by trace.py
 ovs_for_vif = ovs_for_vif
+ovs_for_gw = ovs_for_gw
 port_group_label = port_group_label
 address_set_label = address_set_label
 refs_from_acls = refs_from_acls
 rewrite_match = rewrite_match
 ip_in_address_set = ip_in_address_set
+static_routes_for_lr = static_routes_for_lr
+nb_lr_meta = nb_lr_meta
+nb_ls_meta = nb_ls_meta

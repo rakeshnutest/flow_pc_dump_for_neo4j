@@ -93,7 +93,7 @@ Mermaid is **composite per direction** (Upstream = src→dst, Downstream = dst�
 
 1. **Same L2** — src and dst VIF on the same `ls_uuid`. Hops: NIC1, LSP1, LS, ACLs, LSP2, NIC2. Stretch from `ovn_ls_stretch`.
 2. **L2–L3–L2, one router** — two VIF LSs that share one LR via `ovn_edge_ls_lr`. ACLs on each LS; PBR on the LR.
-3. **Two routers** — shortest LS–LR path with two distinct LRs. This dump has **zero** `LRP.peer` (2287 LRPs); routers only meet on a transit LS. There is no VM–VM overlay pair across two tenant routers (VPCs do not overlay-peer). Closest real path: VIF LS → tenant LR → `gw-scale-out-network` → `gw-scale-out-router` (NAT).
+3. **Two routers / VPC via transit** — shortest LS–LR path with two tenant LRs. This dump has **zero** `LRP.peer`; routers meet on a per-VPC `gw-scale-out-network` (transit LS) and a shared External localnet. VM–VM across user VPCs: src LS → src tenant LR → src transit → src `gw-scale-out-router` (NAT, External GW MAC+IP) → External localnet → dest GW → dest transit → dest tenant LR → dest LS. `Gateway_Chassis` is empty; HA chassis groups + sibling `gw-scale-out-router_*` on the transit LS. `trace.py` prints every scale-out host. Fallback if no two-VIF pair: VIF → tenant LR → gw-scale-out-router.
 4. **Northbound** — VIF LS → tenant LR → gw-scale-out-network → gw-scale-out-router with `ovn_nat` and/or `lrp-ext_gw_port` / localnet.
 
 ## Scripts

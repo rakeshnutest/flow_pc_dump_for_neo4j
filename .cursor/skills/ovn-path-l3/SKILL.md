@@ -20,6 +20,9 @@ Invoked by the upstream and downstream composites. **N/A if no Router** (same L2
 - dashed `PBR` hang-off if any policy routes
 - full `PBR on router` table (`pri` `action` `match` `nexthop`) — every row
 - full `connected routes` (`lrp` `cidr` `ext_gw`) — every LRP CIDR
+- full `static routes on router` (`prefix` `nexthop` `policy`) — every row
+- `two_router` / VPC-via-transit: two tenant Routers **and** transit `gw-scale-out-network`; FAIL if transit LS is missing
+- mermaid Router node: UUID, tunnel_key, path LRP MAC+CIDR, key options
 
 `(none)` allowed only when empty; heading still required.
 `two_router`: two Routers or a transit Switch.

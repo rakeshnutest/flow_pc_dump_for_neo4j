@@ -131,6 +131,15 @@ def layer_l3(chunk: str, scenario: str) -> Tuple[str, List[str]]:
         fails.append("missing connected routes")
     if scenario == "two_router" and md.count("Router") < 2 and "transit" not in md.lower():
         fails.append("two_router needs two Routers or transit")
+    if scenario == "two_router" or (
+        chunk.lower().count("gw-scale-out-router") >= 2
+        and "gw-scale-out-network" not in chunk.lower()
+        and "switch transit" not in chunk.lower()
+    ):
+        if "gw-scale-out-network" not in chunk.lower() and "transit" not in md.lower():
+            fails.append("two-VPC via transit missing transit LS")
+    if "static routes on router" not in chunk.lower():
+        fails.append("missing static routes")
     return ("FAIL" if fails else "PASS"), fails
 
 
@@ -143,8 +152,25 @@ def layer_gw(chunk: str, scenario: str) -> Tuple[str, List[str]]:
         fails.append("missing NAT table")
     if "GW chassis" not in chunk:
         fails.append("missing GW chassis (RC)")
-    if "ext-GW" not in md and "NAT" not in md:
+    if "ext-GW" not in md and "NAT" not in md and "External GW" not in md:
         fails.append("GW mermaid missing NAT/ext-GW")
+    north = scenario == "northbound" or "gw-scale-out" in chunk.lower()
+    if north:
+        if "External GW Host" not in chunk:
+            fails.append("missing External GW Host / RC chassis")
+        if "active RC" not in chunk:
+            fails.append("scale-out missing active RC host")
+        if not re.search(r"MAC\s+[0-9a-fA-F:]{11,}", chunk):
+            fails.append("External GW missing MAC")
+        if not re.search(r"IP\s+\d+\.\d+\.\d+\.\d+", chunk):
+            fails.append("External GW missing IP")
+        peers = set(re.findall(r"gw-scale-out-router[^\s`|<]+", chunk))
+        if len(peers) >= 2 and chunk.count("External GW Host") < 2:
+            fails.append("scale-out hides hosts")
+        if len(peers) >= 4 and chunk.count("External GW Host") < 4:
+            fails.append("two-VPC scale-out hides GW hosts")
+        if "gw-scale-out-network" not in chunk.lower() and "switch transit" not in chunk.lower():
+            fails.append("missing transit LS / gw-scale-out-network")
     return ("FAIL" if fails else "PASS"), fails
 
 
@@ -153,8 +179,22 @@ def layer_ext(chunk: str, scenario: str) -> Tuple[str, List[str]]:
         return "N/A", []
     fails: List[str] = []
     md = _md(chunk)
-    if "External" not in md and "ext-GW" not in md:
+    if "External" not in md and "ext-GW" not in md and "External GW" not in md:
         fails.append("missing External / ext-GW")
+    north = scenario == "northbound" or bool(
+        re.search(r"\bnorthbound\b", chunk, re.I)
+    )
+    via_ext = north or scenario == "two_router" or "gw-scale-out" in chunk.lower()
+    if north:
+        if not re.search(r"MAC\s+[0-9a-fA-F:]{11,}", chunk):
+            fails.append("External GW missing MAC")
+        if not re.search(r"IP\s+\d+\.\d+\.\d+\.\d+", chunk):
+            fails.append("External GW missing IP")
+    elif via_ext:
+        if not re.search(r"MAC\s+[0-9a-fA-F:]{11,}", chunk):
+            fails.append("External GW missing MAC")
+        if not re.search(r"IP\s+\d+\.\d+\.\d+\.\d+", chunk):
+            fails.append("External GW missing IP")
     return ("FAIL" if fails else "PASS"), fails
 
 

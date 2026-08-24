@@ -59,7 +59,9 @@ L2–L3–L2: `OVS_S --> SW1 --> RT1 --> SW2 --> OVS_D`.
 
 Two routers: extra `RT` and transit `SW` (`gw-scale-out-network`) on the solid chain.
 
-Northbound: `OVS_S --> SW_tenant --> RT_tenant --> SW_transit --> RT_gw --> EXT`.
+Northbound: `OVS_S --> SW_tenant --> RT_tenant --> SW_transit --> TAP_GW --> OVS_GW --> RT_gw --> EXT`.
+
+Standby scale-out GW hosts: dashed from the active External GW router; **not** omitted.
 
 ## Topologies (same edge language)
 

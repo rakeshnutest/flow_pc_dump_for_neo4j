@@ -1,9 +1,9 @@
 ---
 name: ovn-path-gw
 description: >-
-  Evaluate OVN GW on one direction: ext-GW router, NAT, GW chassis (RC/HA).
-  Use as a layer inside ovn-path-upstream and ovn-path-downstream. N/A when
-  no gateway router is on the path. External dest hop is ovn-path-external.
+  Evaluate OVN GW on one direction: ext-GW router, NAT, GW chassis (RC/HA),
+  every scale-out External GW Host. Use as a layer inside ovn-path-upstream
+  and ovn-path-downstream. N/A when no gateway router is on the path.
 ---
 
 # GW layer
@@ -15,12 +15,14 @@ Invoked by the upstream and downstream composites. **N/A if no GW router**.
 ## When GW is on the path
 
 - mermaid subgraph `GW`
-- GW router with `ext-GW` and/or `NAT`
-- dashed NAT + RC (chassis_name + priority)
-- full `NAT on router` (`type` `external_ip` `logical_ip` `logical_port`)
-- full `GW chassis (RC)` (`chassis_name` `priority`)
+- **every** scale-out host as `External GW Host` (hostname + chassis UUID)
+- active redirect chassis labeled `active RC`; other HA / sibling gw-scale-out hosts labeled `standby` / `standby scale-out` (never omit peers)
+- External GW hexagon: **MAC** + **IP/CIDR** (`External GW` / `IP` / `MAC`)
+- TAP_GW / OVS brAtlas on a GW host when dataplane has them
+- dashed NAT + RC (hostname, chassis UUID, priority, role)
+- full `NAT on router` and `GW chassis (RC)` tables
 
-`(none)` only if empty; heading required. Northbound must PASS this layer.
+FAIL if northbound / gw-scale-out / two-VPC-via-transit has a GW router but mermaid/story has no External GW Host, hides a scale-out host (all sibling `gw-scale-out-router_*` + HA), or External GW lacks MAC or IP. Two-VPC with four GW router names needs four External GW Host lines. Node label: UUID, MAC, IP/CIDR, tunnel_key.
 
 ```bash
 python3 /home/rakeshkumar.r/panacea/.cursor/skills/ovn-path-eval/scripts/check_trace.py \

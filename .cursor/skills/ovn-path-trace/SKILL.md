@@ -30,7 +30,13 @@ python3 /home/rakeshkumar.r/panacea/clickhouse_ovn/trace.py \
 # clickhouse_ovn/out/<src>__<dst>.md
 ```
 
-`--dst external` for northbound. `--out FILE.md` to name the file.
+`--dst` UUID, `external`, or an IP (`8.8.8.8` → northbound). `--out FILE.md` to name the file.
+
+Two user VPCs via transit: src tenant LR → `gw-scale-out-network` → scale-out GW (all hosts, External GW MAC+IP) → External localnet → dest GW → dest tenant. Write `clickhouse_ovn/out/vpc_transit_vpc.md`.
+
+Every `.md` **starts** with **Traffic story / RCA**: Drop / allow, Routing view, Policy view, What exactly happened. Then mermaid + **Metadata** (each LS/LR: UUID, tunnel_key, options/other_config, every path LSP, every LRP MAC+CIDR) + tables.
+
+Mermaid LS/LR nodes must show UUID, tunnel_key, MAC/IP/CIDR, key options — not name-only.
 
 ## Composites
 
