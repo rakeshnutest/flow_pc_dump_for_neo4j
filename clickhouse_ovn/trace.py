@@ -25,6 +25,8 @@ from dataplane import (
     static_routes_for_lr,
     nb_lr_meta,
     nb_ls_meta,
+    explain_drop_policy,
+    portset_issues_md,
 )
 
 CH_HOST = "127.0.0.1"
@@ -206,6 +208,37 @@ def acls_for_ls(ls_uuid: str, in_lsp: str, out_lsp: str) -> List[dict]:
             "INNER JOIN ovn_acl AS a ON a.acl_uuid = pm.acl_uuid "
             f"WHERE pp.lsp_uuid IN ({plist}) ORDER BY a.priority DESC"
         )
+    seen = set()
+    out = []
+    for r in rows:
+        if r["acl_uuid"] in seen:
+            continue
+        seen.add(r["acl_uuid"])
+        out.append(r)
+    return out
+
+
+def acls_on_ls(ls_uuid: str) -> List[dict]:
+    """Every distinct ACL on this LS: LS-attached plus every PG with a member here.
+
+    Path traces still use acls_for_ls (VIF-scoped). Human ACL view uses this
+    so allow/drop rows from other port-groups on the same switch are not omitted.
+    """
+    rows = ch(
+        "SELECT a.acl_uuid AS acl_uuid, a.name AS name, a.direction AS direction, "
+        "a.action AS action, a.match AS match, a.priority AS priority, 'ls' AS src "
+        "FROM ovn_acl_on_ls AS m INNER JOIN ovn_acl AS a ON a.acl_uuid = m.acl_uuid "
+        f"WHERE m.ls_uuid = '{ls_uuid}' ORDER BY a.priority DESC"
+    )
+    rows += ch(
+        "SELECT a.acl_uuid AS acl_uuid, a.name AS name, a.direction AS direction, "
+        "a.action AS action, a.match AS match, a.priority AS priority, 'pg' AS src "
+        "FROM ovn_lsp AS l "
+        "INNER JOIN ovn_pg_port AS pp ON pp.lsp_uuid = l.lsp_uuid "
+        "INNER JOIN ovn_acl_on_pg AS pm ON pm.pg_uuid = pp.pg_uuid "
+        "INNER JOIN ovn_acl AS a ON a.acl_uuid = pm.acl_uuid "
+        f"WHERE l.ls_uuid = '{ls_uuid}' ORDER BY a.priority DESC"
+    )
     seen = set()
     out = []
     for r in rows:
@@ -550,9 +583,10 @@ def show_acls(lines: List[str], acls: List[dict], reverse: bool) -> None:
             return
         lines.append(f"       ACLs {lbl}: {len(items)} (full list)")
         for a in items:
+            match = rewrite_match(a.get("match") or "")
             lines.append(
-                f"         pri={a['priority']} {a['action']} {a['direction']} "
-                f"[{a['src']}] {a.get('match') or ''}"
+                f"         pri={a.get('priority')} {a.get('action')} "
+                f"{a.get('direction')} [{a.get('src')}] {match}"
             )
 
     dump("from-lport (ingress on this hop)", from_l)
@@ -846,78 +880,69 @@ def _oc_bits(m: Dict[str, str], keys: Tuple[str, ...] = ()) -> List[str]:
     return bits
 
 
+def _fold(summary: str, body: List[str]) -> List[str]:
+    """Hide long tables; keep them in the file for the checker."""
+    if not body:
+        return []
+    return ["<details>", f"<summary>{summary}</summary>", "", *body, "", "</details>", ""]
+
+
 def ls_mermaid_label(tag: str, hop: dict) -> str:
+    """Short node: type, name, uuid, tunnel_key. Full fields go under mermaid."""
     m = hop.get("meta") or {}
+    uid = hop.get("uuid") or m.get("ls_uuid") or ""
     lines = [
         tag,
         str(hop.get("name") or m.get("name") or ""),
-        f"uuid {hop.get('uuid') or m.get('ls_uuid') or ''}",
+        f"uuid {uid}",
     ]
     tk = m.get("tunnel_key") or 0
     if tk:
-        lines.append(f"tunnel_key {tk}")
-    if m.get("datapath_uuid"):
-        lines.append(f"datapath {m.get('datapath_uuid')}")
-    lines.extend(_oc_bits(m.get("other_config") or {}))
-    lines.extend(_oc_bits(m.get("external_ids") or {}))
-    for p in (m.get("ports") or [])[:8]:
-        bit = f"LSP {p.get('type') or 'vif'} {p.get('name') or ''}"
-        if p.get("mac") or p.get("ip"):
-            bit += f" MAC {p.get('mac') or ''} IP {p.get('ip') or ''}"
-        if p.get("hostname") or p.get("chassis_uuid"):
-            bit += f" chassis {p.get('hostname') or p.get('chassis_uuid')}"
-        lines.append(bit)
+        lines.append(f"key {tk}")
+    for p in m.get("ports") or []:
+        if p.get("ip") or (p.get("type") in ("vif", "localnet") and p.get("mac")):
+            bit = f"{p.get('type') or 'port'} {p.get('ip') or ''} {p.get('mac') or ''}".strip()
+            lines.append(bit)
+            break
     return "<br/>".join(_esc(x) for x in lines if x)
 
 
 def lr_mermaid_label(hop: dict, gw: bool = False) -> str:
+    """Short node: Router/External GW, name, uuid, path CIDR or GW MAC+IP."""
     m = hop.get("meta") or {}
     title = "External GW" if gw else "Router"
+    uid = hop.get("uuid") or m.get("lr_uuid") or ""
     lines = [
         title,
         str(hop.get("name") or m.get("name") or ""),
-        f"uuid {hop.get('uuid') or m.get('lr_uuid') or ''}",
+        f"uuid {uid}",
     ]
-    tk = m.get("tunnel_key") or 0
-    if tk:
-        lines.append(f"tunnel_key {tk}")
-    if m.get("datapath_uuid"):
-        lines.append(f"datapath {m.get('datapath_uuid')}")
-    lines.extend(_oc_bits(m.get("options") or {}))
-    lines.extend(_oc_bits(m.get("external_ids") or {}))
-    show = m.get("path_lrps") or []
-    alln = m.get("lrps") or []
-    for p in show[:8]:
-        bit = f"LRP {p.get('name') or ''} uuid {p.get('lrp_uuid') or ''}"
-        bit += f" MAC {p.get('mac') or ''} {p.get('cidr') or ''}"
-        if p.get("peer"):
-            bit += f" peer {p.get('peer')}"
-        if p.get("is_ext_gw"):
-            bit += " ext-GW"
-        lines.append(bit)
-    if len(alln) > len(show):
-        lines.append(f"LRPs {len(alln)} total (path {len(show)}; full Metadata)")
-    elif alln:
-        lines.append(f"LRPs {len(alln)}")
-    pbr_n = len(hop.get("pbrs") or [])
-    st_n = len(hop.get("static_routes") or [])
-    conn_n = len(hop.get("routes") or [])
-    nat_n = len(hop.get("nats") or [])
-    lines.append(f"routes connected {conn_n} static {st_n} PBR {pbr_n} NAT {nat_n}")
     if gw:
         mac = hop.get("ext_mac") or ""
         cidr = hop.get("ext_cidr") or ""
-        if mac or cidr:
-            lines.append(f"IP {cidr} MAC {mac}")
-        if hop.get("has_nat") or hop.get("nats"):
-            lines.append("NAT")
-    ha = []
-    for r in hop.get("rc") or []:
-        ha.append(
-            f"{r.get('hostname') or r.get('chassis_name')} pri={r.get('priority')}"
-        )
-    if ha:
-        lines.append("HA " + "; ".join(ha[:4]))
+        if mac:
+            lines.append(f"MAC {mac}")
+        if cidr:
+            lines.append(f"IP {cidr}")
+        ha = hop.get("rc") or []
+        if ha:
+            top = sorted(ha, key=lambda r: int(r.get("priority") or 0), reverse=True)[0]
+            lines.append(top.get("hostname") or top.get("chassis_name") or "")
+    else:
+        for p in (m.get("path_lrps") or hop.get("path_lrps") or [])[:2]:
+            cidr = p.get("cidr") or ""
+            mac = p.get("mac") or ""
+            if cidr or mac:
+                lines.append(f"{cidr} {mac}".strip())
+        pbr_n = len(hop.get("pbrs") or [])
+        nat_n = len(hop.get("nats") or [])
+        extra = []
+        if pbr_n:
+            extra.append(f"PBR {pbr_n}")
+        if nat_n:
+            extra.append(f"NAT {nat_n}")
+        if extra:
+            lines.append(" ".join(extra))
     return "<br/>".join(_esc(x) for x in lines if x)
 
 
@@ -975,16 +1000,10 @@ def mermaid_topology(
     ids: List[str] = []
     classes: Dict[str, str] = {}
     lines = [
-        "**How to read:** left to right is packet flow. Blue stadium = VM. Rectangle = NIC, "
-        "then TAP, then OVS port on brAtlas (ofport / datapath port / iface-id). "
-        "Green cylinder = Switch (LS), orange hexagon = Router (LR) / External GW. "
-        "Host subgraphs wrap compute VIF hops and every scale-out External GW Host "
-        "(active RC vs standby). External GW label is MAC + IP/CIDR. "
-        "Dashed yellow / pink / gray hang off a router = NAT / PBR / RC. "
-        "Teal dashed = port group (policy applied-to). Gold dashed = address set (policy dest/src IPs). "
-        "Purple dashed = Geneve when chassis differ. Red dashed = drop ACLs. "
-        "Identity is UUID; names are display. `@port_group_*` and `$address_set_*` "
-        "are rewritten to policy category / dest names in the ACL tables.",
+        "_Left → right is packet flow. Blue = VM. Boxes = NIC → TAP → OVS **brAtlas**. "
+        "Green cylinder = Switch. Orange hexagon = Router / External GW (MAC+IP). "
+        "Host boxes wrap a chassis. Full LS/LR fields are in the folded **Metadata** below, "
+        "not on the node._",
         "",
         "```mermaid",
         "flowchart LR",
@@ -1167,23 +1186,34 @@ def mermaid_topology(
             peer_nid = f"RT_GW{i}" if idx == 0 else f"RT_GW{tag}p{i}"
             lines.append(f"  {rid_active} -.-> {peer_nid}")
 
-    comp_id = "DOWN" if "own" in (title or "").lower() or title == "REVERSE" else "UP"
+    # "own" matches Downstream (d-own-stream) — use an explicit prefix.
+    tlow = (title or "").lower()
+    comp_id = "DOWN" if tlow.startswith("down") or title == "REVERSE" else "UP"
     comp_lab = "Downstream" if comp_id == "DOWN" else "Upstream"
     lines.append(f'  subgraph {comp_id}["{comp_lab} composite"]')
-    layer = {"id": ""}
+    layer: Dict[str, Any] = {"id": "", "kind": "", "n": 0}
 
-    def set_layer(lid: str, lab: str) -> None:
-        if layer["id"] == lid:
+    def set_layer(kind: str, lab: str) -> None:
+        """New subgraph id every time the layer kind changes.
+
+        Reusing `subgraph L2` / `subgraph GW` merges later hops into the first
+        box, so upstream and dest-GW look like one unreadable diagram.
+        """
+        if layer.get("kind") == kind:
             return
         if layer["id"]:
             lines.append("  end")
-        layer["id"] = lid
-        lines.append(f'  subgraph {lid}["{lab}"]')
+        layer["n"] += 1
+        uid = f"{kind}{layer['n']}"
+        layer["id"] = uid
+        layer["kind"] = kind
+        lines.append(f'  subgraph {uid}["{lab}"]')
 
     def close_layer() -> None:
         if layer["id"]:
             lines.append("  end")
             layer["id"] = ""
+            layer["kind"] = ""
 
     set_layer("L2", "L2 stretch")
     if wrap_src:
@@ -1320,102 +1350,106 @@ def mermaid_topology(
         )
     lines.append(f"_{title} `{kind}`. {host_note}_")
     lines.append("")
-    lines.extend(format_metadata_md(title, hops))
-    lines.append("")
-    lines.append(
+    extra: List[str] = []
+    extra.extend(format_metadata_md(title, hops))
+    extra.append("")
+    extra.append(
         f"#### {title} — full from-lport ACL list (leave source NIC) — {len(from_acls)} rules"
     )
-    lines.extend(acl_table(from_acls))
-    lines.append("")
-    lines.append(
+    extra.extend(acl_table(from_acls))
+    extra.append("")
+    extra.append(
         f"#### {title} — full to-lport ACL list (enter dest NIC) — {len(to_acls)} rules"
     )
-    lines.extend(acl_table(to_acls))
+    extra.extend(acl_table(to_acls))
     if len(acls_by_ls) > 1:
         for ls_name, fr, to in acls_by_ls:
             if not fr and not to:
                 continue
-            lines.append("")
-            lines.append(
+            extra.append("")
+            extra.append(
                 f"#### {title} — switch `{_esc(ls_name)}` from-lport (full) — {len(fr)} rules"
             )
-            lines.extend(acl_table(fr))
-            lines.append("")
-            lines.append(
+            extra.extend(acl_table(fr))
+            extra.append("")
+            extra.append(
                 f"#### {title} — switch `{_esc(ls_name)}` to-lport (full) — {len(to)} rules"
             )
-            lines.extend(acl_table(to))
+            extra.extend(acl_table(to))
     for hop in hops:
         if hop.get("kind") != "router":
             continue
         lr_name = hop.get("name") or hop.get("uuid") or ""
         ext = " ext-GW" if hop.get("is_ext_gw") else ""
-        lines.append("")
-        lines.append(f"#### {title} — router `{_esc(lr_name)}`{ext}")
-        lines.append("")
+        extra.append("")
+        extra.append(f"#### {title} — router `{_esc(lr_name)}`{ext}")
+        extra.append("")
         nat_rows = hop.get("nats") or []
-        lines.append(
+        extra.append(
             f"#### {title} — NAT on router `{_esc(lr_name)}` (full) — {len(nat_rows)} rows"
         )
-        lines.extend(nat_table(nat_rows))
+        extra.extend(nat_table(nat_rows))
         pbr_rows = hop.get("pbrs") or []
-        lines.append("")
-        lines.append(
+        extra.append("")
+        extra.append(
             f"#### {title} — PBR on router `{_esc(lr_name)}` (full) — {len(pbr_rows)} rows"
         )
-        lines.extend(pbr_table(pbr_rows))
+        extra.extend(pbr_table(pbr_rows))
         route_rows = hop.get("routes") or []
-        lines.append("")
-        lines.append(
+        extra.append("")
+        extra.append(
             f"#### {title} — connected routes on router `{_esc(lr_name)}` (full) — "
             f"{len(route_rows)} rows"
         )
-        lines.extend(route_table(route_rows))
+        extra.extend(route_table(route_rows))
         static_rows = hop.get("static_routes") or []
-        lines.append("")
-        lines.append(
+        extra.append("")
+        extra.append(
             f"#### {title} — static routes on router `{_esc(lr_name)}` (full) — "
             f"{len(static_rows)} rows"
         )
-        lines.extend(static_table(static_rows))
+        extra.extend(static_table(static_rows))
         gw_rows = hop.get("rc") or []
-        lines.append("")
-        lines.append(
+        extra.append("")
+        extra.append(
             f"#### {title} — GW chassis (RC) on router `{_esc(lr_name)}` (full) — "
             f"{len(gw_rows)} rows"
         )
-        lines.extend(rc_table(gw_rows, active=True))
+        extra.extend(rc_table(gw_rows, active=True))
         path_lrp_rows = hop.get("path_lrps") or []
-        lines.append("")
-        lines.append(
+        extra.append("")
+        extra.append(
             f"#### {title} — path LRPs on router `{_esc(lr_name)}` (full) — "
             f"{len(path_lrp_rows)} rows"
         )
-        lines.extend(lrp_table(path_lrp_rows))
+        extra.extend(lrp_table(path_lrp_rows))
         if hop.get("ext_mac") or hop.get("ext_cidr"):
-            lines.append("")
-            lines.append(
+            extra.append("")
+            extra.append(
                 f"#### {title} — External GW MAC/IP on `{_esc(lr_name)}`"
             )
-            lines.append("")
-            lines.append(
+            extra.append("")
+            extra.append(
                 f"- LRP `{hop.get('ext_lrp') or ''}` MAC `{hop.get('ext_mac') or ''}` "
                 f"IP `{hop.get('ext_cidr') or ''}`"
             )
         for peer in hop.get("scaleout_peers") or []:
             ph = peer.get("gw_host") or {}
-            lines.append("")
-            lines.append(
+            extra.append("")
+            extra.append(
                 f"#### {title} — scale-out peer `{_esc(peer.get('name'))}` "
                 f"(standby) host `{ph.get('hostname') or ''}` chassis "
                 f"`{ph.get('chassis_uuid') or ''}`"
             )
-            lines.append("")
-            lines.append(
+            extra.append("")
+            extra.append(
                 f"- External GW MAC `{peer.get('ext_mac') or ''}` "
                 f"IP `{peer.get('ext_cidr') or ''}`"
             )
-            lines.extend(rc_table(peer.get("rc") or [], active=False))
+            extra.extend(rc_table(peer.get("rc") or [], active=False))
+    lines.extend(
+        _fold(f"{title}: metadata, ACL, NAT, PBR, routes (click to expand)", extra)
+    )
     return "\n".join(lines)
 
 
@@ -1896,6 +1930,9 @@ def render_path(
     else:
         lines.append(f"src: {fmt_ep(src)}")
         lines.append(f"dst: {fmt_ep(dst)}")
+    lines.append(
+        "Hop metadata (stretch, full from-lport / to-lport ACL lists, PBR, RC, NAT):"
+    )
     nodes = list(reversed(path)) if reverse else path
     hop = 1
     start_vif = src if not reverse else dst
@@ -1918,11 +1955,11 @@ def render_path(
             st = stretch(uid)
             if st:
                 bits = [
-                    f"{r['hostname'] or r['chassis_uuid'][:8]}:{r['encap_type']}:{r['encap_ip']}"
-                    for r in st[:8]
+                    f"{r['hostname'] or str(r['chassis_uuid'])[:8]}:"
+                    f"{r['encap_type']}:{r['encap_ip']}"
+                    for r in st
                 ]
-                extra = f" (+{len(st) - 8})" if len(st) > 8 else ""
-                lines.append(f"       stretch {', '.join(bits)}{extra}")
+                lines.append(f"       stretch {len(st)} chassis: {', '.join(bits)}")
             a_in = in_lsp if uid == src_ls else ZERO
             a_out = out_lsp if uid == dst_ls else ZERO
             if meta and meta.get("kind") == "ls_lr" and meta.get("ls_uuid") == uid:
@@ -1949,30 +1986,35 @@ def render_path(
                 if via_ls and via_ls != ZERO:
                     lsn = g["ls"].get(via_ls, {}).get("name", via_ls)
                     lines.append(f"       via {via} LS {lsn} uuid={via_ls}")
-                    st = stretch(via_ls)
-                    if st:
-                        bits = [
-                            f"{r['hostname'] or r['chassis_uuid'][:8]}:{r['encap_type']}"
-                            for r in st[:6]
-                        ]
-                        lines.append(f"       transit stretch {', '.join(bits)}")
                     show_acls(lines, acls_for_ls(via_ls, ZERO, ZERO), reverse)
                 else:
                     lines.append(f"       via {via}")
-            for p in pbrs(uid):
+            pbr_rows = pbrs(uid)
+            for p in pbr_rows:
+                nh = p.get("nexthop") or ""
+                extra_nh = p.get("nexthops") or []
+                if extra_nh and not nh:
+                    nh = ",".join(str(x) for x in extra_nh)
                 lines.append(
-                    f"       PBR pri={p['priority']} {p['action']} "
-                    f"match={(p['match'] or '')[:120]} nexthop={p['nexthop']}"
+                    f"       PBR pri={p.get('priority')} {p.get('action')} "
+                    f"match={p.get('match') or ''} nexthop={nh}"
                 )
-            for r in rc_for_lr(g, uid):
+            rc_rows = rc_for_lr(g, uid)
+            for r in rc_rows:
                 lines.append(
-                    f"       RC chassis={r.get('chassis_name')} pri={r.get('priority')}"
+                    f"       RC hostname={r.get('hostname') or ''} "
+                    f"chassis={r.get('chassis_uuid') or r.get('chassis_name') or ''} "
+                    f"name={r.get('chassis_name') or r.get('name') or ''} "
+                    f"pri={r.get('priority')}"
                 )
-            for n in nats(uid):
-                lines.append(
-                    f"       NAT {n['type']} ext={n['external_ip']} "
-                    f"log={n['logical_ip']} port={n['logical_port']}"
-                )
+            nat_rows = nats(uid)
+            if nat_rows:
+                lines.append(f"       NAT {len(nat_rows)} rows (full hop dump)")
+                for n in nat_rows:
+                    lines.append(
+                        f"       NAT {n.get('type')} ext={n.get('external_ip')} "
+                        f"log={n.get('logical_ip')} port={n.get('logical_port')}"
+                    )
             hop += 1
     if end_vif.get("kind") == "vif":
         lines.append(f"  {hop}. VIF {fmt_ep(end_vif)}")
@@ -2559,8 +2601,68 @@ def render_story(
             f"VM `{vm_name}`. Would-be return is drawn even if upstream ACL dropped."
         )
 
+    dst_ip_show = dest_ip or dip
+    hit_pri = (up_hit or {}).get("priority")
+    hit_act = (up_hit or {}).get("action")
+    if up_drops:
+        rca = (
+            f"Ping `{vm_ip}` → `{dst_ip_show}` is dropped on the **source Switch** "
+            f"`{up_drop_ls}` (**from-lport** pri {hit_pri} {hit_act}). "
+            f"Tenant router `{tenant.get('name')}`, SNAT, and External GW never see the packet."
+        )
+    elif dn_drops:
+        rca = (
+            f"Outbound is allowed. Return `{dst_ip_show}` → `{vm_ip}` is dropped "
+            f"on `{dn_drop_ls}` **to-lport** ({_acl_one_liner(dn_hit)})."
+        )
+    else:
+        rca = (
+            f"`{vm_ip}` ↔ `{dst_ip_show}` is allowed by ACL. "
+            f"Routing uses tenant `{tenant.get('name')}` then {snat_txt}."
+        )
+
+    dest_cell = (
+        f"`{dcard.get('vm')}` `{dcard.get('ip')}` on `{dcard.get('hostname')}`"
+        if dst.get("kind") == "vif"
+        else f"`{dst_ip_show}` (External / internet)"
+    )
     lines = [
-        "## Traffic story / RCA",
+        "## Summary",
+        "",
+        f"**{verdict}**",
+        "",
+        rca,
+        "",
+        "| | |",
+        "|---|---|",
+        f"| Src | `{vm_name}` `{vm_ip}` on `{host}` |",
+        f"| Dest | {dest_cell} |",
+        f"| Drop / allow | **{verdict}** |",
+        f"| Upstream ACL | `{up_drop_ls or 'src LS'}` {_acl_one_liner(up_hit)} |",
+        f"| Downstream ACL | `{dn_drop_ls or 'src LS'}` {_acl_one_liner(dn_hit)} |",
+        f"| Src External GW | `{gw_hn}` MAC `{ext_mac}` IP `{ext_cidr}` |",
+        "",
+        "### Dropping policy",
+        "",
+        *explain_drop_policy(up_hit),
+        "",
+        "### Port-set issues (Atlas-only leftovers)",
+        "",
+        *portset_issues_md(
+            [
+                nic_uuid,
+                (dcard.get("nic") if dst.get("kind") == "vif" else "") or "",
+            ]
+        ),
+        "",
+        "Diagrams (separate charts): "
+        "[Upstream mermaid](#mermaid-upstream-composite) · "
+        "[Downstream mermaid](#mermaid-downstream-composite). "
+        "Hop metadata (ACL / PBR / NAT / stretch) is in "
+        "[Upstream composite](#upstream-composite) and "
+        "[Downstream composite](#downstream-composite).",
+        "",
+        "### Endpoints",
         "",
         f"- Src VM `{vm_name}` uuid `{vm_uuid}` NIC `{nic_uuid}` LSP `{lsp_uuid}` "
         f"MAC `{mac}` IP `{vm_ip}` VPC `{vpc_label(vm_name)}`",
@@ -2573,85 +2675,29 @@ def render_story(
         *scale_lines,
         *transit_lines,
         "",
-        "### Drop / allow",
-        "",
-        drop_line,
-        "",
-        f"_Verdict: **{verdict}**. UPSTREAM = src NIC → dest. DOWNSTREAM = dest → src NIC._",
-        "",
-        "### Routing view (L2 → L3 → GW → NAT → External)",
-        "",
-        "Forward (what routing would do if policy allowed):",
+        "### Routing (would-be path if policy allowed)",
         "",
         *route_fwd,
         "",
         ret_body,
         "",
-    ]
-
-    if up_drops:
-        rca = (
-            f"The packet left VM `{vm_name}` (`{vm_uuid}`) NIC `{nic_uuid}` IP `{vm_ip}` "
-            f"on `{host}` via TAP `{tap}` / OVS brAtlas ofport `{ofp}` onto Switch "
-            f"`{up_drop_ls}` (`{ls_uuid}`). **from-lport pri {(up_hit or {}).get('priority')} "
-            f"{(up_hit or {}).get('action')}** on {pg_disp[0] if pg_disp else 'LS ACL'} "
-            f"matched leftover IPv4 to `{dest_ip or dip}` — higher-pri 1060/1052 dest-isolation "
-            f"and 1050 allow-related dest-sets are east-west, not `{dest_ip or dip}`; pri "
-            f"1017/1015 and 500 `tcp || udp || icmp` never run. Tenant LR "
-            f"`{tenant.get('name')}` / {snat_txt} never saw the packet. **Dropped upstream.**"
-        )
-    elif dn_drops:
-        rca = (
-            f"Outbound left VM `{vm_name}` NIC `{nic_uuid}` and would SNAT `{vm_ip}` → "
-            f"`{snat_ext or '(none)'}` toward `{dest_ip or dip}`, but the return packet is "
-            f"dropped on Switch `{dn_drop_ls}` **to-lport** ({_acl_one_liner(dn_hit)}). "
-            f"**Allowed out but dropped on return.**"
-        )
-    else:
-        rca = (
-            f"VM `{vm_name}` NIC `{nic_uuid}` `{vm_ip}` is allowed from-lport and to-lport "
-            f"toward `{dest_ip or dip}` ({_acl_one_liner(up_hit)}). Routing: tenant "
-            f"`{tenant.get('name')}` {pbr_txt}, then {snat_txt} on `{gw.get('name')}`."
-        )
-    if up_drops:
-        lines.append(
-            f"The packet **dies on hop 5** (first Switch `{up_drop_ls}`, from-lport); "
-            "hops 6+ (tenant LR / PBR / SNAT / External) are never reached."
-        )
-        lines.append("")
-    lines += [
-        "### Policy view (ACL)",
+        "### Policy",
         "",
-        f"- Applied-to (name display, UUID identity): "
-        + ("; ".join(pg_disp) if pg_disp else "(none — LS ACLs only)"),
-        f"- ICMP ping `{vm_ip}` → `{dest_ip or dip}` (proto 1): first hit "
-        f"**from-lport** on `{up_drop_ls or 'src LS'}`: {_acl_one_liner(up_hit)}",
-        f"- TCP :443 / UDP :53 to `{dest_ip or dip}`: "
+        f"- Applied-to: " + ("; ".join(pg_disp) if pg_disp else "LS ACLs only"),
+        f"- ICMP `{vm_ip}` → `{dst_ip_show}`: {_acl_one_liner(up_hit)}",
+        f"- TCP :443 / UDP :53: "
         + (
-            "same first hit as ICMP (1050 allow-related is dest-set + tcp/udp port ranges, "
-            f"not `{dest_ip or dip}`)."
+            "same first hit as ICMP (1050 allow-related is dest-set + port ranges, "
+            f"not `{dst_ip_show}`)."
             if icmp_same
             else f"TCP {_acl_one_liner(tcp_hit)}; UDP {_acl_one_liner(udp_hit)}"
         ),
-        f"- Downstream first hit (**to-lport**, `{dest_ip or dip}` → NIC) on "
-        f"`{dn_drop_ls or 'src LS'}`: {_acl_one_liner(dn_hit)}",
-        "- Walk: pri 31500 DHCP miss; 1060/1052 dest/src isolation miss for this dest; "
-        "1050 allow-related miss (wrong dest-set / ports); **1045 IPv4 catch-all drop** "
-        "wins on the secured group; 1017/1015 on the second group and 500 "
-        "`tcp || udp || icmp` never run. Full tables under each mermaid "
-        "(src LS, dest LS, every transit / localnet LS on the walk).",
+        f"- Return `{dst_ip_show}` → NIC: {_acl_one_liner(dn_hit)}",
         "",
-        "### What exactly happened",
-        "",
-        rca,
-        "",
-        f"_Drop direction: **{verdict}**. "
-        "Mermaid: [Mermaid Upstream composite](#mermaid-upstream-composite) "
-        "and [Mermaid Downstream composite](#mermaid-downstream-composite)._",
+        "_Full ACL / NAT / route tables are folded under each mermaid._",
         "",
     ]
     return "\n".join(lines) + "\n"
-
 
 def trace_pair(g: Dict[str, Any], src_tok: str, dst_tok: str) -> str:
     src = resolve(g, src_tok)
@@ -2806,8 +2852,8 @@ def find_scenarios(g: Dict[str, Any]) -> Dict[str, Tuple[str, str, str]]:
                 _tok(n),
                 dest_lr,
                 f"no two-VIF overlay across two tenant routers; closest VM {n.get('vm_name')} "
-                f"LS {g['ls'].get(n['ls_uuid'], {}).get('name')} via "
-                + " -> ".join(names),
+                    f"LS {g['ls'].get(n['ls_uuid'], {}).get('name')} via "
+                    + " -> ".join(names),
             )
             break
     for n in vif_nics:

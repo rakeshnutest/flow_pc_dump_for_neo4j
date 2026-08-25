@@ -34,9 +34,9 @@ python3 /home/rakeshkumar.r/panacea/clickhouse_ovn/trace.py \
 
 Two user VPCs via transit: src tenant LR → `gw-scale-out-network` → scale-out GW (all hosts, External GW MAC+IP) → External localnet → dest GW → dest tenant. Write `clickhouse_ovn/out/vpc_transit_vpc.md`.
 
-Every `.md` **starts** with **Traffic story / RCA**: Drop / allow, Routing view, Policy view, What exactly happened. Then mermaid + **Metadata** (each LS/LR: UUID, tunnel_key, options/other_config, every path LSP, every LRP MAC+CIDR) + tables.
+Every `.md` **starts** with **## Summary** (verdict, one-paragraph RCA, endpoint table). Then Endpoints, a folded hop list, Policy. Then **two separate mermaids**: Upstream composite, then Downstream composite — never one combined chart.
 
-Mermaid LS/LR nodes must show UUID, tunnel_key, MAC/IP/CIDR, key options — not name-only.
+Mermaid LS/LR nodes stay short: name, uuid, tunnel key, path MAC/IP. Full LS/LR JSON, ACL, NAT, PBR, routes live in a **folded `<details>`** under each mermaid. Subgraph ids are unique (`L21`, `GW3`, …) so hops do not merge into one box.
 
 ## Composites
 
