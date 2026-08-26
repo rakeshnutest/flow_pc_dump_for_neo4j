@@ -1,4 +1,5 @@
 -- Flat table lookups. Native 127.0.0.1:19000 / HTTP 8123.
+-- Always filter log_bundle_id (one dump / Panacea bundle).
 
 SELECT 1;
 
@@ -9,13 +10,14 @@ SELECT
     computed_nics,
     atlas_nics
 FROM flow_policy.portset
-WHERE port_set_uuid = {port_set_uuid:UUID}
+WHERE log_bundle_id = {log_bundle_id:UInt64}
+  AND port_set_uuid = {port_set_uuid:UUID}
 LIMIT 1;
 
 SELECT
     port_set_uuid,
     applied_to_port_set_uuid,
-    policy_name,
+    atlas_name,
     role,
     vm_category_refs,
     subnet_category_refs,
@@ -33,14 +35,15 @@ SELECT
     applied_to_subnet_list,
     applied_to_exception_list
 FROM flow_policy.portset
-WHERE role IN ('src', 'dest', 'secured')
+WHERE log_bundle_id = {log_bundle_id:UInt64}
+  AND role IN ('src', 'dest', 'secured')
   AND applied_to_port_set_uuid != toUUID('00000000-0000-0000-0000-000000000000')
 LIMIT 20;
 
 SELECT
     port_set_uuid,
     applied_to_port_set_uuid,
-    policy_name,
+    atlas_name,
     role,
     entity_group_uuid,
     vm_category_refs,
@@ -51,17 +54,35 @@ SELECT
     subnet_list,
     exception_list
 FROM flow_policy.portset
-WHERE role = 'applied_to'
+WHERE log_bundle_id = {log_bundle_id:UInt64}
+  AND role = 'applied_to'
 LIMIT 20;
 
 SELECT
     port_set_uuid,
-    rule_uuid,
-    rule_uuids,
     rule_u_sg
 FROM flow_policy.portset
-WHERE length(rule_uuids) > 1
+WHERE log_bundle_id = {log_bundle_id:UInt64}
+  AND length(rule_u_sg) > 1
 LIMIT 20;
+
+SELECT
+    p.port_set_uuid,
+    tupleElement(m, 'rule_uuid') AS rule_uuid,
+    tupleElement(m, 'sg_id') AS sg_id,
+    tupleElement(m, 'sg_ports') AS sg_ports,
+    tupleElement(m, 'policy_name') AS policy_name,
+    tupleElement(m, 'policy_uuid') AS policy_uuid,
+    tupleElement(m, 'policy_type') AS policy_type,
+    tupleElement(m, 'policy_mode') AS policy_mode,
+    tupleElement(m, 'flex_policy') AS flex_policy,
+    tupleElement(m, 'rule_priority') AS rule_priority,
+    tupleElement(m, 'type') AS type
+FROM flow_policy.portset AS p
+ARRAY JOIN p.rule_u_sg AS m
+WHERE p.log_bundle_id = {log_bundle_id:UInt64}
+  AND p.port_set_uuid = {port_set_uuid:UUID}
+LIMIT 50;
 
 SELECT
     u_sg_id,
@@ -78,26 +99,8 @@ SELECT
     network_function_uuid,
     network_function_name
 FROM flow_policy.u_sg
+WHERE log_bundle_id = {log_bundle_id:UInt64}
 LIMIT 20;
-
-SELECT
-    p.port_set_uuid,
-    tupleElement(m, 1) AS rule_uuid,
-    tupleElement(m, 2) AS u_sg_id,
-    tupleElement(m, 3) AS rule_priority,
-    u.sg_id,
-    u.kind,
-    u.sg_uuids,
-    u.sg_names,
-    u.tcp_ports,
-    u.udp_ports,
-    u.network_function_uuid,
-    u.network_function_name
-FROM flow_policy.portset AS p
-ARRAY JOIN p.rule_u_sg AS m
-INNER JOIN flow_policy.u_sg AS u ON u.u_sg_id = tupleElement(m, 2)
-WHERE p.port_set_uuid = {port_set_uuid:UUID}
-LIMIT 50;
 
 SELECT
     n.vm_name,
@@ -110,4 +113,5 @@ SELECT
     n.cluster_uuid,
     n.cluster
 FROM flow_policy.vm_nic AS n
-WHERE n.nic_uuid = {nic_uuid:UUID};
+WHERE n.log_bundle_id = {log_bundle_id:UInt64}
+  AND n.nic_uuid = {nic_uuid:UUID};

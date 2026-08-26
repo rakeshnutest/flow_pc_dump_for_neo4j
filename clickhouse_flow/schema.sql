@@ -5,41 +5,54 @@
 -- applied_to_* from the applied_to EG: two port-set UUIDs
 -- (port_set_uuid + applied_to_port_set_uuid). role = 'applied_to' is the
 -- second UUID as its own Atlas-matching row.
--- One port-set UUID can sit on many rules, each with a different service.
--- portset.rule_uuids lists those rules. portset.rule_u_sg is
--- Array(Tuple(rule_uuid, u_sg_id, rule_priority)). FLEX dump spec.priority
--- (rule_priority) is per-rule, so it lives on that tuple, not on u_sg.
--- flow_policy.u_sg is the unique service: dump sg_id, a list of dump
--- sg_ids, or inline ports. sg_id is the dump UUID when there is one SG;
--- lists and inline keep sg_id zero.
+-- One port-set UUID can sit on many policies/rules. There is no row-level
+-- policy_uuid, policy_name, rule_uuid, or component_id. Every policy+rule
+-- that uses this hash lives in rule_u_sg as
+-- (rule_uuid, sg_id[], sg_ports, policy_name, policy_uuid, policy_type,
+-- policy_mode, flex_policy, rule_priority, type).
+-- policy_type is app / isolation / quarantine. policy_mode is
+-- enforce / monitor / save (dump state APPLY → enforce).
+-- type is secured_entity, end_point_src, or end_point_dst.
+-- FLEX spec.priority is rule_priority; rule.type FLEX sets flex_policy.
+-- flow_policy.u_sg is the unique service lookup (dump SG UUID, list, or
+-- inline ports). Lists and inline keep u_sg.sg_id zero.
 -- should_allow_any_src/dst matches every NIC in the policy project, or
 -- every VM NIC if the policy has no project.
 -- Secured-group NICs exclude VLAN Basic (advance_vlan /
 -- is_advanced_networking false). Advanced VLAN and overlay stay.
 -- Zero UUID means not present.
 -- Native 127.0.0.1:19000 / HTTP 8123.
+-- Panacea-style: every fact row has log_bundle_id; PARTITION BY log_bundle_id
+-- so re-ingest of the same bundle is ALTER TABLE … DROP PARTITION (instant),
+-- not ALTER DELETE. Other bundles stay. ReplacingMergeTree(updated_at).
+-- No Nullable. ORDER BY: log_bundle_id first (filter), then low-cardinality,
+-- then UUID. Ingest uses CREATE IF NOT EXISTS. --reset-schema drops tables once.
 
 CREATE DATABASE IF NOT EXISTS flow_policy;
 
-DROP VIEW IF EXISTS flow_policy.v_port_set_nic_diff;
-DROP TABLE IF EXISTS flow_policy.atlas_port_set;
-DROP TABLE IF EXISTS flow_policy.computed_port_set;
-DROP TABLE IF EXISTS flow_policy.portset;
-DROP TABLE IF EXISTS flow_policy.u_sg;
-DROP TABLE IF EXISTS flow_policy.sg;
-DROP TABLE IF EXISTS flow_policy.vm_nic;
-DROP TABLE IF EXISTS flow_policy.category;
-
-CREATE TABLE flow_policy.portset
+CREATE TABLE IF NOT EXISTS flow_policy.bundle
 (
+    log_bundle_id   UInt64,
+    dump_dir        String DEFAULT '',
+    cluster_uuid    UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+    cluster_name    LowCardinality(String) DEFAULT '',
+    pc_ip           String DEFAULT '',
+    nos_version     String DEFAULT '',
+    collected_at    DateTime64(3) DEFAULT now64(),
+    updated_at      DateTime64(3) DEFAULT now64()
+)
+ENGINE = ReplacingMergeTree(updated_at)
+PARTITION BY log_bundle_id
+ORDER BY log_bundle_id;
+
+CREATE TABLE IF NOT EXISTS flow_policy.portset
+(
+    log_bundle_id              UInt64,
     port_set_uuid              UUID,
     computed_port_set_uuid     UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
     atlas_port_set_uuid        UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
     applied_to_port_set_uuid   UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
-    policy_uuid                UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
-    rule_uuid                  UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
     role                       LowCardinality(String) DEFAULT '',
-    component_id               String DEFAULT '',
     entity_type                LowCardinality(String) DEFAULT '',
     namespace_uuid             UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
     virtual_network_uuid       UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
@@ -68,15 +81,25 @@ CREATE TABLE flow_policy.portset
     effective_vpc_names        Array(String) DEFAULT [],
     eg_address_grp             Array(String) DEFAULT [],
     eg_exception_address_grp   Array(String) DEFAULT [],
-    rule_uuids                 Array(UUID) DEFAULT [],
     rule_u_sg Array(Tuple(
         rule_uuid UUID,
-        u_sg_id UUID,
-        rule_priority Int32
+        sg_id Array(UUID),
+        sg_ports Tuple(
+            tcp Array(String),
+            udp Array(String),
+            icmp Array(String),
+            icmpv6 Array(String)
+        ),
+        policy_name String,
+        policy_uuid UUID,
+        policy_type LowCardinality(String),
+        policy_mode LowCardinality(String),
+        flex_policy UInt8,
+        rule_priority Int32,
+        type LowCardinality(String)
     )) DEFAULT [],
     computed_nic_uuids         Array(UUID) DEFAULT [],
     atlas_nic_uuids            Array(UUID) DEFAULT [],
-    policy_name                String DEFAULT '',
     atlas_name                 String DEFAULT '',
     vpc_name                   LowCardinality(String) DEFAULT '',
     entity_group_name          String DEFAULT '',
@@ -134,10 +157,12 @@ CREATE TABLE flow_policy.portset
     updated_at                 DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY (entity_type, port_set_uuid, policy_uuid, component_id);
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, entity_type, port_set_uuid);
 
-CREATE TABLE flow_policy.u_sg
+CREATE TABLE IF NOT EXISTS flow_policy.u_sg
 (
+    log_bundle_id              UInt64,
     u_sg_id                    UUID,
     sg_id                      UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
     kind                       LowCardinality(String) DEFAULT '',
@@ -165,10 +190,12 @@ CREATE TABLE flow_policy.u_sg
     updated_at                 DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY u_sg_id;
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, u_sg_id);
 
-CREATE TABLE flow_policy.vm_nic
+CREATE TABLE IF NOT EXISTS flow_policy.vm_nic
 (
+    log_bundle_id          UInt64,
     nic_uuid               UUID,
     vm_uuid                UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
     vm_name                String DEFAULT '',
@@ -184,13 +211,16 @@ CREATE TABLE flow_policy.vm_nic
     updated_at             DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY nic_uuid;
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, nic_uuid);
 
-CREATE TABLE flow_policy.category
+CREATE TABLE IF NOT EXISTS flow_policy.category
 (
+    log_bundle_id          UInt64,
     category_uuid          UUID,
     name                   String DEFAULT '',
     updated_at             DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY category_uuid;
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, category_uuid);

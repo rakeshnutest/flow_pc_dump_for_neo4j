@@ -20,7 +20,7 @@ in-port = from-lport (ingress). out-port = to-lport (egress). Use both terms.
 
 ```bash
 python3 /home/rakeshkumar.r/panacea/.cursor/skills/ovn-acl-readable/scripts/show_acls.py \
-  --src <nic-or-lsp> --dst <nic-or-lsp-or-ip>
+  --log_bundle_id <id> --src <nic-or-lsp> --dst <nic-or-lsp-or-ip>
 ```
 
 Default pair if omitted: src NIC `3468ac71-d670-41a0-93af-0ec34d43f7c3`

@@ -192,18 +192,39 @@ SELECT
     p.atlas_nics
 FROM flow_policy.portset AS p
 FINAL
-WHERE (
+WHERE p.log_bundle_id = %(bid)d
+  AND (
     (p.atlas_port_set_uuid != toUUID('%(z)s') AND p.computed_port_set_uuid = toUUID('%(z)s'))
     OR
     (p.computed_port_set_uuid != toUUID('%(z)s') AND p.atlas_port_set_uuid = toUUID('%(z)s'))
 )
 FORMAT JSONEachRow
-""" % {"z": ZERO}
+"""
 
 
-def fetch_leftover_rows():
+def latest_log_bundle_id():
+    out = ch_query(
+        "SELECT log_bundle_id FROM flow_policy.bundle "
+        "ORDER BY updated_at DESC LIMIT 1")
+    text = (out or "").strip()
+    if not text:
+        raise SystemExit("no flow_policy.bundle rows; ingest with --log_bundle_id first")
+    return int(text.splitlines()[0])
+
+
+def env_or_latest_bundle(explicit=0):
+    if explicit and int(explicit) > 0:
+        return int(explicit)
+    env = os.environ.get("PANACEA_LOG_BUNDLE_ID") or os.environ.get("LOG_BUNDLE_ID")
+    if env:
+        return int(env)
+    return latest_log_bundle_id()
+
+
+def fetch_leftover_rows(bid):
     rows = []
-    for line in ch_query(LEFTOVER_SQL).splitlines():
+    sql = LEFTOVER_SQL % {"z": ZERO, "bid": int(bid)}
+    for line in ch_query(sql).splitlines():
         if not line.strip():
             continue
         rows.append(json.loads(line))
@@ -779,6 +800,11 @@ def main():
     parser.add_argument(
         "--out",
         default=os.path.join(HERE, "leftover_observations.md"))
+    parser.add_argument(
+        "--log_bundle_id",
+        type=int,
+        default=0,
+        help="Panacea log_bundle_id when --from_ch (default: latest bundle)")
     args = parser.parse_args()
     if args.dump_dir and os.path.isdir(args.dump_dir):
         dump = load_dump(args.dump_dir)
@@ -790,8 +816,9 @@ def main():
     if not args.from_ch:
         jsonl_path = jsonl_path or DEFAULT_PORTSET_JSONL
     if args.from_ch:
-        grouped = group_leftovers(fetch_leftover_rows())
-        source = "flow_policy ClickHouse"
+        bid = env_or_latest_bundle(args.log_bundle_id)
+        grouped = group_leftovers(fetch_leftover_rows(bid))
+        source = "flow_policy ClickHouse log_bundle_id=%s" % bid
     else:
         grouped = group_leftovers(fetch_leftover_rows_from_jsonl(jsonl_path))
         source = jsonl_path

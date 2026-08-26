@@ -35,6 +35,70 @@ CH_USER = "default"
 ZERO = "00000000-0000-0000-0000-000000000000"
 DB = "flow_ovn"
 Node = Tuple[str, str]  # ("ls"|"lr", uuid)
+LOG_BUNDLE_ID = 0
+OVN_FACT_TABLES = (
+    "ovn_ls",
+    "ovn_lsp",
+    "ovn_lr",
+    "ovn_lrp",
+    "ovn_acl",
+    "ovn_acl_on_ls",
+    "ovn_pg",
+    "ovn_acl_on_pg",
+    "ovn_pg_port",
+    "ovn_pbr",
+    "ovn_nat",
+    "ovn_vm",
+    "ovn_vm_nic",
+    "ovn_chassis",
+    "ovn_encap",
+    "ovn_datapath",
+    "ovn_port_binding",
+    "ovn_mac_binding",
+    "ovn_ha_chassis",
+    "ovn_edge_ls_lr",
+    "ovn_edge_lr_lr",
+    "ovn_ls_stretch",
+)
+
+
+def set_log_bundle_id(bundle_id: int) -> None:
+    global LOG_BUNDLE_ID
+    LOG_BUNDLE_ID = int(bundle_id)
+
+
+def env_or_latest_bundle(explicit: int = 0) -> int:
+    if explicit and int(explicit) > 0:
+        return int(explicit)
+    env = os.environ.get("PANACEA_LOG_BUNDLE_ID") or os.environ.get("LOG_BUNDLE_ID")
+    if env:
+        return int(env)
+    return latest_log_bundle_id()
+
+
+def latest_log_bundle_id() -> int:
+    cmd = [
+        "clickhouse-client",
+        "--host", CH_HOST,
+        "--port", CH_PORT,
+        "--user", CH_USER,
+        "--database", DB,
+        "--query",
+        "SELECT log_bundle_id FROM bundle ORDER BY updated_at DESC LIMIT 1",
+    ]
+    proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or "clickhouse failed").strip())
+    text = (proc.stdout or "").strip()
+    if not text:
+        raise SystemExit("no flow_ovn.bundle rows; ingest with --log_bundle_id first")
+    return int(text.splitlines()[0])
+
+
+def _table_filters() -> str:
+    bid = int(LOG_BUNDLE_ID)
+    parts = [f"'{t}': 'log_bundle_id = {bid}'" for t in OVN_FACT_TABLES]
+    return "{" + ", ".join(parts) + "}"
 
 
 def ch(sql: str) -> List[Dict[str, Any]]:
@@ -47,6 +111,8 @@ def ch(sql: str) -> List[Dict[str, Any]]:
         "--format", "JSONEachRow",
         "--query", sql,
     ]
+    if LOG_BUNDLE_ID:
+        cmd.extend(["--additional_table_filters", _table_filters()])
     proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout or "clickhouse failed").strip())
@@ -2895,6 +2961,8 @@ def write_md(path: str, body: str, title: str = "") -> str:
     bits = []
     if title:
         bits.extend([f"# {title}", ""])
+    if LOG_BUNDLE_ID:
+        bits.extend([f"log_bundle_id `{LOG_BUNDLE_ID}`", ""])
     bits.append(body.rstrip() + "\n")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(bits))
@@ -2913,7 +2981,16 @@ def main() -> int:
     ap.add_argument("--out", help="markdown file (always .md). default: clickhouse_ovn/out/")
     ap.add_argument("--find-scenarios", action="store_true")
     ap.add_argument("--run-scenarios", action="store_true")
+    ap.add_argument(
+        "--log_bundle_id",
+        type=int,
+        default=0,
+        help="Panacea log_bundle_id (default: latest flow_ovn.bundle)",
+    )
     args = ap.parse_args()
+    bid = env_or_latest_bundle(args.log_bundle_id)
+    set_log_bundle_id(bid)
+    print(f"log_bundle_id={bid}", file=sys.stderr)
     print("loading graph from ClickHouse flow_ovn…", file=sys.stderr)
     g = load_graph()
     print(

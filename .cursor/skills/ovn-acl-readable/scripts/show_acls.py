@@ -33,12 +33,15 @@ from trace import (  # noqa: E402
     dest_nodes,
     first_acl_hit,
     ip_of_lsp,
+    env_or_latest_bundle,
     load_graph,
     pg_names_for_lsp,
     resolve,
+    set_log_bundle_id,
     split_acls,
     start_node,
 )
+import trace as ovn_trace  # noqa: E402
 
 DEFAULT_SRC = "3468ac71-d670-41a0-93af-0ec34d43f7c3"
 DEFAULT_DST = "22bce434-1ef5-4792-8e57-8fa2a5e3bd71"
@@ -329,6 +332,8 @@ def render(src_tok: str, dst_tok: str, full_ips: bool) -> str:
         "no omitted rows, no `N more`.",
         "Identity is UUID (footnotes). Names, IPs, and ports are display.",
         "",
+        f"log_bundle_id `{ovn_trace.LOG_BUNDLE_ID}`",
+        "",
         "## Endpoints",
         "",
         "**Src**",
@@ -482,7 +487,15 @@ def main() -> None:
         action="store_true",
         help="expand address-set remainder inside <details>",
     )
+    ap.add_argument(
+        "--log_bundle_id",
+        type=int,
+        default=0,
+        help="Panacea log_bundle_id (default: latest flow_ovn.bundle)",
+    )
     args = ap.parse_args()
+    bid = env_or_latest_bundle(args.log_bundle_id)
+    set_log_bundle_id(bid)
     md = render(args.src, args.dst, args.full_ips)
     sys.stdout.write(md)
     if args.out:

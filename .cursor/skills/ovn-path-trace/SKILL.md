@@ -9,7 +9,7 @@ description: >-
 
 # OVN path trace (composite)
 
-Identity is UUID. Names are display. DB `flow_ovn` `127.0.0.1:19000`. No `flow_policy`.
+Identity is UUID. Names are display. DB `flow_ovn` `127.0.0.1:19000`. No `flow_policy`. Filter with `--log_bundle_id` (default: latest `flow_ovn.bundle`).
 
 Always write a **`.md` file**. Never chat-only.
 
@@ -26,7 +26,7 @@ Upstream/downstream each pull ACL, L2, L3, GW, External.
 
 ```bash
 python3 /home/rakeshkumar.r/panacea/clickhouse_ovn/trace.py \
-  --src '<vm-or-uuid>' --dst '<vm-or-uuid>'
+  --log_bundle_id 1 --src '<vm-or-uuid>' --dst '<vm-or-uuid>'
 # clickhouse_ovn/out/<src>__<dst>.md
 ```
 

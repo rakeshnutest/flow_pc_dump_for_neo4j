@@ -6,6 +6,7 @@ stdlib + clickhouse-client only. Does not touch flow_policy.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -29,6 +30,37 @@ IPV4_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})(?:/\d{1,2})?\b")
 IPV6_RE = re.compile(r"\b([0-9a-fA-F:]{2,}:[0-9a-fA-F:.]{2,})(?:/\d{1,3})?\b")
 TABLE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*) table\s*$")
 SCHEMA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
+OVN_TABLES = (
+    "bundle",
+    "ovn_ls",
+    "ovn_lsp",
+    "ovn_lr",
+    "ovn_lrp",
+    "ovn_acl",
+    "ovn_acl_on_ls",
+    "ovn_pg",
+    "ovn_acl_on_pg",
+    "ovn_pg_port",
+    "ovn_pbr",
+    "ovn_nat",
+    "ovn_vm",
+    "ovn_vm_nic",
+    "ovn_chassis",
+    "ovn_encap",
+    "ovn_datapath",
+    "ovn_port_binding",
+    "ovn_mac_binding",
+    "ovn_ha_chassis",
+    "ovn_edge_ls_lr",
+    "ovn_edge_lr_lr",
+    "ovn_ls_stretch",
+)
+RESET_SCHEMA_SQL = (
+    "CREATE DATABASE IF NOT EXISTS flow_ovn;\n"
+    + "\n".join(f"DROP TABLE IF EXISTS flow_ovn.{t};" for t in reversed(OVN_TABLES))
+    + "\n"
+)
+LOG_BUNDLE_ID = 0
 
 NB_TABLES = {
     "ACL",
@@ -392,13 +424,75 @@ def apply_schema() -> None:
     ch_run(["--multiquery", "--query", sql])
 
 
+def resolve_log_bundle_id(explicit: int, dump_dir: str = "") -> int:
+    """Panacea log_bundle_id. Flag, env, meta.json, else stable hash of dump_dir."""
+    if explicit and int(explicit) > 0:
+        return int(explicit)
+    env = os.environ.get("PANACEA_LOG_BUNDLE_ID") or os.environ.get("LOG_BUNDLE_ID")
+    if env:
+        return int(env)
+    meta_path = os.path.join(dump_dir, "meta.json") if dump_dir else ""
+    if meta_path and os.path.isfile(meta_path):
+        with open(meta_path) as fh:
+            meta = json.load(fh) or {}
+        for key in ("log_bundle_id", "id", "bundle_id"):
+            val = meta.get(key)
+            if val not in (None, "", 0, "0"):
+                return int(val)
+    if dump_dir:
+        digest = hashlib.sha256(os.path.abspath(dump_dir).encode()).digest()
+        return int.from_bytes(digest[:8], "big")
+    raise SystemExit("need --log_bundle_id")
+
+
+def has_bundle_column(table: str) -> bool:
+    out = ch_run(
+        [
+            "--query",
+            "SELECT count() FROM system.columns "
+            "WHERE database = 'flow_ovn' AND table = '{t}' "
+            "AND name = 'log_bundle_id'".format(t=table),
+        ]
+    )
+    try:
+        return int((out or "0").strip().splitlines()[-1]) > 0
+    except ValueError:
+        return False
+
+
+def drop_bundle_partitions(bundle_id: int) -> None:
+    """DROP PARTITION is instant (insert-mutation-avoid-delete). Other bundles stay."""
+    bid = int(bundle_id)
+    for table in OVN_TABLES:
+        q = f"ALTER TABLE flow_ovn.{table} DROP PARTITION {bid}"
+        try:
+            ch_run(["--query", q])
+        except RuntimeError as exc:
+            text = str(exc)
+            if any(
+                s in text
+                for s in (
+                    "doesn't exist",
+                    "does not exist",
+                    "Unknown table",
+                    "No such partition",
+                )
+            ):
+                continue
+            raise
+        print(f"  dropped partition {bid} {table}")
+
+
 def insert_rows(table: str, rows: List[Dict[str, Any]]) -> None:
     if not rows:
         print(f"  {table}: 0 rows")
         return
+    bid = int(LOG_BUNDLE_ID)
     n = 0
     for i in range(0, len(rows), BATCH):
         chunk = rows[i : i + BATCH]
+        for row in chunk:
+            row["log_bundle_id"] = bid
         payload = "\n".join(json.dumps(r, separators=(",", ":")) for r in chunk)
         ch_run(
             ["--query", f"INSERT INTO flow_ovn.{table} FORMAT JSONEachRow"],
@@ -1014,17 +1108,51 @@ def find_dump(dump_dir: str) -> Tuple[str, str, str]:
 
 
 def main() -> int:
+    global LOG_BUNDLE_ID
     ap = argparse.ArgumentParser(description="Ingest OVN dumps into flow_ovn")
     ap.add_argument(
         "--dump_dir",
         default="/home/rakeshkumar.r/panacea/flow_pc_dumps/ovn_ovs_verify",
     )
+    ap.add_argument(
+        "--log_bundle_id",
+        type=int,
+        default=0,
+        help="Panacea log_bundle_id. Re-ingest DROPs this partition only.",
+    )
+    ap.add_argument("--cluster_uuid", default="", help="Cluster UUID (bundle catalog)")
+    ap.add_argument("--cluster_name", default="", help="Cluster display name")
+    ap.add_argument("--pc_ip", default="", help="Prism Central IP")
+    ap.add_argument("--nos_version", default="", help="AOS / NOS version")
+    ap.add_argument(
+        "--reset-schema",
+        action="store_true",
+        help="DROP all flow_ovn tables then recreate (all bundles). First migration.",
+    )
+    ap.add_argument(
+        "--drop-bundle",
+        type=int,
+        default=0,
+        help="Only DROP PARTITION for this log_bundle_id and exit.",
+    )
     ap.add_argument("--skip-ahv", action="store_true")
     ap.add_argument("--skip-sb", action="store_true")
     args = ap.parse_args()
+    if args.drop_bundle:
+        drop_bundle_partitions(args.drop_bundle)
+        print(f"dropped bundle {args.drop_bundle}")
+        return 0
+    LOG_BUNDLE_ID = resolve_log_bundle_id(args.log_bundle_id, args.dump_dir)
+    print(f"log_bundle_id={LOG_BUNDLE_ID}")
     nb_path, sb_path, ahv_dir = find_dump(args.dump_dir)
     print("applying schema...")
+    if args.reset_schema or not has_bundle_column("ovn_ls"):
+        if not args.reset_schema:
+            print("  existing tables lack log_bundle_id; recreating schema")
+        ch_run(["--multiquery", "--query", RESET_SCHEMA_SQL])
     apply_schema()
+    print(f"dropping old partition {LOG_BUNDLE_ID} (other bundles kept)...")
+    drop_bundle_partitions(LOG_BUNDLE_ID)
     print(f"parsing NB {nb_path}")
     nb = parse_dump(nb_path, NB_TABLES)
     for t, rows in sorted(nb.items()):
@@ -1076,6 +1204,20 @@ def main() -> int:
         print(f"  VMs {len(vm_rows)} nics {len(nic_rows)}")
 
     print("inserting...")
+    insert_rows(
+        "bundle",
+        [
+            {
+                "dump_dir": os.path.abspath(args.dump_dir),
+                "cluster_uuid": as_uuid(args.cluster_uuid) if args.cluster_uuid else ZERO,
+                "cluster_name": args.cluster_name or "",
+                "pc_ip": args.pc_ip or "",
+                "nos_version": args.nos_version or "",
+                "collected_at": now_iso(),
+                "updated_at": now_iso(),
+            }
+        ],
+    )
     insert_rows("ovn_ls", ls_rows)
     insert_rows("ovn_lsp", lsp_rows)
     insert_rows("ovn_lr", lr_rows)

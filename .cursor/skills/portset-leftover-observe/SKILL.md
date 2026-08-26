@@ -22,17 +22,17 @@ After `ingest.py` / `compare.py`, or when the user asks about leftovers.
 
 ## Steps
 
-1. Run from `/home/rakeshkumar.r/panacea/clickhouse_flow/` (files are synced
-   from `flow_pc_dump_github/clickhouse_flow/`):
+1. Run from `/home/rakeshkumar.r/panacea/clickhouse_flow/`:
 
 ```bash
 python3 /home/rakeshkumar.r/panacea/clickhouse_flow/observe_leftovers.py \
+  --from_ch --log_bundle_id 1 \
   --out /home/rakeshkumar.r/panacea/clickhouse_flow/leftover_observations.md
 ```
 
 `--dump_dir` is optional. If the PC dump JSON directory is present, pass it
-for reverse-hash notes. If it is missing, classify leftovers from ClickHouse
-only (Atlas leftover vs Atlas missing vs NIC UUID bugs).
+for reverse-hash notes. `--from_ch` reads `flow_policy` for that bundle.
+Default without `--from_ch` is portset jsonl.
 
 2. Read `leftover_observations.md`.
 3. Summarize **only**:

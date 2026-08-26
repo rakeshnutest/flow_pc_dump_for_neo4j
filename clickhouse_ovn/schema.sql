@@ -1,45 +1,44 @@
 -- flow_ovn: OVN NB/SB path graph. Do not touch flow_policy.
 -- Native 127.0.0.1:19000 / HTTP 8123. User default.
--- ReplacingMergeTree(updated_at); no Nullable; no PARTITION BY.
--- ORDER BY: low-cardinality first, then UUID (schema-pk-cardinality-order).
+-- Panacea-style: every fact row has log_bundle_id; PARTITION BY log_bundle_id
+-- so re-ingest of the same bundle is ALTER TABLE … DROP PARTITION (instant),
+-- not ALTER DELETE. Other bundles stay. ReplacingMergeTree(updated_at).
+-- No Nullable. ORDER BY: log_bundle_id first (filter), then low-cardinality,
+-- then UUID (schema-pk-cardinality-order, schema-pk-prioritize-filters).
+-- Ingest uses CREATE IF NOT EXISTS. --reset-schema drops tables once.
 
 CREATE DATABASE IF NOT EXISTS flow_ovn;
 
-DROP TABLE IF EXISTS flow_ovn.ovn_ls_stretch;
-DROP TABLE IF EXISTS flow_ovn.ovn_edge_lr_lr;
-DROP TABLE IF EXISTS flow_ovn.ovn_edge_ls_lr;
-DROP TABLE IF EXISTS flow_ovn.ovn_ha_chassis;
-DROP TABLE IF EXISTS flow_ovn.ovn_mac_binding;
-DROP TABLE IF EXISTS flow_ovn.ovn_port_binding;
-DROP TABLE IF EXISTS flow_ovn.ovn_datapath;
-DROP TABLE IF EXISTS flow_ovn.ovn_encap;
-DROP TABLE IF EXISTS flow_ovn.ovn_chassis;
-DROP TABLE IF EXISTS flow_ovn.ovn_vm_nic;
-DROP TABLE IF EXISTS flow_ovn.ovn_vm;
-DROP TABLE IF EXISTS flow_ovn.ovn_nat;
-DROP TABLE IF EXISTS flow_ovn.ovn_pbr;
-DROP TABLE IF EXISTS flow_ovn.ovn_pg_port;
-DROP TABLE IF EXISTS flow_ovn.ovn_acl_on_pg;
-DROP TABLE IF EXISTS flow_ovn.ovn_acl_on_ls;
-DROP TABLE IF EXISTS flow_ovn.ovn_pg;
-DROP TABLE IF EXISTS flow_ovn.ovn_acl;
-DROP TABLE IF EXISTS flow_ovn.ovn_lrp;
-DROP TABLE IF EXISTS flow_ovn.ovn_lr;
-DROP TABLE IF EXISTS flow_ovn.ovn_lsp;
-DROP TABLE IF EXISTS flow_ovn.ovn_ls;
-
-CREATE TABLE flow_ovn.ovn_ls
+CREATE TABLE IF NOT EXISTS flow_ovn.bundle
 (
+    log_bundle_id   UInt64,
+    dump_dir        String DEFAULT '',
+    cluster_uuid    UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+    cluster_name    LowCardinality(String) DEFAULT '',
+    pc_ip           String DEFAULT '',
+    nos_version     String DEFAULT '',
+    collected_at    DateTime64(3) DEFAULT now64(),
+    updated_at      DateTime64(3) DEFAULT now64()
+)
+ENGINE = ReplacingMergeTree(updated_at)
+PARTITION BY log_bundle_id
+ORDER BY log_bundle_id;
+
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_ls
+(
+    log_bundle_id UInt64,
     ls_uuid     UUID,
     name        String DEFAULT '',
     other_config Array(Tuple(String, String)) DEFAULT [],
     updated_at  DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY ls_uuid;
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, ls_uuid);
 
-CREATE TABLE flow_ovn.ovn_lsp
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_lsp
 (
+    log_bundle_id          UInt64,
     lsp_uuid               UUID,
     ls_uuid                UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
     name                   String DEFAULT '',
@@ -60,10 +59,12 @@ CREATE TABLE flow_ovn.ovn_lsp
     updated_at             DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY (type, ls_uuid, lsp_uuid);
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, type, ls_uuid, lsp_uuid);
 
-CREATE TABLE flow_ovn.ovn_lr
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_lr
 (
+    log_bundle_id UInt64,
     lr_uuid     UUID,
     name        String DEFAULT '',
     enabled     UInt8 DEFAULT 1,
@@ -71,10 +72,12 @@ CREATE TABLE flow_ovn.ovn_lr
     updated_at  DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY lr_uuid;
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, lr_uuid);
 
-CREATE TABLE flow_ovn.ovn_lrp
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_lrp
 (
+    log_bundle_id       UInt64,
     lrp_uuid            UUID,
     lr_uuid             UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
     name                String DEFAULT '',
@@ -86,10 +89,12 @@ CREATE TABLE flow_ovn.ovn_lrp
     updated_at          DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY (lr_uuid, lrp_uuid);
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, lr_uuid, lrp_uuid);
 
-CREATE TABLE flow_ovn.ovn_acl
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_acl
 (
+    log_bundle_id UInt64,
     acl_uuid    UUID,
     name        String DEFAULT '',
     direction   LowCardinality(String) DEFAULT '',
@@ -100,46 +105,56 @@ CREATE TABLE flow_ovn.ovn_acl
     updated_at  DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY (direction, action, acl_uuid);
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, direction, action, acl_uuid);
 
-CREATE TABLE flow_ovn.ovn_acl_on_ls
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_acl_on_ls
 (
+    log_bundle_id UInt64,
     ls_uuid     UUID,
     acl_uuid    UUID,
     updated_at  DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY (ls_uuid, acl_uuid);
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, ls_uuid, acl_uuid);
 
-CREATE TABLE flow_ovn.ovn_pg
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_pg
 (
+    log_bundle_id UInt64,
     pg_uuid     UUID,
     name        String DEFAULT '',
     updated_at  DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY pg_uuid;
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, pg_uuid);
 
-CREATE TABLE flow_ovn.ovn_acl_on_pg
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_acl_on_pg
 (
+    log_bundle_id UInt64,
     pg_uuid     UUID,
     acl_uuid    UUID,
     updated_at  DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY (pg_uuid, acl_uuid);
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, pg_uuid, acl_uuid);
 
-CREATE TABLE flow_ovn.ovn_pg_port
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_pg_port
 (
+    log_bundle_id UInt64,
     pg_uuid     UUID,
     lsp_uuid    UUID,
     updated_at  DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY (pg_uuid, lsp_uuid);
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, pg_uuid, lsp_uuid);
 
-CREATE TABLE flow_ovn.ovn_pbr
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_pbr
 (
+    log_bundle_id UInt64,
     pbr_uuid    UUID,
     lr_uuid     UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
     match       String DEFAULT '',
@@ -150,10 +165,12 @@ CREATE TABLE flow_ovn.ovn_pbr
     updated_at  DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY (lr_uuid, priority, pbr_uuid);
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, lr_uuid, priority, pbr_uuid);
 
-CREATE TABLE flow_ovn.ovn_nat
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_nat
 (
+    log_bundle_id   UInt64,
     nat_uuid        UUID,
     lr_uuid         UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
     type            LowCardinality(String) DEFAULT '',
@@ -164,20 +181,24 @@ CREATE TABLE flow_ovn.ovn_nat
     updated_at      DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY (lr_uuid, nat_uuid);
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, lr_uuid, nat_uuid);
 
-CREATE TABLE flow_ovn.ovn_vm
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_vm
 (
+    log_bundle_id UInt64,
     vm_uuid     UUID,
     name        String DEFAULT '',
     host_ip     String DEFAULT '',
     updated_at  DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY vm_uuid;
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, vm_uuid);
 
-CREATE TABLE flow_ovn.ovn_vm_nic
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_vm_nic
 (
+    log_bundle_id UInt64,
     nic_uuid    UUID,
     vm_uuid     UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
     vm_name     String DEFAULT '',
@@ -189,20 +210,24 @@ CREATE TABLE flow_ovn.ovn_vm_nic
     updated_at  DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY (vm_uuid, nic_uuid);
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, vm_uuid, nic_uuid);
 
-CREATE TABLE flow_ovn.ovn_chassis
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_chassis
 (
+    log_bundle_id UInt64,
     chassis_uuid UUID,
     name         String DEFAULT '',
     hostname     String DEFAULT '',
     updated_at   DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY chassis_uuid;
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, chassis_uuid);
 
-CREATE TABLE flow_ovn.ovn_encap
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_encap
 (
+    log_bundle_id   UInt64,
     encap_uuid      UUID,
     chassis_uuid    UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
     chassis_name    String DEFAULT '',
@@ -211,10 +236,12 @@ CREATE TABLE flow_ovn.ovn_encap
     updated_at      DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY (chassis_uuid, encap_uuid);
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, chassis_uuid, encap_uuid);
 
-CREATE TABLE flow_ovn.ovn_datapath
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_datapath
 (
+    log_bundle_id UInt64,
     datapath_uuid UUID,
     kind          LowCardinality(String) DEFAULT '',
     nb_uuid       UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
@@ -223,10 +250,12 @@ CREATE TABLE flow_ovn.ovn_datapath
     updated_at    DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY (kind, nb_uuid);
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, kind, nb_uuid);
 
-CREATE TABLE flow_ovn.ovn_port_binding
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_port_binding
 (
+    log_bundle_id   UInt64,
     pb_uuid         UUID,
     logical_port    String DEFAULT '',
     type            LowCardinality(String) DEFAULT '',
@@ -238,10 +267,12 @@ CREATE TABLE flow_ovn.ovn_port_binding
     updated_at      DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY (type, datapath_uuid, pb_uuid);
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, type, datapath_uuid, pb_uuid);
 
-CREATE TABLE flow_ovn.ovn_mac_binding
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_mac_binding
 (
+    log_bundle_id   UInt64,
     mb_uuid         UUID,
     datapath_uuid   UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
     ip              String DEFAULT '',
@@ -250,10 +281,12 @@ CREATE TABLE flow_ovn.ovn_mac_binding
     updated_at      DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY (datapath_uuid, ip);
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, datapath_uuid, ip);
 
-CREATE TABLE flow_ovn.ovn_ha_chassis
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_ha_chassis
 (
+    log_bundle_id   UInt64,
     group_uuid      UUID,
     group_name      String DEFAULT '',
     chassis_name    String DEFAULT '',
@@ -261,10 +294,12 @@ CREATE TABLE flow_ovn.ovn_ha_chassis
     updated_at      DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY (group_uuid, chassis_name);
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, group_uuid, chassis_name);
 
-CREATE TABLE flow_ovn.ovn_edge_ls_lr
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_edge_ls_lr
 (
+    log_bundle_id UInt64,
     ls_uuid     UUID,
     lr_uuid     UUID,
     lsp_uuid    UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
@@ -274,10 +309,12 @@ CREATE TABLE flow_ovn.ovn_edge_ls_lr
     updated_at  DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY (ls_uuid, lr_uuid, lsp_uuid);
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, ls_uuid, lr_uuid, lsp_uuid);
 
-CREATE TABLE flow_ovn.ovn_edge_lr_lr
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_edge_lr_lr
 (
+    log_bundle_id UInt64,
     via         LowCardinality(String) DEFAULT '',
     lr_a        UUID,
     lr_b        UUID,
@@ -287,10 +324,12 @@ CREATE TABLE flow_ovn.ovn_edge_lr_lr
     updated_at  DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY (via, lr_a, lr_b, via_ls_uuid);
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, via, lr_a, lr_b, via_ls_uuid);
 
-CREATE TABLE flow_ovn.ovn_ls_stretch
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_ls_stretch
 (
+    log_bundle_id   UInt64,
     ls_uuid         UUID,
     chassis_uuid    UUID,
     hostname        String DEFAULT '',
@@ -300,4 +339,5 @@ CREATE TABLE flow_ovn.ovn_ls_stretch
     updated_at      DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY (ls_uuid, chassis_uuid);
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, ls_uuid, chassis_uuid);
