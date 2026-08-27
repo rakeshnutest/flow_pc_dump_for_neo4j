@@ -23,29 +23,30 @@ That is the same interpreter the live `flow` / `microseg` services use:
 From your laptop / jump host:
 
 ```bash
-scp flow_pc_dump_for_neo4j.py nutanix@<PC_IP>:/tmp/flow_pc_dump_for_neo4j.py
+scp flow_pc_dump.py flow_pc_dump_for_neo4j.py \
+  nutanix@<PC_IP>:/home/nutanix/data/
 ssh nutanix@<PC_IP>
 ```
 
-Place it anywhere readable by `nutanix` (for example `/tmp`).
+Place both scripts in `/home/nutanix/data/` (do **not** use `/tmp`; it is a small loop on many PCs).
 
 ## Run
 
-Writes **one file per dataset** under `--output_dir` (default `/tmp/flow_pc_neo4j_prefetch/`), plus a combined `all.json` and `dump.log`. This is **not** `/tmp/flow_neo4j_dump.json`.
+Writes **one file per dataset** under `--output_dir` (default `/home/nutanix/upgrade/flow_pc_dump/`), plus a combined `all.json` and `dump.log`. Use the **Flow venv** so `FlowInterfaces` collects AG/SG/EG/policies.
 
 ```bash
-/home/nutanix/.venvs/flow/bin/python3 /tmp/flow_pc_dump_for_neo4j.py \
-  --output_dir /tmp/flow_pc_neo4j_prefetch \
+/home/nutanix/.venvs/flow/bin/python3 /home/nutanix/data/flow_pc_dump.py \
+  --output_dir /home/nutanix/upgrade/flow_pc_dump \
   --workers 16 \
   --atlas_get_workers 32 \
-  --dataset_timeout_secs 90 \
-  --atlas_timeout_secs 600
+  --dataset_timeout_secs 600 \
+  --atlas_timeout_secs 1800
 ```
 
 Output layout:
 
 ```text
-/tmp/flow_pc_neo4j_prefetch/
+/home/nutanix/upgrade/flow_pc_dump/
   all.json                 # combined prefetch payload
   dump.log                 # run log
   meta.json                # source, timestamps, unique uuids
@@ -81,9 +82,9 @@ Combined file override:
 Split an existing combined dump (no live fetch):
 
 ```bash
-/home/nutanix/.venvs/flow/bin/python3 /tmp/flow_pc_dump_for_neo4j.py \
-  --from_json /tmp/flow_neo4j_dump.json \
-  --output_dir /tmp/flow_pc_neo4j_prefetch
+/home/nutanix/.venvs/flow/bin/python3 /home/nutanix/data/flow_pc_dump.py \
+  --from_json /home/nutanix/upgrade/flow_pc_dump/all.json \
+  --output_dir /home/nutanix/upgrade/flow_pc_dump
 ```
 
 Flags are parsed **before** `FlowInterfaces()` is created. That is required on PC; accessing Flow clients before `FLAGS(argv)` triggers `UnparsedFlagAccessError` and Zeus/ZK retry loops.
@@ -92,15 +93,16 @@ Flags are parsed **before** `FlowInterfaces()` is created. That is required on P
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--output_dir` | `/tmp/flow_pc_neo4j_prefetch` | Directory for per-dataset JSON + `all.json` + `dump.log` |
+| `--output_dir` | `/home/nutanix/upgrade/flow_pc_dump` | Directory for per-dataset JSON + `all.json` + `dump.log` |
 | `--output` | `<output_dir>/all.json` | Combined JSON path |
 | `--log_file` | `<output_dir>/dump.log` | Log file |
 | `--from_json` | unset | Split an existing combined JSON; skip live fetch |
 | `--workers` | `16` | Parallel workers for dataset fetch + writes |
-| `--dataset_timeout_secs` | `90` | Per-batch timeout; hung datasets are skipped |
+| `--dataset_timeout_secs` | `600` | Timeout for the FlowInterfaces dataset batch and per-idfcli type |
+| `--skip_flow` | off | Skip FlowInterfaces (AG/SG/EG/policies). Default **collects** them |
 | `--fail_on_error` | off | Exit non-zero if any dataset fails |
 | `--skip_atlas` | off | Skip `atlas_cli port_set.list` / `port_set.get` |
-| `--atlas_timeout_secs` | `300` | Timeout for `port_set.list` and the `port_set.get` batch |
+| `--atlas_timeout_secs` | `1800` | Timeout for `port_set.list` and the `port_set.get` batch |
 | `--atlas_get_workers` | `32` | Parallel `atlas_cli port_set.get` processes |
 | `--skip_ahv_gateway` | off | Skip AHV Gateway host collect (default **on**: OVS/virsh/tap/brAtlas from every PE hypervisor) |
 | `--ahv_gateway_timeout_secs` | `1800` | Retry budget across all hosts until every required artifact exists |
@@ -146,7 +148,7 @@ It retries until both dumps exist. Layout: `<output_dir>/cmsp_ovn/anc-ovn/comman
 Help:
 
 ```bash
-/home/nutanix/.venvs/flow/bin/python3 /tmp/flow_pc_dump_for_neo4j.py --help
+/home/nutanix/.venvs/flow/bin/python3 /home/nutanix/data/flow_pc_dump.py --help
 ```
 
 ## What it dumps
