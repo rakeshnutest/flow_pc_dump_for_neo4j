@@ -28,10 +28,15 @@ from ingest import (  # noqa: E402
     compute_addressset_hashes,
     generate_port_set_id,
 )
+from leftover_ignore import leftover_ignore_reason  # noqa: E402
 
 CH_HOST = "127.0.0.1"
 CH_NATIVE = "19000"
 ZERO = "00000000-0000-0000-0000-000000000000"
+DEFAULT_PORTSET_JSONL = (
+    "/home/rakeshkumar.r/panacea/flow_pc_dumps/clickhouse_all_dump/"
+    "flow_policy/portset.jsonl"
+)
 UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -156,12 +161,10 @@ SELECT
     toString(p.atlas_port_set_uuid) AS atlas_port_set_uuid,
     p.match_status,
     p.mismatch_kind,
-    p.policy_name,
     p.atlas_name,
     p.entity_type,
     p.role,
-    toString(p.policy_uuid) AS policy_uuid,
-    toString(p.rule_uuid) AS rule_uuid,
+    p.rule_u_sg,
     toString(p.entity_group_uuid) AS entity_group_uuid,
     p.entity_group_name,
     toString(p.namespace_uuid) AS namespace_uuid,
@@ -189,21 +192,69 @@ SELECT
     p.atlas_nics
 FROM flow_policy.portset AS p
 FINAL
-WHERE (
+WHERE p.log_bundle_id = %(bid)d
+  AND (
     (p.atlas_port_set_uuid != toUUID('%(z)s') AND p.computed_port_set_uuid = toUUID('%(z)s'))
     OR
     (p.computed_port_set_uuid != toUUID('%(z)s') AND p.atlas_port_set_uuid = toUUID('%(z)s'))
 )
 FORMAT JSONEachRow
-""" % {"z": ZERO}
+"""
 
 
-def fetch_leftover_rows():
+def latest_log_bundle_id():
+    out = ch_query(
+        "SELECT log_bundle_id FROM flow_policy.bundle "
+        "ORDER BY updated_at DESC LIMIT 1")
+    text = (out or "").strip()
+    if not text:
+        raise SystemExit("no flow_policy.bundle rows; ingest with --log_bundle_id first")
+    return int(text.splitlines()[0])
+
+
+def env_or_latest_bundle(explicit=0):
+    if explicit and int(explicit) > 0:
+        return int(explicit)
+    env = os.environ.get("PANACEA_LOG_BUNDLE_ID") or os.environ.get("LOG_BUNDLE_ID")
+    if env:
+        return int(env)
+    return latest_log_bundle_id()
+
+
+def fetch_leftover_rows(bid):
     rows = []
-    for line in ch_query(LEFTOVER_SQL).splitlines():
+    sql = LEFTOVER_SQL % {"z": ZERO, "bid": int(bid)}
+    for line in ch_query(sql).splitlines():
         if not line.strip():
             continue
         rows.append(json.loads(line))
+    return rows
+
+
+def fetch_leftover_rows_from_jsonl(path):
+    """Leftovers from portset.jsonl. Does not query flow_policy ClickHouse."""
+    rows = []
+    with open(path) as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            kind = str(row.get("mismatch_kind") or "")
+            status = str(row.get("match_status") or "")
+            atlas = as_uuid(row.get("atlas_port_set_uuid"))
+            comp = as_uuid(row.get("computed_port_set_uuid"))
+            atlas_only = (
+                kind in ("atlas_without_computed", "atlas_only")
+                or status in ("atlas_without_computed", "atlas_only")
+                or (present(atlas) and not present(comp))
+            )
+            computed_only = (
+                kind in ("computed_without_atlas", "computed_only")
+                or status in ("computed_without_atlas", "computed_only")
+                or (present(comp) and not present(atlas))
+            )
+            if atlas_only or computed_only:
+                rows.append(row)
     return rows
 
 
@@ -229,8 +280,12 @@ def group_leftovers(rows):
             rec["atlas_uuids"].add(as_uuid(row["atlas_port_set_uuid"]))
         rec["computed_nics"].update(uuid_list(row.get("computed_nic_uuids")))
         rec["atlas_nics"].update(uuid_list(row.get("atlas_nic_uuids")))
-        if row.get("policy_name") and row["policy_name"] not in rec["policy_names"]:
-            rec["policy_names"].append(row["policy_name"])
+        for entry in (row.get("rule_u_sg") or []):
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("policy_name") or ""
+            if name and name not in rec["policy_names"]:
+                rec["policy_names"].append(name)
         if row.get("atlas_name") and row["atlas_name"] not in rec["atlas_names"]:
             rec["atlas_names"].append(row["atlas_name"])
         eg = as_uuid(row.get("entity_group_uuid"))
@@ -355,6 +410,25 @@ def build_hash_index(dump):
     return index
 
 
+def empty_dump():
+    return {
+        "unavailable": True,
+        "meta": {},
+        "policies": [],
+        "egs": [],
+        "eg_by_uuid": {},
+        "categories": {},
+        "vpcs": [],
+        "vpc_names": {},
+        "ags": [],
+        "kube_egs": set(),
+        "policy_names": set(),
+        "policies_by_name": {},
+        "referenced": set(),
+        "kube_policy_names": set(),
+    }
+
+
 def load_dump(dump_dir):
     policies = [unwrap(p) for p in load_json(os.path.join(dump_dir, "policies.json"), [])]
     egs = [unwrap(e) for e in load_json(os.path.join(dump_dir, "entity_groups.json"), [])]
@@ -410,7 +484,7 @@ def load_dump(dump_dir):
 
 
 def leftover_is_kube(rec, hits, dump):
-    """Kube is EG membership (KUBE_* types), never a display name."""
+    """EG membership (KUBE_* types). Reporting skip is leftover_ignore.py."""
     if rec.get("entity_group_uuid") in dump["kube_egs"]:
         return True
     for uid in rec.get("entity_group_uuids") or []:
@@ -436,6 +510,10 @@ def observe_one(leftover, hits, dump):
     elif kind == "computed_without_atlas":
         notes.append(
             "This UUID is in computed and not in Atlas (Atlas missing). Match is UUID identity, not name.")
+    if dump.get("unavailable"):
+        notes.append(
+            "PC dump JSON not available; leftover classified from portset.jsonl only.")
+        hit = {}
     if hit.get("kind") == "address_set":
         notes.append(
             "Reverse-hashes as address_set %s of entity UUID %s."
@@ -454,7 +532,7 @@ def observe_one(leftover, hits, dump):
         elif refs and any(ref in dump["referenced"] for ref in refs):
             notes.append(
                 "Dump policies do reference these selector UUIDs, but none of those policies emit this port-set UUID.")
-    else:
+    elif not dump.get("unavailable"):
         notes.append(
             "This port-set UUID does not reverse-hash to any dump category, entity-group, or address-group UUID.")
     only_c = leftover["computed_nics"] - leftover["atlas_nics"]
@@ -585,12 +663,25 @@ def component_lines(rec, dump):
     for row in rec["rows"]:
         ns = as_uuid(row.get("namespace_uuid"))
         vn = as_uuid(row.get("virtual_network_uuid"))
+        names = []
+        for entry in (row.get("rule_u_sg") or []):
+            if isinstance(entry, dict) and entry.get("policy_name"):
+                if entry["policy_name"] not in names:
+                    names.append(entry["policy_name"])
         lines.append(
             "  - policy=`%s` role=`%s` entity_type=`%s`"
-            % (row.get("policy_name") or "", row.get("role") or "",
+            % (", ".join(names[:4]) or row.get("atlas_name") or "",
+               row.get("role") or "",
                row.get("entity_type") or ""))
-        lines.append("    - policy_uuid: `%s`" % (as_uuid(row.get("policy_uuid")) or ZERO))
-        lines.append("    - rule_uuid: `%s`" % (as_uuid(row.get("rule_uuid")) or ZERO))
+        for entry in (row.get("rule_u_sg") or []):
+            if not isinstance(entry, dict):
+                continue
+            lines.append(
+                "    - rule_uuid: `%s` type=`%s` policy=`%s` mode=`%s`"
+                % (as_uuid(entry.get("rule_uuid")) or ZERO,
+                   entry.get("type") or "",
+                   entry.get("policy_type") or "",
+                   entry.get("policy_mode") or ""))
         lines.append(
             "    - namespace_uuid: `%s` (%s)"
             % (ns or ZERO, dump["vpc_names"].get(ns) or row.get("vpc_name") or ""))
@@ -628,32 +719,43 @@ def render_leftover(item, dump):
     return lines
 
 
-def render(path, leftovers, dump, dump_dir):
+def render(path, leftovers, dump, dump_dir, skipped=None, source=""):
     atlas_left = [x for x in leftovers if x["kind"] == "atlas_without_computed"]
     atlas_missing = [x for x in leftovers if x["kind"] == "computed_without_atlas"]
     nic_bugs = [
         x for x in leftovers
         if (x["computed_nics"] - x["atlas_nics"]) or (x["atlas_nics"] - x["computed_nics"])
     ]
+    skipped = skipped or {"k8s": 0, "empty_quarantine": 0}
     lines = [
         "# Port-set leftover observations",
         "",
         "Generated: %s" % datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "Dump: `%s`" % dump_dir,
+    ]
+    if source:
+        lines.append("Source: `%s`" % source)
+    lines.extend([
         "Identity is port-set UUID only. Names are display labels.",
+        "K8s / empty Quarantine names are ignore-class noise only, not identity.",
         "",
         "## Counts",
         "",
         "- Atlas leftover (this UUID in Atlas, not in computed): **%s**" % len(atlas_left),
         "- Atlas missing (this UUID in computed, not in Atlas) **critical**: **%s**" % len(atlas_missing),
         "- NIC UUID bugs: **%s**" % len(nic_bugs),
+        "- ignored %s K8s leftovers, %s empty Quarantine leftovers"
+        % (skipped.get("k8s", 0), skipped.get("empty_quarantine", 0)),
+        "",
+        "Empty Quarantine means `atlas_nic_uuids`, `computed_nic_uuids`, "
+        "`only_atlas_nics`, `atlas_nics`, and `computed_nics` are all empty.",
         "",
         "## Atlas leftover",
         "",
         "Each UUID below is present in Atlas and absent from computed.",
         "A different UUID that already matches is a different object.",
         "",
-    ]
+    ])
     if not atlas_left:
         lines.append("None.")
         lines.append("")
@@ -680,29 +782,60 @@ def enrich(rec, index, dump):
         rec["hash_label"] = "%s %s" % (
             hits[0].get("entity_type") or hits[0].get("kind"),
             hits[0].get("label") or "")
-    return leftover_is_kube(rec, hits, dump)
+    return leftover_ignore_reason(rec)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--dump_dir", required=True, help="Directory of dump JSON files")
+        "--dump_dir", default="", help="Directory of dump JSON files")
+    parser.add_argument(
+        "--from_jsonl",
+        default="",
+        help="Read leftovers from portset.jsonl (does not query flow_policy)")
+    parser.add_argument(
+        "--from_ch",
+        action="store_true",
+        help="Read leftovers from flow_policy ClickHouse instead of jsonl")
     parser.add_argument(
         "--out",
         default=os.path.join(HERE, "leftover_observations.md"))
+    parser.add_argument(
+        "--log_bundle_id",
+        type=int,
+        default=0,
+        help="Panacea log_bundle_id when --from_ch (default: latest bundle)")
     args = parser.parse_args()
-    dump = load_dump(args.dump_dir)
-    index = build_hash_index(dump)
-    grouped = group_leftovers(fetch_leftover_rows())
+    if args.dump_dir and os.path.isdir(args.dump_dir):
+        dump = load_dump(args.dump_dir)
+    else:
+        dump = empty_dump()
+        args.dump_dir = args.dump_dir or "(none)"
+    index = {} if dump.get("unavailable") else build_hash_index(dump)
+    jsonl_path = args.from_jsonl
+    if not args.from_ch:
+        jsonl_path = jsonl_path or DEFAULT_PORTSET_JSONL
+    if args.from_ch:
+        bid = env_or_latest_bundle(args.log_bundle_id)
+        grouped = group_leftovers(fetch_leftover_rows(bid))
+        source = "flow_policy ClickHouse log_bundle_id=%s" % bid
+    else:
+        grouped = group_leftovers(fetch_leftover_rows_from_jsonl(jsonl_path))
+        source = jsonl_path
     observed = []
+    skipped = {"k8s": 0, "empty_quarantine": 0}
     for rec in grouped.values():
-        if enrich(rec, index, dump):
+        reason = enrich(rec, index, dump)
+        if reason:
+            skipped[reason] = skipped.get(reason, 0) + 1
             continue
         observed.append(rec)
     observed.sort(key=lambda r: (r["kind"], r["uuid"]))
-    render(args.out, observed, dump, args.dump_dir)
+    render(args.out, observed, dump, args.dump_dir, skipped=skipped, source=source)
     print("atlas_leftover", sum(1 for r in observed if r["kind"] == "atlas_without_computed"))
     print("atlas_missing", sum(1 for r in observed if r["kind"] == "computed_without_atlas"))
+    print("ignored_k8s", skipped.get("k8s", 0))
+    print("ignored_empty_quarantine", skipped.get("empty_quarantine", 0))
     print("wrote", args.out)
 
 

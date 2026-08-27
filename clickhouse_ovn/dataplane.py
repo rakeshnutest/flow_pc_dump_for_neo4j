@@ -5,6 +5,7 @@ Does not query or alter flow_policy ClickHouse.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -22,9 +23,20 @@ POLICY_CATEGORY = (
     "/home/rakeshkumar.r/panacea/flow_pc_dumps/clickhouse_all_dump/flow_policy/category.jsonl"
 )
 NB_DUMP = os.path.join(DUMP_ROOT, "cmsp_ovn/anc-ovn/commands/ovsdb-client_dump_nb.txt")
+SB_DUMP = os.path.join(DUMP_ROOT, "cmsp_ovn/anc-ovn/commands/ovsdb-client_dump_sb.txt")
 
 PG_RE = re.compile(r"@port_group_([0-9a-fA-F_]{32,})")
 AS_RE = re.compile(r"\$address_set_([0-9a-fA-F_]{32,})")
+TCP_RANGE_RE = re.compile(
+    r"(tcp|udp)\.dst\s*>=\s*(\d+)\s*&&\s*(?:tcp|udp)\.dst\s*<=\s*(\d+)"
+)
+TCP_EQ_RE = re.compile(r"(tcp|udp)\.dst\s*==\s*(\d+)")
+ICMP_RE = re.compile(
+    r"icmp4\.type\s*==\s*(\d+)(?:\s*&&\s*icmp4\.code\s*==\s*(\d+))?"
+)
+ICMP6_RE = re.compile(
+    r"icmp6\.type\s*==\s*(\d+)(?:\s*&&\s*icmp6\.code\s*==\s*(\d+))?"
+)
 
 
 def _underscores_to_uuid(blob: str) -> str:
@@ -337,6 +349,343 @@ def rewrite_match(match: str) -> str:
     return s
 
 
+ICMP4_NAMES = {0: "echo-reply", 3: "dest-unreach", 8: "echo-request", 11: "time-exceeded"}
+SAMPLE_IPS = 4
+SAMPLE_NIC_IPS = 4
+
+
+def _nic_fields(n: Any) -> Tuple[str, str, str]:
+    """Return (nic_uuid, ip, vm_name) from a portset NIC dict/list."""
+    if isinstance(n, dict):
+        return (
+            str(n.get("nic_uuid") or n.get("uuid") or "").lower(),
+            str(n.get("ip") or "").split("/")[0],
+            str(n.get("vm_name") or n.get("vm") or ""),
+        )
+    if isinstance(n, (list, tuple)) and n:
+        uid = str(n[0]).lower() if n else ""
+        ip = str(n[4]).split("/")[0] if len(n) > 4 else ""
+        vm = str(n[1]) if len(n) > 1 else ""
+        return uid, ip, vm
+    if isinstance(n, str):
+        return n.lower(), "", ""
+    return "", "", ""
+
+
+def _ps_nics(ps: dict) -> List[Any]:
+    return list(ps.get("atlas_nics") or ps.get("computed_nics") or [])
+
+
+def _ps_display(ps: dict, uid: str = "") -> Tuple[str, str, str]:
+    cats = ps.get("vm_category_names") or ps.get("reference_names") or []
+    cat = cats[0] if cats else ""
+    atlas = str(ps.get("atlas_name") or "")
+    role = str(ps.get("role") or "")
+    if not cat and uid:
+        cat = _categories().get(str((ps.get("vm_category_refs") or [""])[0]), "")
+    return str(cat or ""), atlas, role
+
+
+def expand_l4(match: str) -> str:
+    """tcp/udp dest ranges and ICMP types as human text."""
+    if not match:
+        return ""
+    tcp: List[str] = []
+    udp: List[str] = []
+    used = set()
+    for m in TCP_RANGE_RE.finditer(match):
+        used.add(m.group(0))
+        bag = tcp if m.group(1) == "tcp" else udp
+        a, b = m.group(2), m.group(3)
+        bag.append(f"{a}-{b}" if a != b else a)
+    for m in TCP_EQ_RE.finditer(match):
+        if m.group(0) in used:
+            continue
+        bag = tcp if m.group(1) == "tcp" else udp
+        bag.append(m.group(2))
+    bits: List[str] = []
+    if tcp:
+        bits.append("tcp dest " + ", ".join(tcp))
+    if udp:
+        bits.append("udp dest " + ", ".join(udp))
+    icmps: List[str] = []
+    for m in ICMP_RE.finditer(match):
+        t, c = m.group(1), m.group(2)
+        name = ICMP4_NAMES.get(int(t), f"type {t}")
+        icmps.append(name if not c else f"{name} code {c}")
+    for m in ICMP6_RE.finditer(match):
+        t, c = m.group(1), m.group(2)
+        icmps.append(f"icmp6 type {t}" + (f" code {c}" if c else ""))
+    if icmps:
+        bits.append("icmp " + ", ".join(icmps))
+    if "ip.proto == 6" in match and not tcp:
+        bits.append("tcp")
+    if "ip.proto == 17" in match and not udp:
+        bits.append("udp")
+    if "ip.proto == 1" in match and not icmps:
+        bits.append("icmp")
+    return "; ".join(bits)
+
+
+def _pg_human(uid: str, nic_uuid: str, sample: int = SAMPLE_NIC_IPS) -> dict:
+    ps = _portsets().get(uid) or {}
+    cat, atlas, role = _ps_display(ps, uid)
+    nics = _ps_nics(ps)
+    ips: List[str] = []
+    member = False
+    want = {x.lower() for x in (nic_uuid or "").replace(",", " ").split() if x}
+    for n in nics:
+        nu, ip, _vm = _nic_fields(n)
+        if nu and nu in want:
+            member = True
+        if ip and ip not in ips:
+            ips.append(ip)
+    label = "/".join(x for x in (cat, atlas) if x) or "port-group"
+    if role:
+        label += f" ({role})"
+    return {
+        "uid": uid,
+        "label": label,
+        "member": member,
+        "nic_count": len(nics),
+        "sample_ips": ips[:sample],
+        "ip_count": len(ips),
+    }
+
+
+@lru_cache(maxsize=1024)
+def _dest_label_for_as(as_name: str) -> str:
+    addrs = tuple(_address_sets().get(as_name) or [])
+    dest = _match_portset_by_ips(list(addrs))
+    if dest:
+        return dest.replace(" ", "_")
+    return f"dest-set({len(addrs)} IPs)" if addrs else "dest-set"
+
+
+def _as_human(
+    as_name: str,
+    src_ip: str = "",
+    dst_ip: str = "",
+    sample: int = SAMPLE_IPS,
+) -> dict:
+    addrs = _address_sets().get(as_name) or []
+    in_src = ip_in_address_set(src_ip, as_name) if src_ip else False
+    in_dst = ip_in_address_set(dst_ip, as_name) if dst_ip else False
+    return {
+        "name": as_name,
+        "label": _dest_label_for_as(as_name),
+        "count": len(addrs),
+        "sample": addrs[:sample],
+        "rest": addrs[sample:],
+        "src_in": in_src,
+        "dst_in": in_dst,
+    }
+
+
+def rewrite_match_human(
+    match: str,
+    nic_uuid: str = "",
+    src_ip: str = "",
+    dst_ip: str = "",
+) -> str:
+    """Human match: policy names, IPs, L4 ports. No hashed PG/AS as primary."""
+    if not match:
+        return match
+
+    def pg_sub(m: re.Match) -> str:
+        h = _pg_human(_underscores_to_uuid(m.group(1)), nic_uuid)
+        mem = "member" if h["member"] else "not-member"
+        ips = ", ".join(h["sample_ips"][:3])
+        extra = f"+{h['ip_count'] - 3}" if h["ip_count"] > 3 else ""
+        return f"@{h['label']} [{mem}, {h['nic_count']} NICs, {ips}{extra}]"
+
+    def as_sub(m: re.Match) -> str:
+        info = _as_human("address_set_" + m.group(1), src_ip, dst_ip)
+        hit = []
+        if src_ip:
+            hit.append("src " + ("in" if info["src_in"] else "not-in"))
+        if dst_ip:
+            hit.append("dst " + ("in" if info["dst_in"] else "not-in"))
+        samp = ", ".join(info["sample"])
+        extra = f"+{info['count'] - len(info['sample'])}" if info["count"] > len(info["sample"]) else ""
+        who = "; ".join(hit)
+        return f"${info['label']} [{info['count']} IPs: {samp}{extra}; {who}]"
+
+    s = PG_RE.sub(pg_sub, match)
+    s = AS_RE.sub(as_sub, s)
+    s = TCP_RANGE_RE.sub(lambda m: f"{m.group(1)}.dst {m.group(2)}-{m.group(3)}", s)
+    return s
+
+
+def fmt_hex(n: Any) -> str:
+    try:
+        v = int(n)
+    except (TypeError, ValueError):
+        return "(missing in dump)"
+    return f"0x{v:x}"
+
+
+def of_metadata(dp_key: Any, port_key: Any) -> Tuple[str, str]:
+    """OpenFlow metadata = dp_key << 16 | port_key. Hex + decimal footnote."""
+    try:
+        dp = int(dp_key or 0)
+        pk = int(port_key or 0)
+    except (TypeError, ValueError):
+        return "(missing in dump)", ""
+    if not dp and not pk:
+        return "(missing in dump)", ""
+    meta = (dp << 16) | (pk & 0xFFFF)
+    return fmt_hex(meta), str(meta)
+
+
+_ACL_LABEL_RE = re.compile(
+    r"^([0-9a-fA-F-]{36})\s+\S+\s+\S+\s+\{[^}]*\}\s+(\d+)\b"
+)
+
+
+@lru_cache(maxsize=1)
+def _acl_labels() -> Dict[str, int]:
+    """NB ACL._uuid -> label (integer). flow_ovn.ovn_acl has no label column."""
+    out: Dict[str, int] = {}
+    if not os.path.isfile(NB_DUMP):
+        return out
+    in_acl = False
+    with open(NB_DUMP, errors="replace") as fh:
+        for line in fh:
+            if line.startswith("ACL table"):
+                in_acl = True
+                continue
+            if in_acl and re.match(r"^[A-Za-z_]+ table", line):
+                break
+            if not in_acl:
+                continue
+            m = _ACL_LABEL_RE.match(line)
+            if m:
+                out[m.group(1).lower()] = int(m.group(2))
+    return out
+
+
+def acl_label_hex(acl_uuid: str) -> str:
+    uid = str(acl_uuid or "").strip().lower()
+    labs = _acl_labels()
+    if uid not in labs:
+        return "(missing in dump)"
+    return fmt_hex(labs[uid])
+
+
+def zone_from_options(opts: Any) -> str:
+    if not isinstance(opts, dict):
+        return ""
+    for k, v in opts.items():
+        lk = str(k).lower().replace("-", "_")
+        if lk in ("ct_zone", "ctzone") or lk == "zone":
+            s = str(v).strip().strip('"')
+            if s:
+                return s
+    return ""
+
+
+@lru_cache(maxsize=1)
+def _sb_port_binding_offset() -> int:
+    if not os.path.isfile(SB_DUMP):
+        return -1
+    needle = b"Port_Binding table\n"
+    with open(SB_DUMP, "rb") as fh:
+        pos = 0
+        chunk = b""
+        while True:
+            more = fh.read(1 << 20)
+            if not more:
+                break
+            data = chunk[-len(needle) :] + more
+            i = data.find(needle)
+            if i >= 0:
+                return pos - min(len(chunk), len(needle)) + i
+            pos += len(more)
+            chunk = more[-len(needle) :]
+    return -1
+
+
+@lru_cache(maxsize=64)
+def pb_ct_zone(logical_port: str) -> str:
+    """SB Port_Binding.options ct_zone for this VIF. Else missing-in-dump."""
+    name = str(logical_port or "")
+    if not name or not os.path.isfile(SB_DUMP):
+        return "(missing in dump)"
+    off = _sb_port_binding_offset()
+    if off < 0:
+        return "(missing in dump)"
+    zone_re = re.compile(
+        r'(?:^|,\s*)ct[-_]?zone\s*=\s*"?([^,}\s"]+)"?', re.I
+    )
+    with open(SB_DUMP, errors="replace") as fh:
+        fh.seek(off)
+        next(fh, "")
+        for line in fh:
+            if re.match(r"^[A-Za-z_]+ table", line):
+                break
+            if name not in line:
+                continue
+            for blob in re.findall(r"\{([^}]*)\}", line):
+                zm = zone_re.search(blob)
+                if zm:
+                    return zm.group(1)
+            return "(missing in dump)"
+    return "(missing in dump)"
+
+
+def human_acl_row(
+    acl: dict,
+    nic_uuid: str = "",
+    src_ip: str = "",
+    dst_ip: str = "",
+    ct_zone: str = "",
+    metadata_hex: str = "",
+    sample: int = SAMPLE_IPS,
+    full_ips: bool = False,
+) -> dict:
+    """One human ACL table row. Identity UUID stays in the footnote column."""
+    match = acl.get("match") or ""
+    pgs = [_pg_human(u, nic_uuid) for u in _pg_uuids(match)]
+    sets = [_as_human(n, src_ip, dst_ip, sample) for n in _as_names(match)]
+    applied = "; ".join(
+        f"{p['label']} ({'member' if p['member'] else 'not-member'}, "
+        f"{p['nic_count']} NICs, IPs {', '.join(p['sample_ips'][:3])})"
+        for p in pgs
+    ) or "-"
+    peers_bits = []
+    details: List[dict] = []
+    for s in sets:
+        hit = []
+        if src_ip:
+            hit.append("src-in" if s["src_in"] else "src-out")
+        if dst_ip:
+            hit.append("dst-in" if s["dst_in"] else "dst-out")
+        show = ", ".join(s["sample"])
+        extra = f"+{s['count'] - len(s['sample'])}" if s["count"] > len(s["sample"]) else ""
+        peers_bits.append(
+            f"{s['label']} ({s['count']} IPs; {', '.join(hit)}; {show}{extra})"
+        )
+        if s["rest"]:
+            details.append(s)
+    uid = str(acl.get("acl_uuid") or "")
+    lab = acl_label_hex(uid)
+    return {
+        "pri": acl.get("priority"),
+        "action": acl.get("action") or "",
+        "direction": acl.get("direction") or "",
+        "applied": applied,
+        "peers": "; ".join(peers_bits) or "-",
+        "l4": expand_l4(match) or "-",
+        "ct_zone": ct_zone or "(missing in dump)",
+        "metadata": metadata_hex or "(missing in dump)",
+        "ct_label": lab,
+        "match": rewrite_match_human(match, nic_uuid, src_ip, dst_ip),
+        "uuid": uid,
+        "ip_details": details if full_ips else details,
+    }
+
+
 def refs_from_acls(acls: List[dict]) -> Tuple[List[str], List[str]]:
     pgs, sets = [], []
     seen_p, seen_s = set(), set()
@@ -455,6 +804,210 @@ def ip_in_address_set(ip: str, as_name: str) -> bool:
     return False
 
 
+ZERO_PS = "00000000-0000-0000-0000-000000000000"
+LEFTOVER_MD = "/home/rakeshkumar.r/panacea/clickhouse_flow/leftover_observations.md"
+LEFTOVER_IGNORE = "/home/rakeshkumar.r/panacea/clickhouse_flow/leftover_ignore.py"
+
+
+@lru_cache(maxsize=1)
+def _leftover_ignore():
+    spec = importlib.util.spec_from_file_location("leftover_ignore", LEFTOVER_IGNORE)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _nic_ids(ps: dict) -> Tuple[set, set, set, set]:
+    def grab(key: str) -> set:
+        out = set()
+        for n in ps.get(key) or []:
+            if isinstance(n, str) and len(n) >= 32:
+                out.add(n.lower())
+            elif isinstance(n, dict):
+                u = str(n.get("nic_uuid") or n.get("uuid") or "")
+                if u:
+                    out.add(u.lower())
+            elif isinstance(n, (list, tuple)) and n:
+                out.add(str(n[0]).lower())
+        return {x for x in out if x and x != ZERO_PS}
+
+    atlas = grab("atlas_nic_uuids") | grab("atlas_nics")
+    comp = grab("computed_nic_uuids") | grab("computed_nics")
+    only_a = grab("only_atlas_nics") or (atlas - comp)
+    only_c = grab("only_computed_nics") or (comp - atlas)
+    return atlas, comp, only_a, only_c
+
+
+def _pg_uuids(match: str) -> List[str]:
+    return [_underscores_to_uuid(m.group(1)) for m in PG_RE.finditer(match or "")]
+
+
+def _as_names(match: str) -> List[str]:
+    return ["address_set_" + m.group(1) for m in AS_RE.finditer(match or "")]
+
+
+def explain_drop_policy(acl: Optional[dict]) -> List[str]:
+    """Name the Flow policy / port-set that owns the first-hit drop ACL."""
+    if not acl:
+        return ["- No matching ACL (implicit allow / next hop)."]
+    match = acl.get("match") or ""
+    pri = acl.get("priority")
+    action = acl.get("action")
+    direc = acl.get("direction")
+    pretty = rewrite_match(match)
+    lines = [
+        f"- OVN first hit: **pri {pri} {action}** `{direc}`",
+        f"- Match (rewritten): `{pretty}`",
+        f"- Match (OVN raw): `{match}`",
+    ]
+    pg_names: List[str] = []
+    for uid in _pg_uuids(match):
+        ps = _portsets().get(uid) or {}
+        cats = ps.get("vm_category_names") or ps.get("reference_names") or []
+        cat = cats[0] if cats else ""
+        name = ps.get("atlas_name") or uid
+        role = ps.get("role") or ""
+        pg_names.append(str(name))
+        lines.append(
+            f"- **Applied-to policy** `{cat}/{name}` "
+            f"uuid `{uid}` role `{role}` "
+            f"(OVN `@port_group_{uid.replace('-', '_')}`)"
+        )
+    dest_names: List[str] = []
+    for as_name in _as_names(match):
+        addrs = _address_sets().get(as_name) or []
+        dest = _match_portset_by_ips(addrs)
+        dest_disp = dest.replace(" ", "_") if dest else as_name
+        dest_names.append(dest_disp)
+        sample = ", ".join(addrs[:4])
+        extra = f" +{len(addrs) - 4}" if len(addrs) > 4 else ""
+        lines.append(
+            f"- **Dest/src address-set** `${dest_disp}` "
+            f"({len(addrs)} IPs: {sample}{extra}) OVN `${as_name}`"
+        )
+    if str(action) == "drop" and int(pri or 0) >= 1060:
+        who = pg_names[0] if pg_names else "applied-to group"
+        dest = dest_names[0] if dest_names else "the named secured address-set"
+        lines.append(
+            f"- **Why it drops:** isolation — `{who}` cannot send to `{dest}` "
+            f"secured IPs, so pri {pri} drop wins before pri 1050 allow-related "
+            "(wrong dest-set / ports) and before pri 1045 catch-all and "
+            "pri 500 `tcp || udp || icmp`."
+        )
+    elif str(action) == "drop":
+        lines.append(
+            "- **Why it drops:** catch-all drop on the applied-to group "
+            "(no higher-pri allow matched this dest/protocol)."
+        )
+    return lines
+
+
+def portset_issues_md(nic_uuids: List[str]) -> List[str]:
+    """Atlas-only leftovers + which port-sets the path NICs belong to.
+
+    Reads dump jsonl (not flow_policy ClickHouse).
+    """
+    nics = {n.lower() for n in nic_uuids if n}
+    leftover: List[dict] = []
+    membership: List[str] = []
+    nic_bugs: List[str] = []
+    leftover_nics: List[str] = []
+    skipped_k8s = 0
+    skipped_quarantine = 0
+    ignore_mod = _leftover_ignore()
+    for uid, ps in _portsets().items():
+        kind = str(ps.get("mismatch_kind") or "")
+        status = str(ps.get("match_status") or "")
+        atlas_uid = str(ps.get("atlas_port_set_uuid") or "")
+        comp_uid = str(ps.get("computed_port_set_uuid") or "")
+        atlas, comp, only_a, only_c = _nic_ids(ps)
+        name = ps.get("atlas_name") or ""
+        role = ps.get("role") or ""
+        atlas_only = (
+            kind in ("atlas_without_computed", "atlas_only")
+            or status in ("atlas_without_computed", "atlas_only")
+            or (
+                atlas_uid
+                and atlas_uid != ZERO_PS
+                and (not comp_uid or comp_uid == ZERO_PS)
+            )
+        )
+        ignore_reason = ignore_mod.leftover_ignore_reason(ps) if atlas_only else ""
+        if atlas_only and ignore_reason == "k8s":
+            skipped_k8s += 1
+        elif atlas_only and ignore_reason == "empty_quarantine":
+            skipped_quarantine += 1
+        elif atlas_only:
+            leftover.append(ps)
+        disp_status = kind or status or "match"
+        hit = nics & (atlas | comp | only_a | only_c)
+        if hit:
+            for nic in sorted(hit):
+                membership.append(
+                    f"- NIC `{nic}` in `{name}` uuid `{uid}` role `{role}` "
+                    f"status `{disp_status}` "
+                    f"(atlas {len(atlas)} NICs, computed {len(comp)})"
+                )
+            if atlas_only and not ignore_reason:
+                leftover_nics.append(
+                    f"- Path NIC `{sorted(hit)[0]}` is on leftover "
+                    f"`atlas_without_computed` port-set `{uid}` `{name}`"
+                )
+            bad_a = only_a & nics
+            bad_c = only_c & nics
+            if bad_a:
+                nic_bugs.append(
+                    f"- Atlas-only NIC `{sorted(bad_a)[0]}` on port-set `{uid}` `{name}`"
+                )
+            if bad_c:
+                nic_bugs.append(
+                    f"- Computed-only NIC `{sorted(bad_c)[0]}` on port-set `{uid}` `{name}`"
+                )
+    leftover.sort(key=lambda p: str(p.get("port_set_uuid") or p.get("atlas_name")))
+    out = [
+        f"- Dump-wide **Atlas-only port-sets** (`mismatch_kind=atlas_without_computed`, "
+        f"Atlas UUID, no computed UUID): **{len(leftover)}**",
+        f"- ignored {skipped_k8s} K8s leftovers, "
+        f"{skipped_quarantine} empty Quarantine leftovers",
+    ]
+    if leftover:
+        out.append("")
+        out.append("| port-set UUID | atlas name | role | mismatch_kind |")
+        out.append("|---|---|---|---|")
+        for ps in leftover:
+            out.append(
+                f"| `{ps.get('port_set_uuid')}` | `{ps.get('atlas_name') or ''}` | "
+                f"`{ps.get('role') or ''}` | "
+                f"`{ps.get('mismatch_kind') or ps.get('match_status') or ''}` |"
+            )
+        out.append("")
+        out.append(
+            "These UUIDs exist in Atlas `port_set.list` and are absent from computed "
+            "hashes. Identity is UUID; a matching *name* on another UUID is a different object."
+        )
+    out.append("")
+    out.append("Path NIC membership (jsonl, not leftover-by-name):")
+    out.extend(membership or ["- (path NICs not found in portset.jsonl)"])
+    out.append("")
+    if leftover_nics:
+        out.append("Path NICs on leftover (atlas-only) port-sets:")
+        out.extend(leftover_nics)
+    else:
+        out.append(
+            "- Path NICs are **not** members of dump-wide leftover "
+            "`atlas_without_computed` port-sets."
+        )
+    if nic_bugs:
+        out.append("")
+        out.append("NIC UUID bugs on this path:")
+        out.extend(nic_bugs)
+    else:
+        out.append("- No Atlas-vs-computed NIC UUID mismatch on the path port-sets.")
+    if os.path.isfile(LEFTOVER_MD):
+        out.append(f"- Leftover observer write-up: `{LEFTOVER_MD}`")
+    return out
+
+
 # Names used by trace.py
 ovs_for_vif = ovs_for_vif
 ovs_for_gw = ovs_for_gw
@@ -466,3 +1019,12 @@ ip_in_address_set = ip_in_address_set
 static_routes_for_lr = static_routes_for_lr
 nb_lr_meta = nb_lr_meta
 nb_ls_meta = nb_ls_meta
+explain_drop_policy = explain_drop_policy
+portset_issues_md = portset_issues_md
+human_acl_row = human_acl_row
+expand_l4 = expand_l4
+rewrite_match_human = rewrite_match_human
+of_metadata = of_metadata
+acl_label_hex = acl_label_hex
+pb_ct_zone = pb_ct_zone
+fmt_hex = fmt_hex

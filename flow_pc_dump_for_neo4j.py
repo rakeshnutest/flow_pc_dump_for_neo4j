@@ -2,12 +2,11 @@
 #
 # Copyright (c) 2026 Nutanix Inc. All rights reserved.
 #
-# Dump Flow policy + infra objects for neo4j_db_insert.py prefetch JSON.
-# Run on PCVM:
-#   /home/nutanix/.venvs/flow/bin/python3 flow_pc_dump_for_neo4j.py \
-#       --output_dir /tmp/flow_pc_neo4j_prefetch \
-#       --workers 16 --atlas_get_workers 32
-# Writes per-dataset JSON files plus compact all.json.
+# PC dump (system python3, no flow venv): idfcli + OVN + OVS + atlas_cli.
+#   python3 flow_pc_dump.py --output_dir /tmp/flow_pc_dump
+# Outside PC (this workstation): parse/convert/ingest. Never FlowInterfaces
+# on the PC. atlas_cli port_set.list/get run on the PC during dump.
+#   python3 flow_pc_process.py --dump_dir /tmp/flow_pc_dump --ingest
 #
 # Host OVS/OVN/virsh is collected from PC via AHV Gateway (mTLS :7030),
 # never SSH to AHV. Per PE hypervisor, the dump loops until these exist:
@@ -39,6 +38,7 @@ import shutil
 import ssl
 import subprocess
 import sys
+import zlib
 import tarfile
 import threading
 import time
@@ -51,84 +51,147 @@ try:
 except ImportError:
   from urllib2 import Request, urlopen
 
-import gflags
+class _FlagBag(object):
+  output_dir = "/tmp/flow_pc_dump"
+  output = ""
+  log_file = ""
+  from_json = ""
+  workers = 16
+  dataset_timeout_secs = 180
+  fail_on_error = False
+  skip_atlas = False
+  atlas_timeout_secs = 1800
+  atlas_get_workers = 32
+  skip_ahv_gateway = False
+  ahv_gateway_timeout_secs = 1800
+  ahv_gateway_class_timeout_secs = 300
+  ahv_gateway_workers = 8
+  ahv_gateway_port = 7030
+  ahv_gateway_cert_dir = "/home/certs/ClusterHealthService"
+  skip_idfcli = False
+  skip_cmsp_ovn = False
+  cmsp_ovn_timeout_secs = 1800
+  cmsp_ovn_namespace = ""
 
-import flow.common.flags  # pylint: disable=unused-import
-from flow.common.interfaces import FlowInterfaces
-from flow.flow_types_pb2 import (
-  AllowedEntity,
-  CategoryEntitySelectionType,
-  ExceptEntity,
-  NetworkSecurityPolicyMode,
-  NetworkSecurityPolicyScope,
-  NetworkSecurityPolicyType,
-  RegexMatchEntity,
-)
+  def __call__(self, argv):
+    return argv
 
-FLAGS = gflags.FLAGS
 
-gflags.DEFINE_string(
-    "output_dir", "/tmp/flow_pc_neo4j_prefetch",
-    "Directory for per-dataset JSON files plus all.json (not the old "
-    "/tmp/flow_neo4j_dump.json).")
-gflags.DEFINE_string(
-    "output", "",
-    "Combined JSON path. Default: <output_dir>/all.json")
-gflags.DEFINE_string(
-    "log_file", "",
-    "Log file path. Default: <output_dir>/dump.log")
-gflags.DEFINE_string(
-    "from_json", "",
-    "If set, skip fetch and split this combined JSON into output_dir files.")
-gflags.DEFINE_integer(
-    "workers", 16,
-    "Parallel worker count for dataset fetch, conversion, and writes.")
-gflags.DEFINE_integer(
-    "dataset_timeout_secs", 90,
-    "Per-dataset timeout. Hung v4/Zeus calls are abandoned.")
-gflags.DEFINE_boolean(
-    "fail_on_error", False,
-    "If true, exit non-zero when any dataset fetch fails.")
-gflags.DEFINE_boolean(
-    "skip_atlas", False,
-    "Skip atlas_cli port_set.list / port_set.get dumps.")
-gflags.DEFINE_integer(
-    "atlas_timeout_secs", 300,
-    "Timeout for atlas_cli port_set.list and the port_set.get batch.")
-gflags.DEFINE_integer(
-    "atlas_get_workers", 32,
-    "Parallel atlas_cli port_set.get processes.")
-gflags.DEFINE_boolean(
-    "skip_ahv_gateway", False,
-    "Skip AHV Gateway host collect (OVS/virsh/tap/brAtlas/OVN DB). "
-    "Default is to pull every PE hypervisor via mTLS :7030, no AHV SSH.")
-gflags.DEFINE_integer(
-    "ahv_gateway_timeout_secs", 1800,
-    "Deadline for AHV Gateway collect across all hosts (retries until "
-    "every required artifact exists or this budget is spent).")
-gflags.DEFINE_integer(
-    "ahv_gateway_class_timeout_secs", 300,
-    "Per-class HTTP timeout when streaming a bugtool tarball.")
-gflags.DEFINE_integer(
-    "ahv_gateway_workers", 8,
-    "Parallel PE hypervisor AHV Gateway collects.")
-gflags.DEFINE_integer(
-    "ahv_gateway_port", 7030,
-    "AHV Gateway HTTPS port.")
-gflags.DEFINE_string(
-    "ahv_gateway_cert_dir",
-    "/home/certs/ClusterHealthService",
-    "Directory with <name>.crt and <name>.key for AHV Gateway mTLS.")
-gflags.DEFINE_boolean(
-    "skip_cmsp_ovn", False,
-    "Skip CMSP kubectl OVN Northbound/Southbound dump "
-    "(anc-ovn / anc-ovn-ic-db / anc-policydb). Default is to collect.")
-gflags.DEFINE_integer(
-    "cmsp_ovn_timeout_secs", 1800,
-    "Retry budget for CMSP kubectl OVN NB/SB collect (dump + backup).")
-gflags.DEFINE_string(
-    "cmsp_ovn_namespace", "",
-    "Kubernetes namespace for ANC/OVN pods. Empty searches all namespaces.")
+class _EnumStub(object):
+  def __init__(self, **names):
+    self.__dict__.update(names)
+
+  def Name(self, value):
+    for name, number in self.__dict__.items():
+      if number == value:
+        return name
+    raise ValueError(value)
+
+
+try:
+  import gflags
+  import flow.common.flags  # pylint: disable=unused-import
+  from flow.common.interfaces import FlowInterfaces
+  from flow.flow_types_pb2 import (
+      AllowedEntity,
+      CategoryEntitySelectionType,
+      ExceptEntity,
+      NetworkSecurityPolicyMode,
+      NetworkSecurityPolicyScope,
+      NetworkSecurityPolicyType,
+      RegexMatchEntity,
+  )
+  FLAGS = gflags.FLAGS
+  gflags.DEFINE_string(
+      "output_dir", "/tmp/flow_pc_dump",
+      "Directory for idfcli/, ahv_gateway/ (OVS), and cmsp_ovn/ (OVN).")
+  gflags.DEFINE_string(
+      "output", "",
+      "Combined JSON path. Default: <output_dir>/all.json")
+  gflags.DEFINE_string(
+      "log_file", "",
+      "Log file path. Default: <output_dir>/dump.log")
+  gflags.DEFINE_string(
+      "from_json", "",
+      "If set, skip fetch and split this combined JSON into output_dir files.")
+  gflags.DEFINE_integer(
+      "workers", 16,
+      "Parallel worker count for dataset fetch, conversion, and writes.")
+  gflags.DEFINE_integer(
+      "dataset_timeout_secs", 180,
+      "Per-idfcli-type timeout.")
+  gflags.DEFINE_boolean(
+      "fail_on_error", False,
+      "If true, exit non-zero when any dataset fetch fails.")
+  gflags.DEFINE_boolean(
+      "skip_atlas", False,
+      "Skip atlas_cli port_set.list and port_set.get.")
+  gflags.DEFINE_integer(
+      "atlas_timeout_secs", 1800,
+      "Timeout for atlas_cli port_set.list and the port_set.get batch.")
+  gflags.DEFINE_integer(
+      "atlas_get_workers", 32,
+      "Parallel atlas_cli port_set.get processes.")
+  gflags.DEFINE_boolean(
+      "skip_ahv_gateway", False,
+      "Skip AHV Gateway host collect (OVS/virsh/tap/brAtlas/OVN DB).")
+  gflags.DEFINE_integer(
+      "ahv_gateway_timeout_secs", 1800,
+      "Deadline for AHV Gateway collect across all hosts.")
+  gflags.DEFINE_integer(
+      "ahv_gateway_class_timeout_secs", 300,
+      "Per-class HTTP timeout when streaming a bugtool tarball.")
+  gflags.DEFINE_integer(
+      "ahv_gateway_workers", 8,
+      "Parallel PE hypervisor AHV Gateway collects.")
+  gflags.DEFINE_integer(
+      "ahv_gateway_port", 7030,
+      "AHV Gateway HTTPS port.")
+  gflags.DEFINE_string(
+      "ahv_gateway_cert_dir",
+      "/home/certs/ClusterHealthService",
+      "Directory with <name>.crt and <name>.key for AHV Gateway mTLS.")
+  gflags.DEFINE_boolean(
+      "skip_idfcli", False,
+      "Skip idfcli entity dumps.")
+  gflags.DEFINE_boolean(
+      "skip_cmsp_ovn", False,
+      "Skip CMSP kubectl OVN Northbound/Southbound dump.")
+  gflags.DEFINE_integer(
+      "cmsp_ovn_timeout_secs", 1800,
+      "Retry budget for CMSP kubectl OVN NB/SB collect.")
+  gflags.DEFINE_string(
+      "cmsp_ovn_namespace", "",
+      "Kubernetes namespace for ANC/OVN pods. Empty searches all namespaces.")
+except ImportError:
+  gflags = None
+  FlowInterfaces = None
+  FLAGS = _FlagBag()
+  AllowedEntity = _EnumStub(
+      kVmByCategoryUuid=1,
+      kSubnetByCategoryUuid=2,
+      kVpcByCategoryUuid=3,
+      kKubeClusterByUuid=4,
+      kKubeNamespaceByName=5,
+      kKubePodsByLabels=6,
+      kKubeServiceByName=7,
+      kAddressGroupByUuid=8,
+      kAddressGroupByValue=9,
+      kAddressGroupByFqdn=10,
+      kVmByUuid=11,
+      kVmNameByRegex=12,
+      kSubnetByUuid=13,
+  )
+  RegexMatchEntity = _EnumStub(
+      kContains=1, kStartsWith=2, kEndsWith=3, kEquals=4)
+  CategoryEntitySelectionType = _EnumStub(kVM=1, kVPC=2, kSubnet=3)
+  ExceptEntity = _EnumStub(kAddressGroupByValue=1)
+  NetworkSecurityPolicyType = _EnumStub(
+      kAPPLICATION=1, kISOLATION=2, kQUARANTINE=3)
+  NetworkSecurityPolicyMode = _EnumStub(
+      kSAVE=1, kMONITOR=2, kENFORCE=3)
+  NetworkSecurityPolicyScope = _EnumStub(
+      kALL_VLAN=1, kVPC=2, kGLOBAL=3)
 
 LOG = logging.getLogger("flow_pc_dump")
 
@@ -1121,8 +1184,27 @@ def _idfcli_bin():
 
 
 _IDF_RESULTS = {}
+_IDF_RAW = {}
 _IDF_LOCKS = {}
 _IDF_GUARD = threading.Lock()
+# If set, _idfcli_one reads <dir>/<entity_type>.json instead of running idfcli.
+_IDF_FILE_DIR = ""
+
+# Every IDF entity type this dump collects. Process maps these later.
+IDF_DUMP_TYPES = (
+    "vm", "mh_vm", "ahv_vm", "virtual_nic",
+    "virtual_network", "subnet", "vpc", "virtual_private_cloud",
+    "node", "host", "ahv_host", "cluster",
+    "project", "projects", "iam_project", "xi_project", "abac_project",
+    "abac_category", "category",
+    "abac_entity_capability", "volume_group_entity_capability",
+    "atlas_network_function", "network_function", "flow_network_function",
+    "fns_fqdn_to_ip_info",
+    "address_group", "network_address_group",
+    "service_group", "network_service_group",
+    "entity_group", "network_entity_group",
+    "network_security_policy", "security_policy",
+)
 
 
 def _idfcli_one(entity_type, timeout=180):
@@ -1134,6 +1216,52 @@ def _idfcli_one(entity_type, timeout=180):
       parsed, err = cached
       LOG.info("DUMP idfcli entitytype %s cached=%s", entity_type, len(parsed))
       return cached
+    file_dir = _IDF_FILE_DIR
+    if file_dir:
+      json_path = os.path.join(file_dir, "%s.json" % entity_type)
+      txt_path = os.path.join(file_dir, "%s.txt" % entity_type)
+      # Service groups only have ports in IDF __zprotobuf__; prefer .txt.
+      prefer_txt = entity_type in (
+          "network_service_group", "service_group",
+          "network_security_policy", "security_policy")
+      if prefer_txt and os.path.isfile(txt_path):
+        try:
+          with open(txt_path, "r") as handle:
+            parsed = _parse_idf_entities(handle.read())
+        except Exception as exc:
+          parsed, err = [], "%s: %s" % (entity_type, exc)
+          _IDF_RESULTS[entity_type] = (parsed, err)
+          return _IDF_RESULTS[entity_type]
+        LOG.info("DUMP idfcli entitytype %s from txt count=%s",
+                 entity_type, len(parsed))
+        _IDF_RESULTS[entity_type] = (parsed, None)
+        return _IDF_RESULTS[entity_type]
+      if os.path.isfile(json_path):
+        try:
+          with open(json_path, "r") as handle:
+            parsed = _idf_loaded_rows(json.load(handle))
+        except Exception as exc:
+          parsed, err = [], "%s: %s" % (entity_type, exc)
+          _IDF_RESULTS[entity_type] = (parsed, err)
+          return _IDF_RESULTS[entity_type]
+        LOG.info("DUMP idfcli entitytype %s from file count=%s",
+                 entity_type, len(parsed))
+        _IDF_RESULTS[entity_type] = (parsed, None)
+        return _IDF_RESULTS[entity_type]
+      if os.path.isfile(txt_path):
+        try:
+          with open(txt_path, "r") as handle:
+            parsed = _parse_idf_entities(handle.read())
+        except Exception as exc:
+          parsed, err = [], "%s: %s" % (entity_type, exc)
+          _IDF_RESULTS[entity_type] = (parsed, err)
+          return _IDF_RESULTS[entity_type]
+        LOG.info("DUMP idfcli entitytype %s from txt count=%s",
+                 entity_type, len(parsed))
+        _IDF_RESULTS[entity_type] = (parsed, None)
+        return _IDF_RESULTS[entity_type]
+      _IDF_RESULTS[entity_type] = ([], "%s: not in dump" % entity_type)
+      return _IDF_RESULTS[entity_type]
     LOG.info("DUMP idfcli entitytype %s", entity_type)
     err = None
     parsed = []
@@ -1142,6 +1270,7 @@ def _idfcli_one(entity_type, timeout=180):
           [_idfcli_bin(), "get", "entitytype", "-e", entity_type],
           capture_output=True, text=True, check=False, timeout=timeout)
       text = proc.stdout or ""
+      _IDF_RAW[entity_type] = text
       if proc.returncode != 0 and not text:
         err = "%s: %s" % (entity_type, (proc.stderr or "").strip()[:200])
       else:
@@ -1153,6 +1282,19 @@ def _idfcli_one(entity_type, timeout=180):
     return _IDF_RESULTS[entity_type]
 
 
+def _idf_loaded_rows(parsed):
+  if isinstance(parsed, list):
+    return parsed
+  if isinstance(parsed, dict):
+    for key in ("entities", "entity", "data"):
+      val = parsed.get(key)
+      if isinstance(val, list):
+        return val
+      if isinstance(val, dict) and val:
+        return [val]
+  return []
+
+
 def _idf_unquote(raw):
   try:
     return codecs.decode(raw, "unicode_escape")
@@ -1160,15 +1302,18 @@ def _idf_unquote(raw):
     return raw
 
 
-def _idf_bytes_to_value(raw):
+def _idf_bytes_raw(raw):
   text = _idf_unquote(raw)
   if isinstance(text, bytes):
-    data = text
-  else:
-    try:
-      data = text.encode("latin-1")
-    except Exception:
-      data = text.encode("utf-8", "replace")
+    return text
+  try:
+    return text.encode("latin-1")
+  except Exception:
+    return text.encode("utf-8", "replace")
+
+
+def _idf_bytes_to_value(raw):
+  data = _idf_bytes_raw(raw)
   if len(data) == 16:
     return _uuid_str(data) or data.hex()
   decoded = data.decode("utf-8", "replace")
@@ -1205,7 +1350,10 @@ def _parse_idf_entities(text):
       elif str_val:
         attrs[name] = _uuid_str(str_val.group(1)) or str_val.group(1)
       elif bytes_list:
-        attrs[name] = _idf_bytes_to_value(bytes_list[0])
+        if name == "__zprotobuf__":
+          attrs[name] = _idf_bytes_raw(bytes_list[0])
+        else:
+          attrs[name] = _idf_bytes_to_value(bytes_list[0])
       elif int_val:
         attrs[name] = int(int_val.group(1))
       elif bool_val:
@@ -1213,6 +1361,421 @@ def _parse_idf_entities(text):
     if attrs:
       entities.append(attrs)
   return entities
+
+
+def _zprotobuf_bytes(value):
+  if not value:
+    return b""
+  if isinstance(value, (bytes, bytearray)):
+    return bytes(value)
+  if isinstance(value, str):
+    try:
+      return value.encode("latin-1")
+    except Exception:
+      return value.encode("utf-8", "replace")
+  return b""
+
+
+def _zlib_decompress(data):
+  if not data:
+    return b""
+  for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS, zlib.MAX_WBITS | 16):
+    try:
+      return zlib.decompress(data, wbits)
+    except Exception:
+      continue
+  return data
+
+
+def _proto_read_varint(buf, idx):
+  value = 0
+  shift = 0
+  n = len(buf or b"")
+  while idx < n:
+    byte = buf[idx]
+    idx += 1
+    value |= (byte & 0x7F) << shift
+    if byte < 0x80:
+      return value, idx
+    shift += 7
+    if shift > 63:
+      break
+  return None, idx
+
+
+def _proto_decode(buf):
+  """Protobuf wire fields: field_number -> list of (wire_type, value)."""
+  fields = {}
+  idx = 0
+  n = len(buf or b"")
+  while idx < n:
+    key, idx = _proto_read_varint(buf, idx)
+    if key is None:
+      break
+    field_n = key >> 3
+    wire = key & 7
+    if wire == 0:
+      val, idx = _proto_read_varint(buf, idx)
+      if val is None:
+        break
+    elif wire == 1:
+      val = buf[idx:idx + 8]
+      idx += 8
+    elif wire == 2:
+      length, idx = _proto_read_varint(buf, idx)
+      if length is None:
+        break
+      val = buf[idx:idx + length]
+      idx += length
+    elif wire == 5:
+      val = buf[idx:idx + 4]
+      idx += 4
+    else:
+      break
+    fields.setdefault(field_n, []).append((wire, val))
+  return fields
+
+
+def _proto_varints(items):
+  nums = []
+  for wire, val in items or []:
+    if wire == 0 and val is not None:
+      nums.append(int(val))
+    elif wire == 2 and val:
+      idx = 0
+      while idx < len(val):
+        num, idx = _proto_read_varint(val, idx)
+        if num is None:
+          break
+        nums.append(int(num))
+  return nums
+
+
+def _proto_bytes_list(fields, number):
+  out = []
+  for wire, val in fields.get(number) or []:
+    if val and (wire == 2 or isinstance(val, (bytes, bytearray))):
+      out.append(bytes(val))
+  return out
+
+
+def _proto_first_varint(fields, number, default=0):
+  nums = _proto_varints(fields.get(number) or [])
+  return nums[0] if nums else default
+
+
+def _proto_str(fields, number):
+  items = _proto_bytes_list(fields, number)
+  if not items:
+    return ""
+  return items[0].decode("utf-8", "replace")
+
+
+def _proto_str_list(fields, number):
+  return [item.decode("utf-8", "replace") for item in _proto_bytes_list(fields, number)]
+
+
+def _proto_first_bytes(fields, number):
+  items = _proto_bytes_list(fields, number)
+  return items[0] if items else b""
+
+
+class _Attr(object):
+  def __init__(self, **kwargs):
+    self.__dict__.update(kwargs)
+
+
+_NSG_PROTO_NAMES = {
+    1: "kAll",
+    2: "kICMP",
+    3: "kTCP",
+    4: "kUDP",
+    5: "kICMPv6",
+}
+
+
+def _nsg_port_objs(fields, number):
+  rows = []
+  for raw in _proto_bytes_list(fields, number):
+    inner = _proto_decode(raw)
+    start = _proto_first_varint(inner, 1, 0)
+    end = _proto_first_varint(inner, 2, start)
+    rows.append(_Attr(start_port=start, end_port=end))
+  return rows
+
+
+def _nsg_icmp_objs(fields, number):
+  rows = []
+  for raw in _proto_bytes_list(fields, number):
+    inner = _proto_decode(raw)
+    rows.append(_Attr(
+        icmp_type=_proto_first_varint(inner, 1, 0),
+        icmp_code=_proto_first_varint(inner, 2, 0)))
+  return rows
+
+
+def _nsg_service_obj(raw):
+  fields = _proto_decode(raw)
+  protocol = _proto_first_varint(fields, 1, 0)
+
+  def _proto_name(value, names=_NSG_PROTO_NAMES):
+    return names.get(int(value or 0), str(value))
+
+  return _Attr(
+      protocol=protocol,
+      Protocol=_Attr(Name=_proto_name),
+      port_range_list=_nsg_port_objs(fields, 2),
+      icmp_type_code_list=_nsg_icmp_objs(fields, 3),
+      tcp_port_range_list=_nsg_port_objs(fields, 4),
+      udp_port_range_list=_nsg_port_objs(fields, 5),
+      icmp_v6_type_code_list=_nsg_icmp_objs(fields, 6),
+  )
+
+
+def _service_lists_from_zprotobuf(raw):
+  data = _zprotobuf_bytes(raw)
+  if not data:
+    return [], [], [], []
+  fields = _proto_decode(_zlib_decompress(data))
+  services = [_nsg_service_obj(item) for item in _proto_bytes_list(fields, 6)]
+  tcp, udp, icmp, icmp6 = _service_lists_from_service_list(services)
+  if not tcp:
+    starts = _proto_varints(fields.get(8) or [])
+    ends = _proto_varints(fields.get(9) or [])
+    for idx, start in enumerate(starts):
+      tcp.append(_port_row(start, ends[idx] if idx < len(ends) else start))
+  if not udp:
+    starts = _proto_varints(fields.get(10) or [])
+    ends = _proto_varints(fields.get(11) or [])
+    for idx, start in enumerate(starts):
+      udp.append(_port_row(start, ends[idx] if idx < len(ends) else start))
+  if not icmp:
+    types = _proto_varints(fields.get(12) or [])
+    codes = _proto_varints(fields.get(13) or [])
+    for idx, icmp_type in enumerate(types):
+      icmp.append(_icmp_row(icmp_type, codes[idx] if idx < len(codes) else 0))
+  if not icmp6:
+    types = _proto_varints(fields.get(14) or [])
+    codes = _proto_varints(fields.get(15) or [])
+    for idx, icmp_type in enumerate(types):
+      icmp6.append(_icmp_row(
+          icmp_type, codes[idx] if idx < len(codes) else 0))
+  return tcp, udp, icmp, icmp6
+
+
+def _inflate_nsg_zprotobuf(row):
+  if not isinstance(row, dict):
+    return row
+  has_ports = (
+      row.get("tcp_services") or row.get("udp_services") or
+      row.get("icmp_services") or row.get("icmp_v6_services") or
+      row.get("tcp_start_port_list") or row.get("udp_start_port_list"))
+  raw = row.get("__zprotobuf__")
+  if has_ports or not raw:
+    row.pop("__zprotobuf__", None)
+    return row
+  try:
+    tcp, udp, icmp, icmp6 = _service_lists_from_zprotobuf(raw)
+  except Exception:
+    row.pop("__zprotobuf__", None)
+    return row
+  if tcp:
+    row["tcp_services"] = tcp
+  if udp:
+    row["udp_services"] = udp
+  if icmp:
+    row["icmp_services"] = icmp
+  if icmp6:
+    row["icmp_v6_services"] = icmp6
+  row.pop("__zprotobuf__", None)
+  return row
+
+
+class _AllowType(object):
+  @staticmethod
+  def Name(value):
+    return {1: "kTypeAll", 2: "kTypeNone"}.get(int(value or 0), str(value))
+
+
+def _attr_base_rule_info(raw):
+  fields = _proto_decode(raw or b"")
+  return _Attr(
+      uuid=_proto_str(fields, 1),
+      description=_proto_str(fields, 2),
+      unique_id=_proto_first_varint(fields, 7, 0),
+      rule_name=_proto_str(fields, 8),
+  )
+
+
+def _attr_secured_group(raw):
+  if not raw:
+    return None
+  fields = _proto_decode(raw)
+  return _Attr(
+      category_uuid_list=_proto_str_list(fields, 1),
+      uuid=_proto_str(fields, 2),
+      unique_id=_proto_first_varint(fields, 3, 0),
+      entity_group_uuid_list=_proto_str_list(fields, 4),
+      category_selection_type=_proto_first_varint(fields, 5, 0),
+  )
+
+
+def _attr_endpoint(raw):
+  if not raw:
+    return None
+  fields = _proto_decode(raw)
+  entity = None
+  ent_raw = _proto_first_bytes(fields, 1)
+  if ent_raw:
+    ent_fields = _proto_decode(ent_raw)
+    entity = _Attr(
+        category_uuid_list=_proto_str_list(ent_fields, 1),
+        category_selection_type=_proto_first_varint(ent_fields, 2, 0),
+    )
+  return _Attr(
+      endpoint_entity=entity,
+      ip_subnet=_proto_str(fields, 2),
+      address_group_uuid=_proto_str(fields, 3),
+      allow_type=_proto_first_varint(fields, 4, 0),
+      AllowType=_AllowType,
+      entity_group_uuid_list=_proto_str_list(fields, 5),
+      ipv6_subnet=_proto_str(fields, 6),
+  )
+
+
+def _attr_rule_services(raw):
+  fields = _proto_decode(raw or b"")
+  ports = []
+  for item in _proto_bytes_list(fields, 2):
+    inner = _proto_decode(item)
+    ports.append(_Attr(
+        start_port=_proto_first_varint(inner, 1, 0),
+        end_port=_proto_first_varint(inner, 2, 0)))
+  icmp = []
+  for item in _proto_bytes_list(fields, 3):
+    inner = _proto_decode(item)
+    icmp.append(_Attr(
+        icmp_type=_proto_first_varint(inner, 1, 0),
+        icmp_code=_proto_first_varint(inner, 2, 0)))
+  icmp6 = []
+  for item in _proto_bytes_list(fields, 5):
+    inner = _proto_decode(item)
+    icmp6.append(_Attr(
+        icmp_type=_proto_first_varint(inner, 1, 0),
+        icmp_code=_proto_first_varint(inner, 2, 0)))
+  return _Attr(
+      protocol=_proto_first_varint(fields, 1, 0),
+      port_range_list=ports,
+      icmp_type_code_list=icmp,
+      service_group_uuid=_proto_str(fields, 4),
+      icmp_v6_type_code_list=icmp6,
+  )
+
+
+def _attr_application_rule(raw):
+  fields = _proto_decode(raw or b"")
+  return _Attr(
+      rule_info=_attr_base_rule_info(_proto_first_bytes(fields, 1)),
+      secured_group=_attr_secured_group(_proto_first_bytes(fields, 2)),
+      endpoint=_attr_endpoint(_proto_first_bytes(fields, 3)),
+      services=[_attr_rule_services(item) for item in _proto_bytes_list(fields, 4)],
+      direction=_proto_first_varint(fields, 5, 0),
+      network_function_uuid=_proto_str(fields, 7),
+  )
+
+
+def _attr_two_env_rule(raw):
+  fields = _proto_decode(raw or b"")
+  return _Attr(
+      rule_info=_attr_base_rule_info(_proto_first_bytes(fields, 1)),
+      first_secured_group=_attr_secured_group(_proto_first_bytes(fields, 2)),
+      second_secured_group=_attr_secured_group(_proto_first_bytes(fields, 3)),
+  )
+
+
+def _attr_multi_env_rule(raw):
+  fields = _proto_decode(raw or b"")
+  groups = []
+  all_raw = _proto_first_bytes(fields, 3)
+  if all_raw:
+    inner = _proto_decode(all_raw)
+    groups = [
+        _attr_secured_group(item) for item in _proto_bytes_list(inner, 1)]
+  return _Attr(
+      rule_info=_attr_base_rule_info(_proto_first_bytes(fields, 1)),
+      isolation_type=_proto_first_varint(fields, 2, 0),
+      all_to_all_isolation_group=_Attr(isolation_group_list=groups),
+  )
+
+
+def _attr_secured_group_rule(raw):
+  fields = _proto_decode(raw or b"")
+  return _Attr(
+      rule_info=_attr_base_rule_info(_proto_first_bytes(fields, 1)),
+      secured_group=_attr_secured_group(_proto_first_bytes(fields, 2)),
+      action=bool(_proto_first_varint(fields, 3, 0)),
+      services=[_attr_rule_services(item) for item in _proto_bytes_list(fields, 4)],
+  )
+
+
+def _attr_flex_rule(raw):
+  fields = _proto_decode(raw or b"")
+  return _Attr(
+      rule_info=_attr_base_rule_info(_proto_first_bytes(fields, 1)),
+      src_endpoint=_attr_endpoint(_proto_first_bytes(fields, 2)),
+      dest_endpoint=_attr_endpoint(_proto_first_bytes(fields, 3)),
+      services=[_attr_rule_services(item) for item in _proto_bytes_list(fields, 4)],
+      action=_proto_first_varint(fields, 5, 0),
+      direction=_proto_first_varint(fields, 6, 0),
+      rule_priority=_proto_first_varint(fields, 7, 0),
+      network_function_uuid=_proto_str(fields, 9),
+      applied_to_entity_group_uuid_list=_proto_str_list(fields, 10),
+      rule_ip_version=_proto_first_varint(fields, 11, 0),
+  )
+
+
+def _attr_rule(raw):
+  fields = _proto_decode(raw or b"")
+  kwargs = {}
+  app = _proto_first_bytes(fields, 1)
+  if app:
+    kwargs["application_rule"] = _attr_application_rule(app)
+  iso = _proto_first_bytes(fields, 2)
+  if iso:
+    kwargs["isolation_rule"] = _attr_two_env_rule(iso)
+  quar = _proto_first_bytes(fields, 3)
+  if quar:
+    kwargs["quarantine_rule"] = _attr_application_rule(quar)
+  sgr = _proto_first_bytes(fields, 4)
+  if sgr:
+    kwargs["secured_group_rule"] = _attr_secured_group_rule(sgr)
+  multi = _proto_first_bytes(fields, 5)
+  if multi:
+    kwargs["multi_env_isolation_rule"] = _attr_multi_env_rule(multi)
+  shared = _proto_first_bytes(fields, 6)
+  if shared:
+    kwargs["shared_services_rule"] = _attr_application_rule(shared)
+  flex = _proto_first_bytes(fields, 7)
+  if flex:
+    kwargs["flex_policy_rule"] = _attr_flex_rule(flex)
+  return _Attr(**kwargs)
+
+
+def _rules_from_policy_zprotobuf(raw):
+  data = _zprotobuf_bytes(raw)
+  if not data:
+    return None
+  fields = _proto_decode(_zlib_decompress(data))
+  rules = []
+  for entry_raw in _proto_bytes_list(fields, 6):
+    entry = _proto_decode(entry_raw)
+    value = _proto_first_bytes(entry, 2)
+    if not value:
+      continue
+    converted = convert_rule(_attr_rule(value))
+    if converted:
+      rules.append(converted)
+  return rules
 
 
 def _idfcli_entities(entity_types):
@@ -1226,6 +1789,55 @@ def _idfcli_entities(entity_types):
       rows.extend(parsed)
       break
   return rows, errors
+
+
+def dump_idfcli(output_dir, workers=8, timeout=180):
+  """Run idfcli get entitytype for every IDF_DUMP_TYPES and write JSON."""
+  dest = os.path.join(output_dir, "idfcli")
+  os.makedirs(dest, exist_ok=True)
+  index = {
+      "dumped_at": datetime.utcnow().isoformat() + "Z",
+      "entity_types": {},
+  }
+  errors = {}
+
+  def _one(entity_type):
+    parsed, err = _idfcli_one(entity_type, timeout=timeout)
+    rows = parsed or []
+    if entity_type in ("network_service_group", "service_group"):
+      for row in rows:
+        _inflate_nsg_zprotobuf(row)
+    else:
+      for row in rows:
+        if isinstance(row, dict):
+          row.pop("__zprotobuf__", None)
+    path = os.path.join(dest, "%s.json" % entity_type)
+    _write_json_file(path, rows)
+    raw = _IDF_RAW.get(entity_type) or ""
+    if raw:
+      txt_path = os.path.join(dest, "%s.txt" % entity_type)
+      with open(txt_path, "w") as handle:
+        handle.write(raw)
+    return entity_type, len(rows), err
+
+  LOG.info("DUMP idfcli types=%s workers=%s", len(IDF_DUMP_TYPES), workers)
+  with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+    futs = [pool.submit(_one, entity_type) for entity_type in IDF_DUMP_TYPES]
+    for fut in futs:
+      entity_type, count, err = fut.result()
+      index["entity_types"][entity_type] = {
+          "count": count,
+          "error": err or "",
+          "file": "%s.json" % entity_type,
+      }
+      if err:
+        errors["idfcli:%s" % entity_type] = err
+        LOG.warning("idfcli %s: %s", entity_type, err)
+      else:
+        LOG.info("idfcli %s count=%s", entity_type, count)
+  _write_json_file(os.path.join(dest, "index.json"), index)
+  LOG.info("DUMP idfcli wrote %s types under %s", len(IDF_DUMP_TYPES), dest)
+  return index, errors
 
 
 def _first_attr(row, *names, default=None):
@@ -1664,6 +2276,374 @@ def _map_category(row):
       "key": key,
       "value": value,
   }
+
+
+def _maybe_json(value):
+  if isinstance(value, (list, dict)):
+    return value
+  text = str(value or "").strip()
+  if not text:
+    return None
+  if text[0] not in "[{":
+    return None
+  try:
+    return json.loads(text)
+  except Exception:
+    return None
+
+
+def _port_rows_from_idf(row, kind):
+  rows = []
+  parsed = _maybe_json(_first_attr(row, "%s_services" % kind, default=None))
+  if isinstance(parsed, list):
+    for item in parsed:
+      if isinstance(item, dict):
+        start = item.get("start_port", item.get("start"))
+        end = item.get("end_port", item.get("end", start))
+        rows.append(_port_row(start, end, bool(item.get("is_all_allowed"))))
+      else:
+        text = str(item)
+        if "-" in text:
+          start, end = text.split("-", 1)
+          rows.append(_port_row(start, end))
+        elif text.isdigit():
+          rows.append(_port_row(text, text))
+    return rows
+  starts = _as_list(_first_attr(row, "%s_start_port_list" % kind, default=[]))
+  ends = _as_list(_first_attr(row, "%s_end_port_list" % kind, default=[]))
+  for idx, start in enumerate(starts):
+    rows.append(_port_row(start, ends[idx] if idx < len(ends) else start))
+  return rows
+
+
+def _icmp_rows_from_idf(row, kind):
+  rows = []
+  parsed = _maybe_json(_first_attr(row, "%s_services" % kind, default=None))
+  if isinstance(parsed, list):
+    for item in parsed:
+      if isinstance(item, dict):
+        rows.append(_icmp_row(
+            item.get("type"), item.get("code"),
+            bool(item.get("is_all_allowed"))))
+    return rows
+  types = _as_list(_first_attr(row, "%s_type_list" % kind, default=[]))
+  codes = _as_list(_first_attr(row, "%s_code_list" % kind, default=[]))
+  for idx, icmp_type in enumerate(types):
+    rows.append(_icmp_row(icmp_type, codes[idx] if idx < len(codes) else 0))
+  return rows
+
+
+def _map_address_group(row):
+  ipv4 = []
+  ipv6 = []
+  fqdns = []
+  ranges = []
+  for item in _as_list(_first_attr(
+      row, "ipv4_addresses", "ip_address_block_list", "cidr_list",
+      "subnets", default=[])):
+    text = str(item).strip()
+    if text:
+      ipv4.append(text)
+  for item in _as_list(_first_attr(row, "ipv6_addresses", "ipv6_subnets", default=[])):
+    text = str(item).strip()
+    if text:
+      ipv6.append(text)
+  for item in _as_list(_first_attr(row, "fqdns", "fqdn_addresses", default=[])):
+    text = str(item).strip()
+    if text:
+      fqdns.append(text)
+  parsed_ranges = _maybe_json(_first_attr(row, "ip_ranges", "ranges", default=None))
+  if isinstance(parsed_ranges, list):
+    ranges = parsed_ranges
+  elif isinstance(parsed_ranges, dict):
+    ranges = parsed_ranges.get("ipv4_ranges") or []
+  data = {
+      "ext_id": _uuid_str(_first_attr(row, "ext_id", "uuid", "id")) or "",
+      "name": _first_attr(row, "name") or "",
+      "description": _first_attr(row, "description") or "",
+      "ipv4_addresses": ipv4,
+      "ipv6_addresses": ipv6,
+      "ip_ranges": ranges,
+      "fqdns": fqdns,
+  }
+  project_id = _row_project_id(row)
+  if project_id:
+    _apply_project(data, project_id)
+  return data
+
+
+def _map_service_group(row):
+  if isinstance(row, dict):
+    _inflate_nsg_zprotobuf(row)
+  data = {
+      "ext_id": _uuid_str(_first_attr(row, "ext_id", "uuid", "id")) or "",
+      "name": _first_attr(row, "name") or "",
+      "description": _first_attr(row, "description") or "",
+      "tcp_services": _port_rows_from_idf(row, "tcp"),
+      "udp_services": _port_rows_from_idf(row, "udp"),
+      "icmp_services": _icmp_rows_from_idf(row, "icmp"),
+      "icmp_v6_services": _icmp_rows_from_idf(row, "icmp_v6"),
+  }
+  project_id = _row_project_id(row)
+  if project_id:
+    _apply_project(data, project_id)
+  return data
+
+
+def _idf_entity_refs(row, *names):
+  ids = []
+  seen = set()
+  for name in names:
+    for item in _as_list(_first_attr(row, name, default=[])):
+      uid = _uuid_str(item) or ""
+      if uid and uid not in seen:
+        seen.add(uid)
+        ids.append(uid)
+  return ids
+
+
+def _map_entity_group(row):
+  allowed = []
+  parsed = _maybe_json(_first_attr(
+      row, "allowed_entities", "allowed_config", default=None))
+  if isinstance(parsed, dict):
+    allowed = list(parsed.get("entities") or [])
+  elif isinstance(parsed, list):
+    allowed = parsed
+  if not allowed:
+    cats = _idf_entity_refs(
+        row, "category_uuid_list", "allowed_category_uuid_list")
+    if cats:
+      allowed.append({
+          "type": "VM",
+          "select_by": "CATEGORY_EXT_ID",
+          "reference_ext_ids": cats,
+      })
+    vms = _idf_entity_refs(row, "vm_uuid_list", "allowed_vm_uuid_list")
+    if vms:
+      allowed.append({
+          "type": "VM",
+          "select_by": "EXT_ID",
+          "reference_ext_ids": vms,
+      })
+    subs = _idf_entity_refs(row, "subnet_uuid_list", "allowed_subnet_uuid_list")
+    if subs:
+      allowed.append({
+          "type": "SUBNET",
+          "select_by": "EXT_ID",
+          "reference_ext_ids": subs,
+      })
+    ags = _idf_entity_refs(
+        row, "address_group_uuid_list", "allowed_address_group_uuid_list")
+    if ags:
+      allowed.append({
+          "type": "ADDRESS_GROUP",
+          "select_by": "EXT_ID",
+          "reference_ext_ids": ags,
+      })
+    kube = [
+        str(item) for item in _as_list(_first_attr(
+            row, "allowed_entity_kube_entities", default=[]))
+        if item]
+    refs = _idf_entity_refs(row, "allowed_entity_reference_uuids")
+    if kube:
+      allowed.append({
+          "type": "KUBE_CLUSTER",
+          "select_by": "EXT_ID",
+          "reference_ext_ids": refs,
+      })
+    elif refs:
+      allowed.append({
+          "type": "UNTYPED_REF",
+          "select_by": "EXT_ID",
+          "reference_ext_ids": refs,
+      })
+  excepted = []
+  parsed_ex = _maybe_json(_first_attr(
+      row, "except_entities", "except_config", default=None))
+  if isinstance(parsed_ex, dict):
+    excepted = list(parsed_ex.get("entities") or [])
+  elif isinstance(parsed_ex, list):
+    excepted = parsed_ex
+  data = {
+      "ext_id": _uuid_str(_first_attr(row, "ext_id", "uuid", "id")) or "",
+      "name": _first_attr(row, "name") or "",
+      "description": _first_attr(row, "description") or "",
+      "is_system_eg": _as_bool(_first_attr(row, "is_system_eg"), False),
+      "allowed_config": {"entities": allowed},
+      "except_config": {"entities": excepted},
+  }
+  project_id = _row_project_id(row)
+  if project_id:
+    _apply_project(data, project_id)
+  return data
+
+
+def _policy_enum_label(value, mapping, default):
+  if value in (None, ""):
+    return default
+  text = str(value).strip().upper().lstrip("K")
+  if text in mapping:
+    return mapping[text]
+  if text in mapping.values():
+    return text
+  try:
+    number = int(value)
+  except (TypeError, ValueError):
+    return default
+  for key, label in mapping.items():
+    if str(number) == key or number == key:
+      return label
+  return default
+
+
+def _map_policy(row):
+  # Live IDF ints: type 1=APP 2=ISO 3=QUAR; mode 1=MONITOR 2=ENFORCE;
+  # scope 1=ALL_VLAN 3=VPC 4=GLOBAL 5=VPC_AS_CATEGORY.
+  type_map = {
+      "1": "APPLICATION", "APPLICATION": "APPLICATION", "APP": "APPLICATION",
+      "2": "ISOLATION", "ISOLATION": "ISOLATION",
+      "3": "QUARANTINE", "QUARANTINE": "QUARANTINE",
+  }
+  mode_map = {
+      "0": "SAVE", "SAVE": "SAVE",
+      "1": "MONITOR", "MONITOR": "MONITOR",
+      "2": "ENFORCE", "ENFORCE": "ENFORCE", "APPLY": "ENFORCE",
+      "3": "SAVE",
+  }
+  scope_map = {
+      "1": "ALL_VLAN", "ALL_VLAN": "ALL_VLAN", "VLAN": "ALL_VLAN",
+      "2": "VPC", "3": "VPC", "VPC": "VPC", "VPC_LIST": "VPC",
+      "4": "GLOBAL", "GLOBAL": "GLOBAL",
+      "5": "VPC_AS_CATEGORY", "VPC_AS_CATEGORY": "VPC_AS_CATEGORY",
+  }
+  proto_rules = None
+  if isinstance(row, dict) and row.get("__zprotobuf__"):
+    try:
+      proto_rules = _rules_from_policy_zprotobuf(row.get("__zprotobuf__"))
+    except Exception as err:
+      LOG.warning("policy zprotobuf rules failed name=%s: %s",
+                  _first_attr(row, "name") or "", err)
+      proto_rules = None
+    row.pop("__zprotobuf__", None)
+  rules = _first_attr(row, "rules", "rule_list", default=[])
+  parsed_rules = _maybe_json(rules)
+  if parsed_rules is not None:
+    rules = parsed_rules
+  if not isinstance(rules, list):
+    rules = []
+  wrapped = []
+  if proto_rules is not None:
+    wrapped = proto_rules
+  else:
+    for rule in rules:
+      if not isinstance(rule, dict):
+        continue
+      if "spec" in rule or "data" in rule:
+        wrapped.append(rule)
+      else:
+        wrapped.append({"spec": rule, "type": rule.get("type") or "APPLICATION"})
+  if not wrapped and proto_rules is None:
+    spec = {}
+    src_cats = _idf_entity_refs(
+        row, "source_category_uuid_list", "src_category_references")
+    dst_cats = _idf_entity_refs(
+        row, "destination_category_uuid_list", "dest_category_references")
+    sec_cats = _idf_entity_refs(
+        row, "secured_group_category_uuid_list",
+        "secured_group_category_references")
+    src_ag = _idf_entity_refs(
+        row, "source_address_group_uuid_list", "src_address_group_references")
+    dst_ag = _idf_entity_refs(
+        row, "destination_address_group_uuid_list",
+        "dest_address_group_references")
+    sgs = _idf_entity_refs(row, "service_group_uuid_list", "service_group_references")
+    sec_eg = _idf_entity_refs(
+        row, "secured_group_entity_group_uuid_list",
+        "secured_group_entity_group_reference")
+    src_eg = _idf_entity_refs(
+        row, "source_entity_group_uuid_list", "src_entity_group_reference")
+    dst_eg = _idf_entity_refs(
+        row, "destination_entity_group_uuid_list", "dest_entity_group_reference")
+    pol_type = _policy_enum_label(
+        _first_attr(row, "policy_type", "type"), type_map, "APPLICATION")
+    if src_cats:
+      spec["src_category_references"] = src_cats
+    if dst_cats:
+      spec["dest_category_references"] = dst_cats
+    if sec_cats:
+      spec["secured_group_category_references"] = sec_cats
+    if src_ag:
+      spec["src_address_group_references"] = src_ag
+    if dst_ag:
+      spec["dest_address_group_references"] = dst_ag
+    if sgs:
+      spec["service_group_references"] = sgs
+    if sec_eg:
+      spec["secured_group_entity_group_reference"] = sec_eg[0]
+    if src_eg:
+      spec["src_entity_group_reference"] = src_eg[0]
+    if dst_eg:
+      spec["dest_entity_group_reference"] = dst_eg[0]
+    if pol_type == "ISOLATION" and sec_cats:
+      spec["spec"] = {
+          "isolation_groups": [
+              {
+                  "group_category_references": [cid],
+                  "group_category_associated_entity_type": "VM",
+              }
+              for cid in sec_cats
+          ]
+      }
+    rule_ids = _idf_entity_refs(row, "rule_uuid_list")
+    rule_type = "MULTI_ENV_ISOLATION" if pol_type == "ISOLATION" else "APPLICATION"
+    if spec or rule_ids:
+      wrapped.append({
+          "ext_id": rule_ids[0] if rule_ids else "",
+          "type": rule_type,
+          "spec": spec,
+      })
+  data = {
+      "ext_id": _uuid_str(_first_attr(row, "ext_id", "uuid", "id")) or "",
+      "name": _first_attr(row, "name", "policy_name") or "",
+      "description": _first_attr(row, "description") or "",
+      "type": _policy_enum_label(
+          _first_attr(row, "policy_type", "type"), type_map, "APPLICATION"),
+      "state": _policy_enum_label(
+          _first_attr(row, "mode", "state", "policy_mode"), mode_map, "SAVE"),
+      "scope": _policy_enum_label(
+          _first_attr(row, "scope", "policy_scope"), scope_map, "ALL_VLAN"),
+      "vpc_references": _idf_entity_refs(
+          row, "vpc_uuid_list", "vpc_references", "vpc_uuid"),
+      "scope_references": _idf_entity_refs(
+          row, "reference_uuid_list", "scope_references"),
+      "priority": _int_attr(row, "policy_priority", "priority", default=0),
+      "is_ipv6_traffic_allowed": _as_bool(
+          _first_attr(row, "allow_ipv6_traffic", "is_ipv6_traffic_allowed"),
+          False),
+      "is_logging_enabled": _as_bool(
+          _first_attr(row, "is_policy_hitlog_enabled", "is_logging_enabled"),
+          False),
+      "rules": wrapped,
+  }
+  project_id = _row_project_id(row)
+  if project_id:
+    _apply_project(data, project_id)
+  return {"data": data}
+
+
+def _fetch_mapped(entity_types, mapper):
+  rows, errors = _idf_mapped(entity_types, mapper)
+  for err in errors:
+    LOG.warning("%s: %s", entity_types, err)
+  return rows
+
+
+def _load_json_if_present(path, default):
+  if not os.path.isfile(path):
+    return default
+  with open(path, "r") as handle:
+    return json.load(handle) or default
 
 
 def _int_attr(row, *names, default=0):
@@ -2547,10 +3527,11 @@ def fetch_clusters(_interfaces):
   for err in errors:
     LOG.warning("clusters fallback: %s", err)
   ncli_rows = []
-  try:
-    ncli_rows = _ncli_registered_clusters()
-  except Exception as err:
-    LOG.debug("clusters ncli vip enrich skipped: %s", err)
+  if not _IDF_FILE_DIR:
+    try:
+      ncli_rows = _ncli_registered_clusters()
+    except Exception as err:
+      LOG.debug("clusters ncli vip enrich skipped: %s", err)
   by_uuid = {}
   by_name = {}
   for rec in ncli_rows:
@@ -2670,27 +3651,40 @@ def fetch_categories(_interfaces):
 
 def fetch_unique_uuids():
   LOG.info("DUMP start vlan/global unique uuids")
-  zkcat = "/usr/local/nutanix/cluster/bin/zkcat"
+  zkcats = (
+      "/home/nutanix/cluster/bin/zkcat",
+      "/usr/local/nutanix/cluster/bin/zkcat",
+  )
   paths = {
       "vlan_unique_uuid": "/appliance/logical/flow/vlan_unique_uuid",
       "global_unique_uuid": "/appliance/logical/flow/global_unique_uuid",
   }
   out = {}
   for key, zk_path in paths.items():
-    if not os.path.exists(zkcat):
+    value = ""
+    found_bin = False
+    for zkcat in zkcats:
+      if not (os.path.exists(zkcat) and os.access(zkcat, os.X_OK)):
+        continue
+      found_bin = True
+      try:
+        proc = subprocess.run(
+            [zkcat, zk_path], capture_output=True, text=True, check=False,
+            timeout=20)
+      except Exception as err:
+        LOG.error("DUMP %s failed: %s", key, err)
+        continue
+      text = (proc.stdout or "").strip()
+      err_text = (proc.stderr or "").strip()
+      if "no node" in ("%s %s" % (text, err_text)).lower():
+        continue
+      if proc.returncode == 0 and text:
+        value = text.splitlines()[-1].strip()
+        break
+    if not found_bin:
       LOG.warning("zkcat missing; skip %s", key)
-      out[key] = ""
-      continue
-    try:
-      proc = subprocess.run(
-          [zkcat, zk_path], capture_output=True, text=True, check=False,
-          timeout=20)
-      value = (proc.stdout or "").strip()
-      out[key] = value
-      LOG.info("DUMP %s=%s", key, value or "<empty>")
-    except Exception as err:
-      LOG.error("DUMP %s failed: %s", key, err)
-      out[key] = ""
+    out[key] = value
+    LOG.info("DUMP %s=%s", key, value or "<empty>")
   return out
 
 
@@ -2715,7 +3709,7 @@ def fetch_fqdn_map(interfaces):
       interfaces, "fqdn_resolution_manager", "fqdn_manager")
   payload = _call_first(manager, [
       "iter_all", "get_all", "list", "get_fqdn_to_ip_mapping"])
-  for item in _unwrap_list(payload) or _iter_manager(manager):
+  for item in _unwrap_list(payload) or (_iter_manager(manager) if manager else []):
     proto = _item_proto(item)
     fqdn = getattr(proto, "fqdn", None) or getattr(item, "fqdn", None)
     ips = []
@@ -3032,6 +4026,33 @@ def _port_set_get_record(parsed, ps_uuid):
   return parsed
 
 
+def _normalize_port_set_get(gets):
+  """Unwrap atlas_cli {data: {uuid: rec}} accidentally stored as the rec."""
+  if not isinstance(gets, dict):
+    return gets or {}
+  out = {}
+  for uid, rec in gets.items():
+    if not isinstance(rec, dict):
+      continue
+    inner = rec
+    nested = rec.get(uid)
+    if isinstance(nested, dict) and (
+        "virtual_nic_uuid_list" in nested or nested.get("name") is not None):
+      inner = nested
+    elif "virtual_nic_uuid_list" not in rec:
+      candidates = [
+          value for key, value in rec.items()
+          if key != "uuid" and isinstance(value, dict) and (
+              "virtual_nic_uuid_list" in value or value.get("name") is not None)]
+      if len(candidates) == 1:
+        inner = candidates[0]
+    if isinstance(inner, dict):
+      inner = dict(inner)
+      inner.setdefault("uuid", uid)
+    out[uid] = inner
+  return out
+
+
 def fetch_port_set_get(platform_info, uuids, workers, timeout_secs, errors):
   gets = {}
   if not uuids:
@@ -3045,7 +4066,10 @@ def fetch_port_set_get(platform_info, uuids, workers, timeout_secs, errors):
         platform_info, ["port_set.get", ps_uuid], per_timeout, log_cmd=False)
     if isinstance(parsed, dict) and parsed.get("status") not in (None, 0, "0"):
       raise RuntimeError("status=%s" % parsed.get("status"))
-    return _port_set_get_record(parsed, ps_uuid)
+    rec = _port_set_get_record(parsed, ps_uuid)
+    if isinstance(rec, dict):
+      rec.setdefault("uuid", ps_uuid)
+    return rec
 
   failed = []
   with ThreadPoolExecutor(max_workers=max(1, min(workers, len(uuids)))) as pool:
@@ -3069,6 +4093,48 @@ def fetch_port_set_get(platform_info, uuids, workers, timeout_secs, errors):
   LOG.info(
       "DUMP done port_set_get got=%s failed=%s", len(gets), len(failed))
   return gets
+
+
+def dump_atlas_port_sets(output_dir, workers=32, timeout_secs=1800):
+  """atlas_cli port_set.list + port_set.get into dump JSON files."""
+  errors = {}
+  info = detect_msp_platform()
+  list_timeout = max(60, min(300, int(timeout_secs)))
+  try:
+    rows = fetch_port_set_list(info, list_timeout)
+  except Exception as err:
+    errors["port_set_list"] = str(err)
+    LOG.error("DATASET port_set_list FAILED: %s", err)
+    rows = []
+  _write_json_file(os.path.join(output_dir, "port_set_list.json"), rows)
+  uuids = []
+  seen = set()
+  for item in rows:
+    uid = _port_set_uuid(item)
+    if uid and uid not in seen:
+      seen.add(uid)
+      uuids.append(uid)
+  try:
+    gets = fetch_port_set_get(
+        info, uuids, max(1, int(workers)), max(60, int(timeout_secs)), errors)
+  except Exception as err:
+    errors["port_set_get"] = str(err)
+    LOG.error("DATASET port_set_get FAILED: %s", err)
+    gets = {}
+  gets = _normalize_port_set_get(gets)
+  _write_json_file(os.path.join(output_dir, "port_set_get.json"), gets)
+  rec = {
+      "ran": True,
+      "platform": info.get("platform") or "",
+      "detection_method": info.get("detection_method") or "",
+      "list_count": len(rows),
+      "get_count": len(gets),
+      "errors": errors,
+  }
+  LOG.info(
+      "DUMP atlas port_set list=%s get=%s platform=%s",
+      rec["list_count"], rec["get_count"], rec["platform"])
+  return rec
 
 
 # Host OVS via AHV Gateway mTLS; OVN NB/SB via kubectl on CMSP PC.
@@ -4390,79 +5456,178 @@ def _merge_network_functions(payload):
     LOG.info("DUMP merged %s network_functions from by_id lookups", extra)
 
 
+def _enrich_entity_group_refs(payload):
+  """IDF EG refs are untyped; join category UUIDs and EG name."""
+  cat_ids = set()
+  for row in payload.get("categories") or []:
+    uid = row.get("ext_id") or ""
+    if uid:
+      cat_ids.add(uid)
+  classified = 0
+  for eg in payload.get("entity_groups") or []:
+    ents = ((eg.get("allowed_config") or {}).get("entities")) or []
+    name = str(eg.get("name") or "").lower()
+    for ent in ents:
+      if str(ent.get("type") or "") != "UNTYPED_REF":
+        continue
+      refs = list(ent.get("reference_ext_ids") or [])
+      if any(uid in cat_ids for uid in refs):
+        if "subnet" in name:
+          ent["type"] = "SUBNET"
+        elif "vpc" in name:
+          ent["type"] = "VPC"
+        else:
+          ent["type"] = "VM"
+        ent["select_by"] = "CATEGORY_EXT_ID"
+      else:
+        ent["type"] = "VM"
+        ent["select_by"] = "EXT_ID"
+      classified += 1
+  LOG.info("DUMP entity_group refs classified=%s categories=%s",
+           classified, len(cat_ids))
+
+
 def _post_fetch_enrich(payload):
   _merge_network_functions(payload)
   _enrich_nics_and_vlan_vpc(payload)
   _enrich_projects(payload)
+  _enrich_entity_group_refs(payload)
   _expand_service_and_function_details(payload)
   _expand_fqdn_details(payload)
 
 
-def main(argv):
-  try:
-    argv = FLAGS(argv)
-  except gflags.FlagsError as err:
-    print("%s\nUsage: %s ARGS\n%s" % (err, sys.argv[0], FLAGS))
-    return 1
-  del argv
-
-  output_dir = FLAGS.output_dir or "/tmp/flow_pc_neo4j_prefetch"
+def process_dump(dump_dir, output_dir=None, workers=16, timeout_secs=90,
+                 fail_on_error=False):
+  """Map idfcli JSON into prefetch files. No live PC APIs."""
+  global _IDF_FILE_DIR
+  dump_dir = os.path.abspath(dump_dir)
+  output_dir = os.path.abspath(output_dir or dump_dir)
+  idf_dir = os.path.join(dump_dir, "idfcli")
+  if not os.path.isdir(idf_dir):
+    raise SystemExit("process: no idfcli/ under %s" % dump_dir)
   os.makedirs(output_dir, exist_ok=True)
-  combined_path = FLAGS.output or os.path.join(output_dir, "all.json")
-  log_file = FLAGS.log_file or os.path.join(output_dir, "dump.log")
+  log_file = os.path.join(output_dir, "process.log")
   _setup_logging(log_file)
-  workers = max(1, int(FLAGS.workers))
+  _IDF_FILE_DIR = idf_dir
+  _IDF_RESULTS.clear()
+  combined_path = os.path.join(output_dir, "all.json")
+  errors = {}
+  uuids = _load_json_if_present(
+      os.path.join(dump_dir, "unique_uuids.json"), {})
+  if not isinstance(uuids, dict):
+    uuids = {}
+  if not (uuids.get("vlan_unique_uuid") and uuids.get("global_unique_uuid")):
+    meta = _load_json_if_present(os.path.join(dump_dir, "meta.json"), {})
+    if isinstance(meta, dict):
+      uuids.setdefault("vlan_unique_uuid", meta.get("vlan_unique_uuid") or "")
+      uuids.setdefault(
+          "global_unique_uuid", meta.get("global_unique_uuid") or "")
+  payload = {
+      "source": "flow_pc_process",
+      "dumped_at": datetime.utcnow().isoformat() + "Z",
+      "platform": "",
+      "platform_detection_method": "process_idfcli",
+      "smsp_cluster_uuid": "",
+      "vlan_unique_uuid": uuids.get("vlan_unique_uuid") or "",
+      "global_unique_uuid": uuids.get("global_unique_uuid") or "",
+      "ahv_gateway": _load_json_if_present(
+          os.path.join(dump_dir, "ahv_gateway.json"), {}),
+      "cmsp_ovn": _load_json_if_present(
+          os.path.join(dump_dir, "cmsp_ovn.json"), {}),
+      "port_set_list": _load_json_if_present(
+          os.path.join(dump_dir, "port_set_list.json"), []),
+      "port_set_get": _normalize_port_set_get(_load_json_if_present(
+          os.path.join(dump_dir, "port_set_get.json"), {})),
+  }
+  jobs = [
+      ("hosts", lambda: fetch_hosts(None)),
+      ("fqdn_to_ip_map", lambda: fetch_fqdn_map(None)),
+      ("vms", lambda: fetch_vms(None)),
+      ("subnets", lambda: fetch_subnets(None)),
+      ("vpcs", lambda: fetch_vpcs(None)),
+      ("clusters", lambda: fetch_clusters(None)),
+      ("projects", lambda: fetch_projects(None)),
+      ("categories", lambda: fetch_categories(None)),
+      ("network_functions", lambda: fetch_network_functions(None)),
+      ("entity_capabilities", lambda: fetch_entity_capabilities(None)),
+      ("address_groups", lambda: _fetch_mapped(
+          ("address_group", "network_address_group"), _map_address_group)),
+      ("service_groups", lambda: _fetch_mapped(
+          ("service_group", "network_service_group"), _map_service_group)),
+      ("entity_groups", lambda: _fetch_mapped(
+          ("entity_group", "network_entity_group"), _map_entity_group)),
+      ("policies", lambda: _fetch_mapped(
+          ("network_security_policy", "security_policy"), _map_policy)),
+  ]
+  payload.update(_run_jobs_parallel(jobs, workers, timeout_secs, errors))
+  try:
+    payload["network_function_by_id"] = fetch_network_function_by_id(
+        None, payload.get("network_functions") or [], [])
+    _post_fetch_enrich(payload)
+  except Exception as err:
+    errors["post_fetch_enrich"] = str(err)
+    LOG.error("post_fetch_enrich FAILED: %s", err)
+  payload["dump_errors"] = errors
+  _write_outputs(payload, output_dir, combined_path, workers)
+  LOG.info("PROCESS wrote prefetch JSON under %s", output_dir)
+  LOG.info(
+      "  policies=%s address_groups=%s service_groups=%s entity_groups=%s "
+      "port_set_list=%s port_set_get=%s",
+      len(payload.get("policies") or []),
+      len(payload.get("address_groups") or []),
+      len(payload.get("service_groups") or []),
+      len(payload.get("entity_groups") or []),
+      len(payload.get("port_set_list") or []),
+      len(payload.get("port_set_get") or {}))
+  if errors:
+    LOG.warning("Process errors: %s", ", ".join(sorted(errors)))
+    return 2 if fail_on_error else 0
+  return 0
 
+
+def dump_collect(output_dir, workers=8, skip_idf=False, skip_ahv=False,
+                 skip_cmsp=False, skip_atlas=False, ahv_gw_timeout=1800,
+                 cmsp_ovn_timeout=1800, atlas_timeout=1800,
+                 atlas_get_workers=32, idf_timeout=180, fail_on_error=False,
+                 log_file="", combined_path=""):
+  """PC dump: idfcli + OVN + OVS + atlas_cli. No FlowInterfaces or convert."""
+  os.makedirs(output_dir, exist_ok=True)
+  combined_path = combined_path or os.path.join(output_dir, "all.json")
+  log_file = log_file or os.path.join(output_dir, "dump.log")
+  _setup_logging(log_file)
+  workers = max(1, int(workers))
   LOG.info("logs=%s combined=%s output_dir=%s",
            log_file, combined_path, output_dir)
-
-  if FLAGS.from_json:
-    LOG.info("Splitting existing dump %s (no live fetch)", FLAGS.from_json)
-    with open(FLAGS.from_json, "r") as handle:
-      payload = json.load(handle)
-    _enrich_projects(payload)
-    _expand_service_and_function_details(payload)
-    _expand_fqdn_details(payload)
-    _write_outputs(payload, output_dir, combined_path, workers)
-    LOG.info("Split complete under %s", output_dir)
-    return 0
-
-  timeout_secs = max(15, int(FLAGS.dataset_timeout_secs))
-  atlas_timeout_secs = max(30, int(FLAGS.atlas_timeout_secs))
-  atlas_get_workers = max(1, int(FLAGS.atlas_get_workers))
-  skip_ahv = getattr(FLAGS, "skip_ahv_gateway", False)
-  skip_cmsp = getattr(FLAGS, "skip_cmsp_ovn", False)
-  ahv_gw_timeout = max(
-      60, int(getattr(FLAGS, "ahv_gateway_timeout_secs", 1800) or 1800))
-  cmsp_ovn_timeout = max(
-      60, int(getattr(FLAGS, "cmsp_ovn_timeout_secs", 1800) or 1800))
   LOG.info(
-      "workers=%s atlas_get_workers=%s timeout=%ss atlas_timeout=%ss "
-      "skip_atlas=%s skip_ahv_gateway=%s skip_cmsp_ovn=%s "
-      "ahv_gw_timeout=%ss cmsp_ovn_timeout=%ss",
-      workers, atlas_get_workers, timeout_secs, atlas_timeout_secs,
-      FLAGS.skip_atlas, skip_ahv, skip_cmsp,
-      ahv_gw_timeout, cmsp_ovn_timeout)
+      "dump=idfcli+OVN+OVS+atlas skip_idfcli=%s skip_ahv_gateway=%s "
+      "skip_cmsp_ovn=%s skip_atlas=%s workers=%s ahv_gw_timeout=%ss "
+      "cmsp_ovn_timeout=%ss atlas_timeout=%ss",
+      skip_idf, skip_ahv, skip_cmsp, skip_atlas, workers, ahv_gw_timeout,
+      cmsp_ovn_timeout, atlas_timeout)
 
   errors = {}
   payload = {
-      "source": "flow_pc_dump_for_neo4j",
+      "source": "flow_pc_dump",
+      "collects": ["idfcli", "ovn", "ovs", "atlas"],
       "dumped_at": datetime.utcnow().isoformat() + "Z",
-      "platform": "",
-      "platform_detection_method": "",
-      "smsp_cluster_uuid": "",
+      "idfcli": {},
+      "ahv_gateway": {},
+      "cmsp_ovn": {},
+      "atlas": {},
   }
-  payload["port_set_list"] = []
-  payload["port_set_get"] = {}
-  payload["ahv_gateway"] = {}
-  payload["cmsp_ovn"] = {}
-  write_fut = None
 
-  # Finish OVS/OVN before FlowInterfaces so a Zeus abort still leaves dumps.
-  LOG.info("Collecting AHV Gateway OVS + CMSP OVN NB/SB first")
-  with ThreadPoolExecutor(max_workers=2) as ovn_ovs:
+  LOG.info("Collecting idfcli + AHV Gateway OVS + CMSP OVN + atlas_cli")
+  with ThreadPoolExecutor(max_workers=4) as pool:
+    idf_fut = None
     ahv_gw_fut = None
     cmsp_ovn_fut = None
+    atlas_fut = None
+    if skip_idf:
+      LOG.info("Skipping idfcli (--skip_idfcli)")
+      payload["idfcli"] = {"ran": False, "error": "skipped (--skip_idfcli)"}
+    else:
+      idf_fut = pool.submit(
+          dump_idfcli, output_dir, min(8, workers), idf_timeout)
     if skip_ahv:
       LOG.info("Skipping AHV Gateway collect (--skip_ahv_gateway)")
       payload["ahv_gateway"] = {
@@ -4472,7 +5637,7 @@ def main(argv):
           "ssh_to_ahv": False,
       }
     else:
-      ahv_gw_fut = ovn_ovs.submit(
+      ahv_gw_fut = pool.submit(
           fetch_ahv_gateway_host_state, output_dir, None, None, ahv_gw_timeout)
     if skip_cmsp:
       LOG.info("Skipping CMSP OVN NB/SB kubectl dump (--skip_cmsp_ovn)")
@@ -4484,8 +5649,24 @@ def main(argv):
           "transport": "kubectl",
       }
     else:
-      cmsp_ovn_fut = ovn_ovs.submit(
+      cmsp_ovn_fut = pool.submit(
           fetch_cmsp_ovn_nb_sb, output_dir, cmsp_ovn_timeout)
+    if skip_atlas:
+      LOG.info("Skipping atlas_cli (--skip_atlas)")
+      payload["atlas"] = {"ran": False, "error": "skipped (--skip_atlas)"}
+    else:
+      atlas_fut = pool.submit(
+          dump_atlas_port_sets, output_dir,
+          max(1, int(atlas_get_workers)), atlas_timeout)
+    if idf_fut is not None:
+      try:
+        index, idf_errors = idf_fut.result()
+        payload["idfcli"] = index
+        errors.update(idf_errors)
+      except Exception as err:
+        errors["idfcli"] = str(err)
+        payload["idfcli"] = {"ran": False, "error": str(err)}
+        LOG.error("DATASET idfcli FAILED: %s", err)
     if ahv_gw_fut is not None:
       try:
         payload["ahv_gateway"] = ahv_gw_fut.result()
@@ -4521,191 +5702,39 @@ def main(argv):
         cmsp = payload.get("cmsp_ovn") or {}
         if not cmsp.get("complete") and cmsp.get("error"):
           errors["cmsp_ovn"] = cmsp["error"]
+    if atlas_fut is not None:
+      try:
+        payload["atlas"] = atlas_fut.result()
+      except Exception as err:
+        errors["atlas"] = str(err)
+        payload["atlas"] = {"ran": False, "error": str(err)}
+        LOG.error("DATASET atlas FAILED: %s", err)
+      else:
+        atlas_rec = payload.get("atlas") or {}
+        errors.update(atlas_rec.get("errors") or {})
+
+  uuids = fetch_unique_uuids()
+  payload["vlan_unique_uuid"] = uuids.get("vlan_unique_uuid") or ""
+  payload["global_unique_uuid"] = uuids.get("global_unique_uuid") or ""
+  _write_json_file(os.path.join(output_dir, "unique_uuids.json"), uuids)
+
+  payload["dump_errors"] = errors
   _write_json_file(
       os.path.join(output_dir, "ahv_gateway.json"),
       payload.get("ahv_gateway") or {})
   _write_json_file(
       os.path.join(output_dir, "cmsp_ovn.json"),
       payload.get("cmsp_ovn") or {})
+  _write_json_file(os.path.join(output_dir, "dump_errors.json"), errors)
+  _write_json_file(combined_path, payload)
 
-  LOG.info("FlowInterfaces + platform detect in parallel (no v4_client)")
-  try:
-    with ThreadPoolExecutor(max_workers=1) as pool:
-      plat_fut = pool.submit(detect_msp_platform)
-      interfaces = FlowInterfaces()
-      platform_info = plat_fut.result()
-  except Exception as err:
-    LOG.error("FlowInterfaces/platform detect FAILED: %s", err)
-    errors["flow_interfaces"] = str(err)
-    interfaces = None
-    platform_info = {
-        "platform": "",
-        "detection_method": "failed",
-        "smsp_cluster_uuid": "",
-    }
-  payload["platform"] = platform_info.get("platform")
-  payload["platform_detection_method"] = platform_info.get("detection_method")
-  payload["smsp_cluster_uuid"] = platform_info.get("smsp_cluster_uuid") or ""
-  LOG.info(
-      "Platform %s (method=%s smsp_uuid=%s)",
-      platform_info.get("platform"),
-      platform_info.get("detection_method"),
-      platform_info.get("smsp_cluster_uuid") or "<none>")
-  if interfaces is None:
-    LOG.warning("Skipping Flow/Atlas datasets; OVN/OVS already written")
-    payload["dump_errors"] = errors
-    _write_outputs(payload, output_dir, combined_path, workers)
-    return 1 if FLAGS.fail_on_error else 0
-  LOG.info("FlowInterfaces ready")
-
-  jobs = [
-      ("address_groups", lambda: fetch_address_groups(interfaces)),
-      ("service_groups", lambda: fetch_service_groups(interfaces)),
-      ("entity_groups", lambda: fetch_entity_groups(interfaces)),
-      ("policies", lambda: fetch_policies(interfaces)),
-      ("hosts", lambda: fetch_hosts(interfaces)),
-      ("unique_uuids", fetch_unique_uuids),
-      ("fqdn_to_ip_map", lambda: fetch_fqdn_map(interfaces)),
-      ("vms", lambda: fetch_vms(interfaces)),
-      ("subnets", lambda: fetch_subnets(interfaces)),
-      ("vpcs", lambda: fetch_vpcs(interfaces)),
-      ("clusters", lambda: fetch_clusters(interfaces)),
-      ("projects", lambda: fetch_projects(interfaces)),
-      ("categories", lambda: fetch_categories(interfaces)),
-      ("network_functions", lambda: fetch_network_functions(interfaces)),
-      ("entity_capabilities", lambda: fetch_entity_capabilities(interfaces)),
-  ]
-
-  def _atlas_list_and_get():
-    rows = fetch_port_set_list(platform_info, atlas_timeout_secs)
-    uuids = []
-    seen = set()
-    for item in rows or []:
-      ps_uuid = _port_set_uuid(item)
-      if ps_uuid and ps_uuid not in seen:
-        seen.add(ps_uuid)
-        uuids.append(ps_uuid)
-    gets = {}
-    if uuids:
-      gets = fetch_port_set_get(
-          platform_info, uuids, atlas_get_workers, atlas_timeout_secs, errors)
-    else:
-      LOG.info("Skipping port_set.get (no UUIDs from port_set.list)")
-    return rows or [], gets
-
-  with ThreadPoolExecutor(max_workers=6) as coordinator:
-    fetch_fut = coordinator.submit(
-        _run_jobs_parallel, jobs, workers, timeout_secs, errors)
-    atlas_fut = None
-    if FLAGS.skip_atlas:
-      LOG.info("Skipping atlas_cli port_set dumps (--skip_atlas)")
-    else:
-      atlas_fut = coordinator.submit(_atlas_list_and_get)
-    payload.update(fetch_fut.result())
-
-    unique = payload.pop("unique_uuids", {}) or {}
-    payload["vlan_unique_uuid"] = unique.get("vlan_unique_uuid", "")
-    payload["global_unique_uuid"] = unique.get("global_unique_uuid", "")
-    try:
-      payload["network_function_by_id"] = fetch_network_function_by_id(
-          interfaces, payload.get("network_functions") or [],
-          _policy_nf_uuids(payload))
-      _post_fetch_enrich(payload)
-    except Exception as err:
-      errors["post_fetch_enrich"] = str(err)
-      LOG.error("post_fetch_enrich FAILED: %s", err)
-
-    skip_late = (
-        "port_set_list", "port_set_get", "ahv_gateway",
-        "cmsp_ovn", "dump_errors")
-    write_fut = None
-    late_pending = [
-        fut for fut in (atlas_fut,)
-        if fut is not None and not fut.done()]
-    if late_pending:
-      write_fut = coordinator.submit(
-          _write_outputs, payload, output_dir, combined_path, workers,
-          skip_late, False)
-    if atlas_fut is not None:
-      try:
-        payload["port_set_list"], payload["port_set_get"] = atlas_fut.result()
-      except Exception as err:
-        errors["port_set_list"] = str(err)
-        LOG.error("DATASET port_set_list/get FAILED: %s", err)
-    if write_fut is not None:
-      write_fut.result()
-
-  payload["dump_errors"] = errors
-  if write_fut is not None:
-    _write_json_file(
-        os.path.join(output_dir, "port_set_list.json"),
-        payload.get("port_set_list") or [])
-    _write_json_file(
-        os.path.join(output_dir, "port_set_get.json"),
-        payload.get("port_set_get") or {})
-    _write_json_file(
-        os.path.join(output_dir, "ahv_gateway.json"),
-        payload.get("ahv_gateway") or {})
-    _write_json_file(
-        os.path.join(output_dir, "cmsp_ovn.json"),
-        payload.get("cmsp_ovn") or {})
-    _write_json_file(os.path.join(output_dir, "dump_errors.json"), errors)
-    _write_json_file(combined_path, payload)
-  else:
-    _write_outputs(payload, output_dir, combined_path, workers)
-
-  LOG.info("===== DUMP SUMMARY =====")
-  for key in (
-      "address_groups", "service_groups", "entity_groups", "policies",
-      "vms", "subnets", "vpcs", "hosts", "clusters", "projects",
-      "categories", "network_functions"):
-    value = payload.get(key) or []
-    LOG.info("  %-22s %s", key, len(value) if isinstance(value, list) else value)
-  LOG.info("  %-22s %s", "vlan_unique_uuid", payload.get("vlan_unique_uuid") or "<empty>")
-  LOG.info("  %-22s %s", "global_unique_uuid", payload.get("global_unique_uuid") or "<empty>")
-  LOG.info("  %-22s %s", "fqdn_to_ip_map", len(payload.get("fqdn_to_ip_map") or {}))
-  fqdn_map = payload.get("fqdn_to_ip_map") or {}
-  LOG.info(
-      "  %-22s %s", "fqdn_with_resolved_ips",
-      sum(1 for ips in fqdn_map.values() if ips))
-  nic_fqdn = 0
-  for vm in payload.get("vms") or []:
-    for nic in vm.get("nics") or []:
-      if nic.get("fqdns") or (nic.get("nic_network_info") or {}).get("fqdns"):
-        nic_fqdn += 1
-  LOG.info("  %-22s %s", "nics_with_fqdn", nic_fqdn)
-  eg_fqdn = sum(
-      1 for eg in (payload.get("entity_groups") or [])
-      if eg.get("fqdn_mapping") or eg.get("subnet_list"))
-  LOG.info("  %-22s %s", "egs_with_fqdn_subnet", eg_fqdn)
-  LOG.info("  %-22s %s", "network_function_by_id",
-           len(payload.get("network_function_by_id") or {}))
-  vms = payload.get("vms") or []
-  vm_proj = sum(1 for vm in vms if _project_blob(vm))
-  nic_proj = 0
-  nic_total = 0
-  for vm in vms:
-    for nic in vm.get("nics") or []:
-      nic_total += 1
-      if nic.get("project") or (nic.get("nic_network_info") or {}).get("project"):
-        nic_proj += 1
-  sg_rules = 0
-  nf_rules = 0
-  for policy in payload.get("policies") or []:
-    data = policy.get("data") or policy
-    for rule in data.get("rules") or []:
-      spec = rule.get("spec") or {}
-      if spec.get("service_group_details"):
-        sg_rules += 1
-      if spec.get("network_function_details"):
-        nf_rules += 1
-  LOG.info("  %-22s %s / %s", "vms_with_project", vm_proj, len(vms))
-  LOG.info("  %-22s %s / %s", "nics_with_project", nic_proj, nic_total)
-  LOG.info("  %-22s %s", "rules_with_sg_details", sg_rules)
-  LOG.info("  %-22s %s", "rules_with_nf_details", nf_rules)
-  LOG.info("  %-22s %s", "platform", payload.get("platform") or "<empty>")
-  LOG.info("  %-22s %s", "port_set_list", len(payload.get("port_set_list") or []))
-  LOG.info("  %-22s %s", "port_set_get", len(payload.get("port_set_get") or {}))
+  LOG.info("===== DUMP SUMMARY (idfcli + OVN + OVS + atlas) =====")
+  types = (payload.get("idfcli") or {}).get("entity_types") or {}
+  LOG.info("  %-22s %s types", "idfcli", len(types))
+  for name, rec in sorted(types.items()):
+    LOG.info(
+        "  %-22s count=%s err=%s",
+        name, rec.get("count"), rec.get("error") or "<none>")
   gw = payload.get("ahv_gateway") or {}
   LOG.info(
       "  %-22s ran=%s complete=%s hosts=%s/%s error=%s",
@@ -4741,13 +5770,103 @@ def main(argv):
         pod_rec.get("complete"),
         ",".join(pod_rec.get("missing") or []) or "<none>",
         (pod_rec.get("error") or "")[:50] or "<none>")
+  atlas = payload.get("atlas") or {}
+  LOG.info(
+      "  %-22s ran=%s list=%s get=%s platform=%s error=%s",
+      "atlas",
+      atlas.get("ran"),
+      atlas.get("list_count"),
+      atlas.get("get_count"),
+      atlas.get("platform") or "",
+      (atlas.get("error") or "")[:80] or "<none>")
   if errors:
     LOG.warning("Failed datasets: %s", ", ".join(sorted(errors)))
-    if FLAGS.fail_on_error:
+    if fail_on_error:
       return 2
-  LOG.info("Done. Combined file: %s", combined_path)
-  LOG.info("Per-dataset files: %s/*.json", output_dir)
+  LOG.info("Done. Index: %s", combined_path)
+  LOG.info("idfcli=%s/idfcli  ovs=%s/ahv_gateway  ovn=%s/cmsp_ovn  atlas=%s",
+           output_dir, output_dir, output_dir, output_dir)
+  LOG.info("Convert off-PC with: python3 flow_pc_process.py --dump_dir %s",
+           output_dir)
   return 0
+
+
+def main(argv):
+  if gflags is not None:
+    try:
+      argv = FLAGS(argv)
+    except gflags.FlagsError as err:
+      print("%s\nUsage: %s ARGS\n%s" % (err, sys.argv[0], FLAGS))
+      return 1
+    del argv
+    if FLAGS.from_json:
+      output_dir = FLAGS.output_dir or "/tmp/flow_pc_dump"
+      os.makedirs(output_dir, exist_ok=True)
+      combined_path = FLAGS.output or os.path.join(output_dir, "all.json")
+      log_file = FLAGS.log_file or os.path.join(output_dir, "process.log")
+      _setup_logging(log_file)
+      LOG.info("from_json is process, not dump; splitting %s", FLAGS.from_json)
+      with open(FLAGS.from_json, "r") as handle:
+        payload = json.load(handle)
+      _enrich_projects(payload)
+      _expand_service_and_function_details(payload)
+      _expand_fqdn_details(payload)
+      _write_outputs(
+          payload, output_dir, combined_path, max(1, int(FLAGS.workers)))
+      LOG.info("Split complete under %s", output_dir)
+      return 0
+    return dump_collect(
+        FLAGS.output_dir or "/tmp/flow_pc_dump",
+        workers=max(1, int(FLAGS.workers)),
+        skip_idf=getattr(FLAGS, "skip_idfcli", False),
+        skip_ahv=getattr(FLAGS, "skip_ahv_gateway", False),
+        skip_cmsp=getattr(FLAGS, "skip_cmsp_ovn", False),
+        skip_atlas=getattr(FLAGS, "skip_atlas", False),
+        ahv_gw_timeout=max(
+            60, int(getattr(FLAGS, "ahv_gateway_timeout_secs", 1800) or 1800)),
+        cmsp_ovn_timeout=max(
+            60, int(getattr(FLAGS, "cmsp_ovn_timeout_secs", 1800) or 1800)),
+        atlas_timeout=max(
+            60, int(getattr(FLAGS, "atlas_timeout_secs", 1800) or 1800)),
+        atlas_get_workers=max(
+            1, int(getattr(FLAGS, "atlas_get_workers", 32) or 32)),
+        idf_timeout=max(60, int(FLAGS.dataset_timeout_secs)),
+        fail_on_error=bool(FLAGS.fail_on_error),
+        log_file=FLAGS.log_file or "",
+        combined_path=FLAGS.output or "")
+  import argparse
+  ap = argparse.ArgumentParser(
+      description="Dump idfcli + OVN + OVS + atlas_cli. No FlowInterfaces.")
+  ap.add_argument("--output_dir", default="/tmp/flow_pc_dump")
+  ap.add_argument("--output", default="")
+  ap.add_argument("--log_file", default="")
+  ap.add_argument("--workers", type=int, default=16)
+  ap.add_argument("--dataset_timeout_secs", type=int, default=180)
+  ap.add_argument("--fail_on_error", action="store_true")
+  ap.add_argument("--skip_idfcli", action="store_true")
+  ap.add_argument("--skip_ahv_gateway", action="store_true")
+  ap.add_argument("--skip_cmsp_ovn", action="store_true")
+  ap.add_argument("--skip_atlas", action="store_true")
+  ap.add_argument("--ahv_gateway_timeout_secs", type=int, default=1800)
+  ap.add_argument("--cmsp_ovn_timeout_secs", type=int, default=1800)
+  ap.add_argument("--atlas_timeout_secs", type=int, default=1800)
+  ap.add_argument("--atlas_get_workers", type=int, default=32)
+  args = ap.parse_args(list(argv[1:]) if argv else None)
+  return dump_collect(
+      args.output_dir,
+      workers=args.workers,
+      skip_idf=args.skip_idfcli,
+      skip_ahv=args.skip_ahv_gateway,
+      skip_cmsp=args.skip_cmsp_ovn,
+      skip_atlas=args.skip_atlas,
+      ahv_gw_timeout=args.ahv_gateway_timeout_secs,
+      cmsp_ovn_timeout=args.cmsp_ovn_timeout_secs,
+      atlas_timeout=args.atlas_timeout_secs,
+      atlas_get_workers=args.atlas_get_workers,
+      idf_timeout=args.dataset_timeout_secs,
+      fail_on_error=args.fail_on_error,
+      log_file=args.log_file,
+      combined_path=args.output)
 
 
 if __name__ == "__main__":

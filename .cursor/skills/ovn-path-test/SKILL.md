@@ -8,7 +8,7 @@ description: >-
 
 # Test 5 scenarios (composites)
 
-Identity is UUID. DB `flow_ovn` `127.0.0.1:19000`.
+Identity is UUID. DB `flow_ovn` `127.0.0.1:19000`. Pass `--log_bundle_id`.
 
 **Read:** `ovn-path-trace`, `ovn-path-upstream`, `ovn-path-downstream`.
 
@@ -23,7 +23,7 @@ Identity is UUID. DB `flow_ovn` `127.0.0.1:19000`.
 ```bash
 PY=/home/rakeshkumar.r/panacea/clickhouse_ovn/trace.py
 CK=/home/rakeshkumar.r/panacea/.cursor/skills/ovn-path-eval/scripts/check_trace.py
-python3 "$PY" --run-scenarios
+python3 "$PY" --log_bundle_id 1 --run-scenarios
 # writes clickhouse_ovn/out/scenarios.md and out/<id>.md
 python3 "$CK" --scenario northbound /home/rakeshkumar.r/panacea/clickhouse_ovn/out/northbound.md
 ```

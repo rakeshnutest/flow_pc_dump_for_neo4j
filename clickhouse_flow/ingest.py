@@ -37,145 +37,27 @@ UUID_RE = re.compile(
 CAT_TYPE_MAP = {"VM": "kVM", "VPC": "kVPC", "SUBNET": "kSubnet"}
 _U_QUOTE = re.compile(r"'[a-z0-9A-Z\-]+'")
 
-SCHEMA_SQL = """
+POLICY_TABLES = ("bundle", "portset", "u_sg", "vm_nic", "category")
+RESET_SCHEMA_SQL = """
 CREATE DATABASE IF NOT EXISTS flow_policy;
 DROP VIEW IF EXISTS flow_policy.v_port_set_nic_diff;
 DROP TABLE IF EXISTS flow_policy.atlas_port_set;
 DROP TABLE IF EXISTS flow_policy.computed_port_set;
+DROP TABLE IF EXISTS flow_policy.bundle;
 DROP TABLE IF EXISTS flow_policy.portset;
 DROP TABLE IF EXISTS flow_policy.u_sg;
 DROP TABLE IF EXISTS flow_policy.sg;
 DROP TABLE IF EXISTS flow_policy.vm_nic;
 DROP TABLE IF EXISTS flow_policy.category;
-CREATE TABLE flow_policy.portset
-(
-    port_set_uuid              UUID,
-    computed_port_set_uuid     UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
-    atlas_port_set_uuid        UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
-    applied_to_port_set_uuid   UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
-    policy_uuid                UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
-    rule_uuid                  UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
-    role                       LowCardinality(String) DEFAULT '',
-    component_id               String DEFAULT '',
-    entity_type                LowCardinality(String) DEFAULT '',
-    namespace_uuid             UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
-    virtual_network_uuid       UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
-    entity_group_uuid          UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
-    reference_uuids            Array(UUID) DEFAULT [],
-    vm_category_refs           Array(UUID) DEFAULT [],
-    subnet_category_refs       Array(UUID) DEFAULT [],
-    vpc_category_refs          Array(UUID) DEFAULT [],
-    vm_ext_ids                 Array(UUID) DEFAULT [],
-    subnet_ext_ids             Array(UUID) DEFAULT [],
-    subnet_list                Array(String) DEFAULT [],
-    exception_list             Array(String) DEFAULT [],
-    applied_to_entity_group_uuid UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
-    applied_to_vm_category_refs  Array(UUID) DEFAULT [],
-    applied_to_subnet_category_refs Array(UUID) DEFAULT [],
-    applied_to_vpc_category_refs Array(UUID) DEFAULT [],
-    applied_to_vm_ext_ids        Array(UUID) DEFAULT [],
-    applied_to_subnet_ext_ids    Array(UUID) DEFAULT [],
-    applied_to_subnet_list       Array(String) DEFAULT [],
-    applied_to_exception_list    Array(String) DEFAULT [],
-    applied_to_entity_group_name String DEFAULT '',
-    applied_to_vm_category_names Array(String) DEFAULT [],
-    applied_to_subnet_category_names Array(String) DEFAULT [],
-    applied_to_vpc_category_names Array(String) DEFAULT [],
-    effective_vpc_refs         Array(UUID) DEFAULT [],
-    effective_vpc_names        Array(String) DEFAULT [],
-    eg_address_grp             Array(String) DEFAULT [],
-    eg_exception_address_grp   Array(String) DEFAULT [],
-    rule_uuids                 Array(UUID) DEFAULT [],
-    rule_u_sg Array(Tuple(
-        rule_uuid UUID, u_sg_id UUID, rule_priority Int32
-    )) DEFAULT [],
-    computed_nic_uuids         Array(UUID) DEFAULT [],
-    atlas_nic_uuids            Array(UUID) DEFAULT [],
-    policy_name                String DEFAULT '',
-    atlas_name                 String DEFAULT '',
-    vpc_name                   LowCardinality(String) DEFAULT '',
-    entity_group_name          String DEFAULT '',
-    vm_category_names          Array(String) DEFAULT [],
-    subnet_category_names      Array(String) DEFAULT [],
-    vpc_category_names         Array(String) DEFAULT [],
-    reference_names            Array(String) DEFAULT [],
-    computed_nics Array(Tuple(
-        vm_name String, nic_uuid UUID, subnet String, vpc String, ip String,
-        host_uuid UUID, host String, cluster_uuid UUID, cluster String
-    )) DEFAULT [],
-    atlas_nics Array(Tuple(
-        vm_name String, nic_uuid UUID, subnet String, vpc String, ip String,
-        host_uuid UUID, host String, cluster_uuid UUID, cluster String
-    )) DEFAULT [],
-    match_status               LowCardinality(String) DEFAULT '',
-    mismatch_kind              LowCardinality(String) DEFAULT '',
-    only_computed_nics Array(Tuple(
-        vm_name String, nic_uuid UUID, subnet String, vpc String, ip String,
-        host_uuid UUID, host String, cluster_uuid UUID, cluster String
-    )) DEFAULT [],
-    only_atlas_nics Array(Tuple(
-        vm_name String, nic_uuid UUID, subnet String, vpc String, ip String,
-        host_uuid UUID, host String, cluster_uuid UUID, cluster String
-    )) DEFAULT [],
-    all_ports                  UInt8 DEFAULT 0,
-    updated_at                 DateTime64(3) DEFAULT now64()
-)
-ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY (entity_type, port_set_uuid, policy_uuid, component_id);
-CREATE TABLE flow_policy.u_sg
-(
-    u_sg_id                    UUID,
-    sg_id                      UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
-    kind                       LowCardinality(String) DEFAULT '',
-    sg_uuids                   Array(UUID) DEFAULT [],
-    sg_names                   Array(String) DEFAULT [],
-    tcp_ports                  Array(String) DEFAULT [],
-    udp_ports                  Array(String) DEFAULT [],
-    icmp_types                 Array(String) DEFAULT [],
-    icmp_v6_types              Array(String) DEFAULT [],
-    is_inline                  UInt8 DEFAULT 0,
-    is_all_ports               UInt8 DEFAULT 0,
-    secured_group_action       LowCardinality(String) DEFAULT '',
-    network_function_uuid      UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
-    network_function_name      String DEFAULT '',
-    network_function_failure_handling LowCardinality(String) DEFAULT '',
-    network_function_traffic_forwarding_mode LowCardinality(String) DEFAULT '',
-    network_function_high_availability_mode LowCardinality(String) DEFAULT '',
-    network_function_nic_pairs Array(Tuple(
-        vm_uuid UUID, ingress_nic_uuid UUID, egress_nic_uuid UUID,
-        high_availability_state String, data_plane_health_status String
-    )) DEFAULT [],
-    updated_at                 DateTime64(3) DEFAULT now64()
-)
-ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY u_sg_id;
-CREATE TABLE flow_policy.vm_nic
-(
-    nic_uuid               UUID,
-    vm_uuid                UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
-    vm_name                String DEFAULT '',
-    subnet_uuid            UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
-    subnet                 LowCardinality(String) DEFAULT '',
-    vpc_uuid               UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
-    vpc                    LowCardinality(String) DEFAULT '',
-    ip                     String DEFAULT '',
-    host_uuid              UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
-    host                   LowCardinality(String) DEFAULT '',
-    cluster_uuid           UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
-    cluster                LowCardinality(String) DEFAULT '',
-    updated_at             DateTime64(3) DEFAULT now64()
-)
-ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY nic_uuid;
-CREATE TABLE flow_policy.category
-(
-    category_uuid          UUID,
-    name                   String DEFAULT '',
-    updated_at             DateTime64(3) DEFAULT now64()
-)
-ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY category_uuid;
 """
+LOG_BUNDLE_ID = 0
+
+
+def load_schema_sql(path=""):
+    here = os.path.dirname(os.path.abspath(__file__))
+    schema_path = path or os.path.join(here, "schema.sql")
+    with open(schema_path) as handle:
+        return handle.read()
 
 
 def as_uuid(value):
@@ -255,7 +137,7 @@ def scope_unique_uuid(scope, is_flex, vlan_uuid, global_uuid, policy_vpc_uuids):
         return GLOBAL_SCOPE_UNIQUE_ID if is_flex else global_uuid
     if scope in ("ALL_VLAN", "kAllVlan"):
         return VLAN_SCOPE_UNIQUE_ID if is_flex else vlan_uuid
-    if scope in ("VPC_AS_CATEGORY", "VPC_LIST") and policy_vpc_uuids:
+    if scope in ("VPC_AS_CATEGORY", "VPC_LIST", "VPC") and policy_vpc_uuids:
         return policy_vpc_uuids[0]
     return ""
 
@@ -419,6 +301,7 @@ def ch_client(*args, input_text=None):
         "--host", CH_HOST,
         "--port", CH_NATIVE,
         "--user", "default",
+        "--date_time_input_format=best_effort",
     ]
     cmd.extend(args)
     proc = subprocess.run(
@@ -431,13 +314,107 @@ def ch_client(*args, input_text=None):
 def insert_json(table, rows):
     if not rows:
         return
-    for offset in range(0, len(rows), BATCH):
-        chunk = rows[offset:offset + BATCH]
+    bid = int(LOG_BUNDLE_ID)
+    batch = 50 if table.endswith("portset") else BATCH
+    for offset in range(0, len(rows), batch):
+        chunk = rows[offset:offset + batch]
+        for row in chunk:
+            row["log_bundle_id"] = bid
         payload = "\n".join(json.dumps(row) for row in chunk)
         ch_client(
             "--query",
             "INSERT INTO %s FORMAT JSONEachRow" % table,
             input_text=payload)
+
+
+def resolve_log_bundle_id(explicit, dump_dir=""):
+    """Panacea log_bundle_id. Flag, env, meta.json, else stable hash of dump_dir."""
+    if explicit and int(explicit) > 0:
+        return int(explicit)
+    env = os.environ.get("PANACEA_LOG_BUNDLE_ID") or os.environ.get("LOG_BUNDLE_ID")
+    if env:
+        return int(env)
+    meta_path = os.path.join(dump_dir, "meta.json") if dump_dir else ""
+    if meta_path and os.path.isfile(meta_path):
+        meta = load_json(meta_path, {})
+        for key in ("log_bundle_id", "id", "bundle_id"):
+            val = meta.get(key)
+            if val not in (None, "", 0, "0"):
+                return int(val)
+    if dump_dir:
+        digest = hashlib.sha256(os.path.abspath(dump_dir).encode()).digest()
+        return int.from_bytes(digest[:8], "big")
+    raise SystemExit("need --log_bundle_id")
+
+
+def has_bundle_column(table):
+    out = ch_client(
+        "--query",
+        "SELECT count() FROM system.columns "
+        "WHERE database = 'flow_policy' AND table = '%s' "
+        "AND name = 'log_bundle_id'" % table)
+    try:
+        return int((out or "0").strip().splitlines()[-1]) > 0
+    except ValueError:
+        return False
+
+
+def drop_bundle_partitions(bundle_id):
+    """DROP PARTITION is instant (insert-mutation-avoid-delete). Other bundles stay."""
+    bid = int(bundle_id)
+    for table in POLICY_TABLES:
+        q = "ALTER TABLE flow_policy.%s DROP PARTITION %s" % (table, bid)
+        try:
+            ch_client("--query", q)
+        except RuntimeError as exc:
+            text = str(exc)
+            if any(
+                s in text
+                for s in (
+                    "doesn't exist",
+                    "does not exist",
+                    "Unknown table",
+                    "No such partition",
+                )
+            ):
+                continue
+            raise
+        print("  dropped partition %s %s" % (bid, table))
+
+
+def jsonl_table_dir(path):
+    if os.path.isfile(os.path.join(path, "portset.jsonl")):
+        return path
+    nested = os.path.join(path, "flow_policy")
+    if os.path.isfile(os.path.join(nested, "portset.jsonl")):
+        return nested
+    raise SystemExit("no portset.jsonl under %s" % path)
+
+
+def load_jsonl(path):
+    if not os.path.isfile(path):
+        return []
+    rows = []
+    with open(path) as handle:
+        for line in handle:
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
+def ingest_from_jsonl(path):
+    d = jsonl_table_dir(path)
+    insert_json("flow_policy.bundle", [{
+        "dump_dir": os.path.abspath(d),
+    }])
+    for table in ("category", "vm_nic", "u_sg", "portset"):
+        rows = load_jsonl(os.path.join(d, table + ".jsonl"))
+        insert_json("flow_policy." + table, rows)
+        print("jsonl_%s" % table, len(rows))
+    print("inserted_into",
+          "flow_policy.bundle,flow_policy.portset,flow_policy.u_sg,"
+          "flow_policy.vm_nic,flow_policy.category",
+          "log_bundle_id=%s" % LOG_BUNDLE_ID)
 
 
 def ips_in_range(start_ip, end_ip, cap=8192):
@@ -463,12 +440,21 @@ def ips_in_range(start_ip, end_ip, cap=8192):
 def cidrs_from_addresses(addresses):
     out = []
     for addr in addresses or []:
+        if isinstance(addr, str):
+            text = addr.strip()
+            if text:
+                out.append(text)
+            continue
         if not isinstance(addr, dict):
             continue
         value = addr.get("value")
         prefix = addr.get("prefix_length")
         if value is not None and prefix is not None:
             out.append("%s/%s" % (value, prefix))
+        elif addr.get("ipv4") or addr.get("cidr"):
+            text = str(addr.get("ipv4") or addr.get("cidr") or "").strip()
+            if text:
+                out.append(text)
     return out
 
 
@@ -717,7 +703,7 @@ def policy_hash_vpc_refs(policy, scope):
     """Dump vpc_references / scope_references used as VPC_LIST unique uuid."""
     if scope == "VPC_AS_CATEGORY":
         return uuid_list(policy.get("scope_references"))
-    if scope == "VPC_LIST":
+    if scope in ("VPC_LIST", "VPC"):
         return uuid_list(
             policy.get("vpc_references") or policy.get("scope_references"))
     return []
@@ -1155,7 +1141,7 @@ def host_cluster_map(hosts, clusters):
     return out
 
 
-def collect_nics(vms, subnets=None, vpc_names=None, host_map=None):
+def collect_nics(vms, subnets=None, vpc_names=None, host_map=None, vpc_map=None):
     nics = []
     host_map = host_map or {}
     sub_by = {}
@@ -1164,6 +1150,12 @@ def collect_nics(vms, subnets=None, vpc_names=None, host_map=None):
         if uid:
             sub_by[uid] = row
     vpc_names = vpc_names or {}
+    # Overlay VPC names live on Atlas virtual_network_*; dump vpcs.json
+    # may omit those UUIDs. UUID identity is unchanged.
+    vpc_uuid_to_name = dict(vpc_map or {})
+    for name, uid in vpc_names.items():
+        if uid and name:
+            vpc_uuid_to_name[uid] = name
     for vm in vms or []:
         vm = unwrap(vm)
         name = str(vm.get("name") or "")
@@ -1193,10 +1185,19 @@ def collect_nics(vms, subnets=None, vpc_names=None, host_map=None):
                         "is_advanced_networking",
                         dump_sub.get("is_advanced_networking"))
             vpc = dict(net.get("vpc") or {})
+            dump_vpc = dump_sub.get("vpc") if isinstance(dump_sub.get("vpc"), dict) else {}
+            if dump_vpc:
+                if dump_vpc.get("ext_id") and not vpc.get("ext_id"):
+                    vpc["ext_id"] = dump_vpc.get("ext_id")
+                if dump_vpc.get("name") and not vpc.get("name"):
+                    vpc["name"] = dump_vpc.get("name")
             vpc_uuid = (
                 as_uuid(vpc.get("ext_id"))
                 or vpc_uuid_for_subnet(subnet, vpc_names)
                 or ZERO)
+            vpc_name = str(vpc.get("name") or "")
+            if not vpc_name and vpc_uuid and vpc_uuid not in (ZERO, ALL_VLAN_VPC):
+                vpc_name = str(vpc_uuid_to_name.get(vpc_uuid) or "")
             nic_vm_cats = _entity_cat_ids(net, vm) or vm_cat_ids
             flags = {}
             flags.update(nic)
@@ -1217,7 +1218,7 @@ def collect_nics(vms, subnets=None, vpc_names=None, host_map=None):
                 "advance_vlan": advanced,
                 "is_advanced_networking": advanced,
                 "vpc_uuid": vpc_uuid,
-                "vpc": str(vpc.get("name") or ""),
+                "vpc": vpc_name,
                 "host_uuid": host_uuid or ZERO,
                 "host": host_rec.get("host") or "",
                 "cluster_uuid": host_rec.get("cluster_uuid") or ZERO,
@@ -1368,6 +1369,8 @@ def add_component(
         vlan_uuid, global_uuid, is_flex, is_endpoint,
         ipv4_only, ipv6_only, allowed, role=role)
     if not port_set:
+        if sel.get("addresses"):
+            return "ag_na"
         return "no_hash"
     rule_uuid = as_uuid(rule.get("ext_id")) or ZERO
     policy_uuid = as_uuid(policy.get("ext_id")) or ZERO
@@ -1523,6 +1526,42 @@ def nf_pair_rows(pairs):
     return out
 
 
+def rule_side_type(role):
+    """How this port-set is used on the rule (not APPLICATION INBOUND/OUTBOUND)."""
+    role = str(role or "")
+    if role == "src":
+        return "end_point_src"
+    if role == "dest":
+        return "end_point_dst"
+    return "secured_entity"
+
+
+def policy_type_value(policy, rule=None):
+    """Dump policy.type → app / isolation / quarantine."""
+    raw = str((policy or {}).get("type") or "").upper()
+    if raw == "APPLICATION":
+        return "app"
+    if raw == "ISOLATION":
+        return "isolation"
+    if raw == "QUARANTINE":
+        return "quarantine"
+    if rule and str(rule.get("type") or "") in ISOLATION_RULE_TYPES:
+        return "isolation"
+    return raw.lower() or "app"
+
+
+def policy_mode_value(policy):
+    """Dump policy.state → enforce / monitor / save. APPLY is enforce."""
+    raw = str((policy or {}).get("state") or "").upper()
+    if raw in ("APPLY", "ENFORCE"):
+        return "enforce"
+    if raw == "MONITOR":
+        return "monitor"
+    if raw == "SAVE":
+        return "save"
+    return raw.lower()
+
+
 def rule_priority_value(rule, spec=None):
     """FLEX dump spec.priority (rule_priority). APPLICATION has none → 0."""
     spec = spec if spec is not None else ((rule or {}).get("spec") or {})
@@ -1536,7 +1575,30 @@ def rule_priority_value(rule, spec=None):
 
 
 def empty_rule_service_columns():
-    return {"rule_uuids": [], "rule_u_sg": []}
+    return {"rule_u_sg": []}
+
+
+def rule_u_sg_entry(rule_uuid, role, spec, u_sg_row, policy, rule):
+    u_sg_row = u_sg_row or {}
+    policy = policy or {}
+    rule = rule or {}
+    return {
+        "rule_uuid": rule_uuid or ZERO,
+        "sg_id": list(u_sg_row.get("sg_uuids") or []),
+        "sg_ports": {
+            "tcp": list(u_sg_row.get("tcp_ports") or []),
+            "udp": list(u_sg_row.get("udp_ports") or []),
+            "icmp": list(u_sg_row.get("icmp_types") or []),
+            "icmpv6": list(u_sg_row.get("icmp_v6_types") or []),
+        },
+        "policy_name": str(policy.get("name") or ""),
+        "policy_uuid": as_uuid(policy.get("ext_id")) or ZERO,
+        "policy_type": policy_type_value(policy, rule),
+        "policy_mode": policy_mode_value(policy),
+        "flex_policy": 1 if str(rule.get("type") or "") == "FLEX" else 0,
+        "rule_priority": rule_priority_value(rule, spec),
+        "type": rule_side_type(role),
+    }
 
 
 def load_service_group_map(rows):
@@ -1732,32 +1794,60 @@ def unique_service(spec, sg_map, nf_map):
 
 
 def attach_portset_rules(components):
-    """Same port-set UUID can belong to many rules; each rule has its u_sg_id."""
+    """Same port-set UUID can belong to many rules; each rule has dump SGs/ports."""
     by_ps = defaultdict(list)
     for row in components:
-        rid = row.get("rule_uuid") or ZERO
-        uid = row.get("_u_sg_id") or ZERO
-        prio = int(row.get("_rule_priority") or 0)
-        if rid and rid != ZERO:
-            by_ps[row["port_set_uuid"]].append((rid, uid, prio))
+        entry = row.get("_rule_u_sg")
+        if not entry:
+            continue
+        by_ps[row["port_set_uuid"]].append(entry)
     for row in components:
         pairs = []
         seen = set()
-        for rid, uid, prio in by_ps.get(row["port_set_uuid"], []):
-            key = (rid, uid)
+        for entry in by_ps.get(row["port_set_uuid"], []):
+            key = (entry.get("rule_uuid"), entry.get("type"),
+                   entry.get("policy_uuid"))
             if key in seen:
                 continue
             seen.add(key)
-            pairs.append({
-                "rule_uuid": rid,
-                "u_sg_id": uid,
-                "rule_priority": prio,
-            })
-        row["rule_uuids"] = list(dict.fromkeys(
-            pair["rule_uuid"] for pair in pairs))
+            pairs.append(entry)
         row["rule_u_sg"] = pairs
-        row.pop("_u_sg_id", None)
-        row.pop("_rule_priority", None)
+        row.pop("_rule_u_sg", None)
+        row.pop("rule_uuid", None)
+
+
+def collapse_by_port_set(components):
+    """One ClickHouse row per port-set UUID. Policy/rule live only in rule_u_sg."""
+    by = {}
+    order = []
+    for row in components:
+        uid = row["port_set_uuid"]
+        if uid not in by:
+            by[uid] = row
+            order.append(uid)
+            continue
+        keep = by[uid]
+        seen_nics = set(keep.get("computed_nic_uuids") or [])
+        for nic in row.get("computed_nic_uuids") or []:
+            if nic not in seen_nics:
+                seen_nics.add(nic)
+                keep.setdefault("computed_nic_uuids", []).append(nic)
+        if str(row.get("role") or "").startswith("isolation"):
+            keep["role"] = row.get("role") or keep.get("role") or ""
+        keep["all_ports"] = int(bool(keep.get("all_ports")) or bool(row.get("all_ports")))
+        if (keep.get("applied_to_port_set_uuid") or ZERO) == ZERO:
+            for key, value in row.items():
+                if str(key).startswith("applied_to_") and value:
+                    keep[key] = value
+    out = []
+    for uid in order:
+        row = by[uid]
+        row.pop("component_id", None)
+        row.pop("policy_uuid", None)
+        row.pop("policy_name", None)
+        row.pop("rule_uuid", None)
+        out.append(row)
+    return out
 
 
 def _side_eg_uuid(spec, prefix):
@@ -1798,6 +1888,10 @@ def _side_ag_sel(spec, prefix, ag_map):
     cidrs = []
     for uid in ag:
         cidrs.extend((ag_map.get(uid) or {}).get("subnet_list") or [])
+    # AG UUID list without dump CIDRs is not a hashable address-set.
+    # Fall through to category / EG selectors (APPLICATION order).
+    if not cidrs:
+        return None
     return {"addresses": ag, "subnet_list": cidrs}
 
 
@@ -1917,11 +2011,36 @@ def selectors_from_spec(spec, ag_map=None, rule_type=""):
     return out
 
 
+def unwrap_atlas_get_record(rec, uid=""):
+    """Handle atlas_cli data wrapped as {uuid: record, 'uuid': uuid}."""
+    if not isinstance(rec, dict):
+        return {}
+    nested = rec.get(uid) if uid else None
+    if isinstance(nested, dict) and (
+            "virtual_nic_uuid_list" in nested or nested.get("name") is not None):
+        nested = dict(nested)
+        nested.setdefault("uuid", uid)
+        return nested
+    if "virtual_nic_uuid_list" not in rec:
+        candidates = [
+            value for key, value in rec.items()
+            if key != "uuid" and isinstance(value, dict) and (
+                "virtual_nic_uuid_list" in value or value.get("name") is not None)]
+        if len(candidates) == 1:
+            inner = dict(candidates[0])
+            inner.setdefault("uuid", uid or inner.get("uuid"))
+            return inner
+    return rec
+
+
 def atlas_by_uuid(port_set_list, port_set_get):
     if isinstance(port_set_get, dict):
-        records = list(port_set_get.values())
+        records = [
+            unwrap_atlas_get_record(rec, uid)
+            for uid, rec in port_set_get.items()]
     else:
-        records = port_set_get or []
+        records = [
+            unwrap_atlas_get_record(rec) for rec in (port_set_get or [])]
     by_uuid = {}
     for rec in records:
         if not isinstance(rec, dict):
@@ -2077,25 +2196,60 @@ def attach_nics(components, nics, vlan_uuid, global_uuid):
 
 
 def main():
+    global LOG_BUNDLE_ID
     here = os.path.dirname(os.path.abspath(__file__))
     parser = argparse.ArgumentParser(
         description="Ingest PC dump JSON into ClickHouse. Stdlib + clickhouse-client only.")
-    parser.add_argument("--dump_dir", required=True, help="Directory of dump JSON files")
+    parser.add_argument("--dump_dir", default="", help="Directory of dump JSON files")
+    parser.add_argument(
+        "--from_jsonl",
+        default="",
+        help="Load flow_policy/*.jsonl (ClickHouse dump). Use when PC dump JSON is absent.")
+    parser.add_argument(
+        "--log_bundle_id",
+        type=int,
+        default=0,
+        help="Panacea log_bundle_id. Re-ingest DROPs this partition only.")
+    parser.add_argument("--cluster_uuid", default="", help="Cluster UUID (bundle catalog)")
+    parser.add_argument("--cluster_name", default="", help="Cluster display name")
+    parser.add_argument("--pc_ip", default="", help="Prism Central IP")
+    parser.add_argument("--nos_version", default="", help="AOS / NOS version")
+    parser.add_argument(
+        "--reset-schema",
+        action="store_true",
+        help="DROP all flow_policy tables then recreate (all bundles). First migration.")
+    parser.add_argument(
+        "--drop-bundle",
+        type=int,
+        default=0,
+        help="Only DROP PARTITION for this log_bundle_id and exit.")
     parser.add_argument(
         "--schema",
         default="",
-        help="Optional schema.sql; embedded schema is used if omitted or missing")
+        help="Optional schema.sql; clickhouse_flow/schema.sql is used if omitted")
     args = parser.parse_args()
-    dump_dir = args.dump_dir
+    dump_dir = args.dump_dir or args.from_jsonl
 
     ch_client("--query", "SELECT 1")
+    if args.drop_bundle:
+        drop_bundle_partitions(args.drop_bundle)
+        print("dropped bundle %s" % args.drop_bundle)
+        return 0
+    if not dump_dir:
+        parser.error("need --dump_dir or --from_jsonl")
+    LOG_BUNDLE_ID = resolve_log_bundle_id(args.log_bundle_id, dump_dir)
+    print("log_bundle_id=%s" % LOG_BUNDLE_ID)
+    if args.reset_schema or not has_bundle_column("portset"):
+        if not args.reset_schema:
+            print("  existing tables lack log_bundle_id; recreating schema")
+        ch_client("--multiquery", input_text=RESET_SCHEMA_SQL)
     schema_path = args.schema or os.path.join(here, "schema.sql")
-    if schema_path and os.path.exists(schema_path):
-        with open(schema_path) as handle:
-            schema_sql = handle.read()
-    else:
-        schema_sql = SCHEMA_SQL
-    ch_client("--multiquery", input_text=schema_sql)
+    ch_client("--multiquery", input_text=load_schema_sql(schema_path))
+    print("dropping old partition %s (other bundles kept)..." % LOG_BUNDLE_ID)
+    drop_bundle_partitions(LOG_BUNDLE_ID)
+    if args.from_jsonl:
+        ingest_from_jsonl(args.from_jsonl)
+        return 0
 
     meta = load_json(os.path.join(dump_dir, "meta.json"), {})
     vlan_uuid = as_uuid(meta.get("vlan_unique_uuid"))
@@ -2112,6 +2266,16 @@ def main():
     vpc_map = named_map(vpcs)
     vpc_cat_map = vpc_category_map(vpcs)
     eg_names = named_map(egs)
+    cluster_uuid = as_uuid(args.cluster_uuid) or as_uuid(meta.get("cluster_uuid")) or ZERO
+    insert_json("flow_policy.bundle", [{
+        "dump_dir": os.path.abspath(dump_dir),
+        "cluster_uuid": cluster_uuid,
+        "cluster_name": args.cluster_name or str(meta.get("cluster_name") or ""),
+        "pc_ip": args.pc_ip or str(meta.get("pc_ip") or ""),
+        "nos_version": (
+            args.nos_version
+            or str(meta.get("nos_version") or meta.get("aos_version") or "")),
+    }])
     insert_json("flow_policy.category", [
         {"category_uuid": uid, "name": name} for uid, name in cat_map.items()
     ])
@@ -2142,7 +2306,8 @@ def main():
         vms, subnet_rows, atlas_vpc_names(atlas_get),
         host_cluster_map(
             load_json(os.path.join(dump_dir, "hosts.json"), []),
-            load_json(os.path.join(dump_dir, "clusters.json"), [])))
+            load_json(os.path.join(dump_dir, "clusters.json"), [])),
+        vpc_map)
     insert_json("flow_policy.vm_nic", [{
         "nic_uuid": nic["nic_uuid"],
         "vm_uuid": nic["vm_uuid"] or ZERO,
@@ -2199,9 +2364,9 @@ def main():
                     key = "applied_to_%s" % reason
                     verify[key] = verify.get(key, 0) + 1
                 if reason == "ok":
-                    components[-1]["_u_sg_id"] = u_sg_id
-                    components[-1]["_rule_priority"] = rule_priority_value(
-                        rule, spec)
+                    components[-1]["_rule_u_sg"] = rule_u_sg_entry(
+                        components[-1]["rule_uuid"], role, spec, u_sg_row,
+                        policy, rule)
                     hashed_ok = True
             if hashed_ok:
                 u_sg_rows[u_sg_id] = u_sg_row
@@ -2209,6 +2374,23 @@ def main():
 
     attach_portset_rules(components)
     attach_nics(components, nics, vlan_uuid, global_uuid)
+    computed_component_count = len(components)
+    isolation_component_count = sum(
+        1 for row in components
+        if str(row.get("role") or "").startswith("isolation"))
+    allow_any_src_rows = sum(
+        1 for row in components
+        if row.get("role") == "src" and row.get("should_allow_any"))
+    allow_any_dst_rows = sum(
+        1 for row in components
+        if row.get("role") == "dest" and row.get("should_allow_any"))
+    allow_any_src_nics = sum(
+        len(row.get("computed_nic_uuids") or []) for row in components
+        if row.get("role") == "src" and row.get("should_allow_any"))
+    allow_any_dst_nics = sum(
+        len(row.get("computed_nic_uuids") or []) for row in components
+        if row.get("role") == "dest" and row.get("should_allow_any"))
+    components = collapse_by_port_set(components)
     nic_by_uuid = {nic["nic_uuid"]: nic for nic in nics}
 
     def fill_names(row, atlas_rec):
@@ -2273,22 +2455,12 @@ def main():
             cat_map.get(uid) or eg_names.get(uid) or ""
             for uid in (row.get("reference_uuids") or [])
         ]
-        row["policy_name"] = row.get("policy_name") or ""
+        row.pop("policy_name", None)
+        row.pop("policy_uuid", None)
+        row.pop("component_id", None)
 
     rows = []
     seen = set()
-    allow_any_src_rows = sum(
-        1 for row in components
-        if row.get("role") == "src" and row.get("should_allow_any"))
-    allow_any_dst_rows = sum(
-        1 for row in components
-        if row.get("role") == "dest" and row.get("should_allow_any"))
-    allow_any_src_nics = sum(
-        len(row.get("computed_nic_uuids") or []) for row in components
-        if row.get("role") == "src" and row.get("should_allow_any"))
-    allow_any_dst_nics = sum(
-        len(row.get("computed_nic_uuids") or []) for row in components
-        if row.get("role") == "dest" and row.get("should_allow_any"))
     for row in components:
         row.pop("policy_scope", None)
         row.pop("policy_project_uuid", None)
@@ -2308,6 +2480,8 @@ def main():
         row.pop("is_ipv6_traffic_allowed", None)
         row.pop("link_local", None)
         row.pop("should_allow_any", None)
+        row.pop("rule_uuid", None)
+        row.pop("sel", None)
         rows.append(row)
     for ps, atlas_rec in atlas.items():
         if ps in seen:
@@ -2316,11 +2490,7 @@ def main():
             "port_set_uuid": ps,
             "computed_port_set_uuid": ZERO,
             "atlas_port_set_uuid": ps,
-            "policy_uuid": ZERO,
-            "policy_name": "",
-            "rule_uuid": ZERO,
             "role": "",
-            "component_id": ps,
             "entity_type": "",
             "namespace_uuid": ZERO,
             "virtual_network_uuid": atlas_rec.get("virtual_network_uuid") or ZERO,
@@ -2350,9 +2520,9 @@ def main():
 
     print("nics", len(nics))
     print("atlas_uuids", len(atlas))
-    print("computed_components", len(components))
-    print("isolation_components", sum(
-        1 for row in components if str(row.get("role") or "").startswith("isolation")))
+    print("computed_components", computed_component_count)
+    print("isolation_components", isolation_component_count)
+    print("portset_rows", len(rows))
     print("dump_should_allow_any", verify["dump_should_allow_any"])
     print("dump_should_allow_any_src", verify["dump_should_allow_any_src"])
     print("dump_should_allow_any_dst", verify["dump_should_allow_any_dst"])
@@ -2409,8 +2579,9 @@ def main():
         1 for nic in nics if (nic.get("cluster_uuid") or ZERO) != ZERO))
     print("rows", len(rows))
     print("inserted_into",
-          "flow_policy.portset,flow_policy.u_sg,"
-          "flow_policy.vm_nic,flow_policy.category")
+          "flow_policy.bundle,flow_policy.portset,flow_policy.u_sg,"
+          "flow_policy.vm_nic,flow_policy.category",
+          "log_bundle_id=%s" % LOG_BUNDLE_ID)
 
 
 if __name__ == "__main__":

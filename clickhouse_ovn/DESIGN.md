@@ -50,17 +50,19 @@ Skinny entity tables + membership/edge tables. No giant Nested ACL blobs.
 
 Per ClickHouse rules:
 
-- `schema-pk-plan-before-creation` / `schema-pk-cardinality-order` / `schema-pk-prioritize-filters`: ORDER BY low-cardinality type/direction then UUID.
+- `schema-pk-plan-before-creation` / `schema-pk-cardinality-order` / `schema-pk-prioritize-filters`: ORDER BY `log_bundle_id`, then low-cardinality type/direction, then UUID.
 - `schema-types-native-types`: native `UUID`, `UInt8`, `Int32`, `IPv4` where it fits; IPs also kept as `String` because CIDRs mix with addresses.
 - `schema-types-lowcardinality`: `type`, `direction`, `action`, `encap_type`.
 - `schema-types-avoid-nullable`: empty string / zero UUID, never Nullable.
-- `schema-partition-start-without`: no PARTITION BY.
+- `schema-partition-lifecycle` / `insert-mutation-avoid-delete`: `PARTITION BY log_bundle_id`. Re-ingest DROPs that partition only. Cardinality = retained dumps (`schema-partition-low-cardinality`). Not a time-series log, so no `toDate(event_time)` in the key.
 - `insert-mutation-avoid-update`: `ReplacingMergeTree(updated_at)`.
 - `insert-batch-size`: 10k JSONEachRow inserts.
+- Catalog: `flow_ovn.bundle` (dump_dir, cluster_uuid/name, pc_ip, nos_version, collected_at).
 
 | Table | ORDER BY | Grain |
 |---|---|---|
-| `ovn_ls` | `(ls_uuid)` | Logical switch |
+| `bundle` | `(log_bundle_id)` | Panacea dump catalog |
+| `ovn_ls` | `(log_bundle_id, ls_uuid)` | Logical switch |
 | `ovn_lsp` | `(type, ls_uuid, lsp_uuid)` | Switch port |
 | `ovn_lr` | `(lr_uuid)` | Router |
 | `ovn_lrp` | `(lr_uuid, lrp_uuid)` | Router port |
@@ -99,11 +101,13 @@ Mermaid is **composite per direction** (Upstream = srcâ†’dst, Downstream = dstâ†
 ## Scripts
 
 ```text
-python3 ingest.py --dump_dir /home/rakeshkumar.r/panacea/flow_pc_dumps/ovn_ovs_verify
-python3 trace.py --find-scenarios
-python3 trace.py --src <vm|mac|lsp-uuid> --dst <vm|mac|lsp-uuid|external>
+python3 ingest.py --dump_dir /home/rakeshkumar.r/panacea/flow_pc_dumps/ovn_ovs_verify --log_bundle_id 123
+python3 trace.py --log_bundle_id 123 --find-scenarios
+python3 trace.py --log_bundle_id 123 --src <vm|mac|lsp-uuid> --dst <vm|mac|lsp-uuid|external>
 # always writes clickhouse_ovn/out/<src>__<dst>.md (or --out FILE.md)
 # each file: Upstream composite + Downstream composite mermaid (ACL|L2|L3|GW|External)
-python3 trace.py --run-scenarios
+python3 trace.py --log_bundle_id 123 --run-scenarios
 # writes clickhouse_ovn/out/scenarios.md plus one .md per scenario
+# re-ingest same bundle: DROP PARTITION 123 only
+# first migration: ingest.py --reset-schema
 ```
