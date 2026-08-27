@@ -1,22 +1,24 @@
 # flow_pc_dump.py
 
-Dump Prism Central Flow policy and infra objects into JSON that `neo4j_db_insert.py` can prefetch.
+PC dump is **collect only**. Convert and enrich run locally with `flow_pc_process.py`.
 
-The script **must run on the PCVM**, using the Flow venv. It uses `FlowInterfaces` managers (address group, service group, entity group, policy) plus parallel `idfcli` for VMs, subnets, hosts, clusters, and categories. Do **not** use `/home/nutanix/.venvs/bin/bin/python3.9` — that venv has a different `flow` package and fails with `No module named 'flow.common'`.
+On the PCVM, copy **one file** and use **system python3** (no Flow venv):
 
-## Python binary (PCVM)
-
-```text
-/home/nutanix/.venvs/flow/bin/python3
+```bash
+python3 /home/nutanix/data/flow_pc_dump.py \
+  --output_dir /home/nutanix/upgrade/flow_pc_dump
 ```
 
-That is the same interpreter the live `flow` / `microseg` services use:
+That collects `idfcli/`, `ahv_gateway/` (OVS), `cmsp_ovn/` (OVN), and atlas `port_set_list.json` / `port_set_get.json`. It does **not** call FlowInterfaces, convert policies, or write `policies.json`.
 
-```text
-/home/nutanix/.venvs/flow/bin/python3 /home/nutanix/flow/bin/flow
+Locally, after you copy the dump off the PC:
+
+```bash
+python3 flow_pc_process.py --dump_dir /path/to/dump
+python3 flow_pc_process.py --dump_dir /path/to/dump --ingest --log_bundle_id N
 ```
 
-`flow_cli` also forces `PYTHON_TARGET_PATH` to this binary.
+`process_dump` maps `idfcli/*.json` into `policies.json`, AG/SG/EG, VMs, NICs (stdlib only; no Flow venv).
 
 ## Copy the script to the PC
 
@@ -27,18 +29,18 @@ scp flow_pc_dump.py nutanix@<PC_IP>:/home/nutanix/data/
 ssh nutanix@<PC_IP>
 ```
 
-Copy **only** `flow_pc_dump.py` (idfcli, FlowInterfaces, atlas, OVN, and OVS are all in that file). Place it in `/home/nutanix/data/` (do **not** use `/tmp`; it is a small loop on many PCs).
+Place it in `/home/nutanix/data/` (do **not** use `/tmp`; it is a small loop on many PCs).
 
-## Run
+## Run (PC, dump only)
 
-Writes **one file per dataset** under `--output_dir` (default `/home/nutanix/upgrade/flow_pc_dump/`), plus a combined `all.json` and `dump.log`. Use the **Flow venv** so `FlowInterfaces` collects AG/SG/EG/policies.
+Writes under `--output_dir` (default `/home/nutanix/upgrade/flow_pc_dump/`).
 
 ```bash
-/home/nutanix/.venvs/flow/bin/python3 /home/nutanix/data/flow_pc_dump.py \
+python3 /home/nutanix/data/flow_pc_dump.py \
   --output_dir /home/nutanix/upgrade/flow_pc_dump \
   --workers 16 \
   --atlas_get_workers 32 \
-  --dataset_timeout_secs 600 \
+  --dataset_timeout_secs 180 \
   --atlas_timeout_secs 1800
 ```
 
@@ -46,29 +48,16 @@ Output layout:
 
 ```text
 /home/nutanix/upgrade/flow_pc_dump/
-  all.json                 # combined prefetch payload
-  dump.log                 # run log
-  meta.json                # source, timestamps, unique uuids
-  address_groups.json
-  service_groups.json
-  entity_groups.json
-  policies.json
-  vms.json
-  subnets.json
-  vpcs.json
-  hosts.json
-  clusters.json
-  projects.json
-  categories.json
-  network_functions.json
-  network_function_by_id.json
-  fqdn_to_ip_map.json
-  port_set_list.json          # atlas_cli -o json port_set.list
-  port_set_get.json           # atlas_cli -o json port_set.get <uuid> (keyed by uuid)
-  ahv_gateway.json            # AHV Gateway OVS/virsh/tap/brAtlas index
-  ahv_gateway/<hypervisor_ip>/  # per-host OVS + virsh + tap + conf.db
-  cmsp_ovn.json               # CMSP kubectl OVN NB/SB dump index
-  cmsp_ovn/anc-ovn/           # ovsdb-client dump of NB/SB
+  all.json                 # dump index (not prefetch policies)
+  dump.log
+  unique_uuids.json
+  idfcli/                  # raw idfcli get entitytype
+  port_set_list.json
+  port_set_get.json
+  ahv_gateway.json
+  ahv_gateway/<hypervisor_ip>/
+  cmsp_ovn.json
+  cmsp_ovn/anc-ovn/
   dump_errors.json
 ```
 
@@ -78,15 +67,15 @@ Combined file override:
 --output /home/nutanix/flow_pc_neo4j_prefetch_all.json
 ```
 
-Split an existing combined dump (no live fetch):
+Local convert (after rsync):
 
 ```bash
-/home/nutanix/.venvs/flow/bin/python3 /home/nutanix/data/flow_pc_dump.py \
-  --from_json /home/nutanix/upgrade/flow_pc_dump/all.json \
-  --output_dir /home/nutanix/upgrade/flow_pc_dump
+python3 flow_pc_process.py --dump_dir /path/to/dump
 ```
 
-Flags are parsed **before** `FlowInterfaces()` is created. That is required on PC; accessing Flow clients before `FLAGS(argv)` triggers `UnparsedFlagAccessError` and Zeus/ZK retry loops.
+That writes `policies.json`, `address_groups.json`, `vms.json`, and the rest.
+
+Flags are argparse on the dump CLI. Flow venv is **not** required for dump.
 
 ### Flags
 
@@ -97,8 +86,7 @@ Flags are parsed **before** `FlowInterfaces()` is created. That is required on P
 | `--log_file` | `<output_dir>/dump.log` | Log file |
 | `--from_json` | unset | Split an existing combined JSON; skip live fetch |
 | `--workers` | `16` | Parallel workers for dataset fetch + writes |
-| `--dataset_timeout_secs` | `600` | Timeout for the FlowInterfaces dataset batch and per-idfcli type |
-| `--skip_flow` | off | Skip FlowInterfaces (AG/SG/EG/policies). Default **collects** them |
+| `--dataset_timeout_secs` | `180` | Per-idfcli-type timeout |
 | `--fail_on_error` | off | Exit non-zero if any dataset fails |
 | `--skip_atlas` | off | Skip `atlas_cli port_set.list` / `port_set.get` |
 | `--atlas_timeout_secs` | `1800` | Timeout for `port_set.list` and the `port_set.get` batch |
@@ -115,7 +103,7 @@ Flags are parsed **before** `FlowInterfaces()` is created. That is required on P
 
 **SMSP vs CMSP (auto-detected, no flag):** `mspctl cluster list` / `mspctl cluster get flow --verbose`. A cluster named `flow` with a UUID is SMSP → every `atlas_cli` uses `-u ws://smsp-<uuid>.ntnx-ikat.svc:2060/atlas_cli`. No `flow` cluster (404 / only `controller_msp`) plus a local `genesis status` Atlas process is CMSP → `atlas_cli` on the PCVM. `port_set.list` → `port_set_list.json`; each `port_set.get <uuid>` → `port_set_get.json`.
 
-**AHV Gateway host collect (default on, never SSH to AHV):** runs first (before FlowInterfaces). The script mTLS-calls each PE hypervisor at `:7030` with the PC `ClusterHealthService` cert and **retries until all of these exist per host**:
+**AHV Gateway host collect (default on, never SSH to AHV):** The script mTLS-calls each PE hypervisor at `:7030` with the PC `ClusterHealthService` cert and **retries until all of these exist per host**:
 
 - `ovs-vsctl show`
 - `ovs-dpctl -s show`
@@ -147,12 +135,12 @@ It retries until both dumps exist. Layout: `<output_dir>/cmsp_ovn/anc-ovn/comman
 Help:
 
 ```bash
-/home/nutanix/.venvs/flow/bin/python3 /home/nutanix/data/flow_pc_dump.py --help
+python3 /home/nutanix/data/flow_pc_dump.py --help
 ```
 
-## What it dumps
+## What process writes (local)
 
-Logged as `DUMP start` / `DUMP done` / `DATASET … dumped N records`, then `===== DUMP SUMMARY =====`.
+`flow_pc_process.py` maps idfcli into prefetch JSON. Logged as `DUMP start` / `DUMP done` / `DATASET … dumped N records`.
 
 | JSON key | Source | Used by `neo4j_db_insert.py` |
 |---|---|---|
@@ -241,9 +229,8 @@ python3 clickhouse_flow/observe_leftovers.py \
 
 ## Do not
 
-- Run with `/usr/bin/python3` or `/home/nutanix/.venvs/bin/bin/python3.9`
-- Call Prism `v4_client` from this script on PC (it can loop on Zeus config forever)
-- Run from `/tmp` with a shebang `python` and no Flow venv — always invoke the Flow binary explicitly
+- Call Prism `v4_client` or construct `FlowInterfaces()` from the PC dump (Zeus)
+- Run dump from `/tmp` (small loop filesystem on many PCs)
 
 ## Example collected on a lab PC
 

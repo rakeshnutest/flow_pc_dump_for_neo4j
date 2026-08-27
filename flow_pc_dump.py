@@ -2,11 +2,10 @@
 #
 # Copyright (c) 2026 Nutanix Inc. All rights reserved.
 #
-# Single PC dump script (copy this file only):
-#   FlowInterfaces + idfcli + atlas_cli + OVN + OVS.
-#   /home/nutanix/.venvs/flow/bin/python3 flow_pc_dump.py \
-#       --output_dir /home/nutanix/upgrade/flow_pc_dump
-# Convert/enrich on the PC (FlowInterfaces). Ingest off-PC:
+# Single PC dump script (copy this file only). Collect only:
+#   idfcli + atlas_cli + OVN + OVS. No convert, no enrich, no FlowInterfaces.
+#   python3 flow_pc_dump.py --output_dir /home/nutanix/upgrade/flow_pc_dump
+# Convert/enrich locally (this workstation):
 #   python3 flow_pc_process.py --dump_dir ... --ingest --log_bundle_id N
 #
 # Host OVS/OVN/virsh is collected from PC via AHV Gateway (mTLS :7030),
@@ -72,7 +71,7 @@ class _FlagBag(object):
   ahv_gateway_cert_dir = "/home/certs/ClusterHealthService"
   skip_idfcli = False
   skip_cmsp_ovn = False
-  skip_flow = False
+  skip_flow = True
   cmsp_ovn_timeout_secs = 1800
   cmsp_ovn_namespace = ""
 
@@ -121,8 +120,8 @@ try:
       "workers", 16,
       "Parallel worker count for dataset fetch, conversion, and writes.")
   gflags.DEFINE_integer(
-      "dataset_timeout_secs", 600,
-      "Timeout for the FlowInterfaces dataset batch and per-idfcli type.")
+      "dataset_timeout_secs", 180,
+      "Per-idfcli-type timeout.")
   gflags.DEFINE_boolean(
       "fail_on_error", False,
       "If true, exit non-zero when any dataset fetch fails.")
@@ -155,8 +154,8 @@ try:
       "/home/certs/ClusterHealthService",
       "Directory with <name>.crt and <name>.key for AHV Gateway mTLS.")
   gflags.DEFINE_boolean(
-      "skip_flow", False,
-      "Skip FlowInterfaces (AG/SG/EG/policies). Default collects them.")
+      "skip_flow", True,
+      "Ignored. Convert/enrich is off-PC (flow_pc_process.py).")
   gflags.DEFINE_boolean(
       "skip_idfcli", False,
       "Skip idfcli entity dumps.")
@@ -5596,32 +5595,26 @@ def dump_pc(output_dir, workers=8, skip_idf=False, skip_ahv=False,
             ahv_gw_timeout=1800, cmsp_ovn_timeout=1800, atlas_timeout=1800,
             atlas_get_workers=32, idf_timeout=180, flow_timeout=600,
             fail_on_error=False, log_file="", combined_path=""):
-  """PC dump: FlowInterfaces + idfcli + OVN + OVS + atlas_cli.
-
-  Parse FLAGS(argv) before calling this so FlowInterfaces() does not hit
-  UnparsedFlagAccessError. Default collects AG/SG/EG/policies on the PC.
-  """
+  """PC dump only: idfcli + OVN + OVS + atlas_cli. No convert or enrich."""
   global _IDF_FILE_DIR
   os.makedirs(output_dir, exist_ok=True)
   combined_path = combined_path or os.path.join(output_dir, "all.json")
   log_file = log_file or os.path.join(output_dir, "dump.log")
   _setup_logging(log_file)
   workers = max(1, int(workers))
-  flow_timeout = max(60, int(flow_timeout or 600))
   LOG.info("logs=%s combined=%s output_dir=%s",
            log_file, combined_path, output_dir)
   LOG.info(
-      "dump=FlowInterfaces+idfcli+OVN+OVS+atlas skip_flow=%s skip_idfcli=%s "
+      "dump=idfcli+OVN+OVS+atlas (no convert) skip_idfcli=%s "
       "skip_ahv_gateway=%s skip_cmsp_ovn=%s skip_atlas=%s workers=%s "
-      "ahv_gw_timeout=%ss cmsp_ovn_timeout=%ss atlas_timeout=%ss "
-      "flow_timeout=%ss",
-      skip_flow, skip_idf, skip_ahv, skip_cmsp, skip_atlas, workers,
-      ahv_gw_timeout, cmsp_ovn_timeout, atlas_timeout, flow_timeout)
+      "ahv_gw_timeout=%ss cmsp_ovn_timeout=%ss atlas_timeout=%ss",
+      skip_idf, skip_ahv, skip_cmsp, skip_atlas, workers,
+      ahv_gw_timeout, cmsp_ovn_timeout, atlas_timeout)
 
   errors = {}
   payload = {
       "source": "flow_pc_dump",
-      "collects": ["flowinterfaces", "idfcli", "ovn", "ovs", "atlas"],
+      "collects": ["idfcli", "ovn", "ovs", "atlas"],
       "dumped_at": datetime.utcnow().isoformat() + "Z",
       "platform": "",
       "platform_detection_method": "",
@@ -5634,7 +5627,7 @@ def dump_pc(output_dir, workers=8, skip_idf=False, skip_ahv=False,
       "port_set_get": {},
   }
 
-  LOG.info("Collecting idfcli + AHV Gateway OVS + CMSP OVN + atlas_cli first")
+  LOG.info("Collecting idfcli + AHV Gateway OVS + CMSP OVN + atlas_cli")
   with ThreadPoolExecutor(max_workers=4) as pool:
     idf_fut = None
     ahv_gw_fut = None
@@ -5743,7 +5736,6 @@ def dump_pc(output_dir, workers=8, skip_idf=False, skip_ahv=False,
   payload["port_set_get"] = _normalize_port_set_get(_load_json_if_present(
       os.path.join(output_dir, "port_set_get.json"), {}))
 
-  # Persist OVS/OVN/atlas before FlowInterfaces so a Zeus abort still leaves them.
   payload["dump_errors"] = errors
   _write_json_file(
       os.path.join(output_dir, "ahv_gateway.json"),
@@ -5752,105 +5744,9 @@ def dump_pc(output_dir, workers=8, skip_idf=False, skip_ahv=False,
       os.path.join(output_dir, "cmsp_ovn.json"),
       payload.get("cmsp_ovn") or {})
   _write_json_file(os.path.join(output_dir, "dump_errors.json"), errors)
+  _write_json_file(combined_path, payload)
 
-  interfaces = None
-  if skip_flow:
-    LOG.info("Skipping FlowInterfaces (--skip_flow)")
-    payload["collects"] = ["idfcli", "ovn", "ovs", "atlas"]
-  elif FlowInterfaces is None:
-    msg = (
-        "FlowInterfaces is not importable. Run with the Flow venv:\n"
-        "  /home/nutanix/.venvs/flow/bin/python3 flow_pc_dump.py "
-        "--output_dir %s\n"
-        "Use --skip_flow only for idfcli+OVN+OVS+atlas without AG/SG/EG/"
-        "policies." % output_dir)
-    LOG.error(msg.replace("\n", " | "))
-    errors["flow_interfaces"] = "FlowInterfaces not imported (need flow venv)"
-    payload["dump_errors"] = errors
-    _write_json_file(os.path.join(output_dir, "dump_errors.json"), errors)
-    _write_json_file(combined_path, payload)
-    sys.stderr.write(msg + "\n")
-    return 1
-  else:
-    LOG.info("FlowInterfaces + platform detect (FLAGS already parsed)")
-    try:
-      with ThreadPoolExecutor(max_workers=1) as pool:
-        plat_fut = pool.submit(detect_msp_platform)
-        interfaces = FlowInterfaces()
-        platform_info = plat_fut.result()
-    except Exception as err:
-      LOG.error("FlowInterfaces/platform detect FAILED: %s", err)
-      errors["flow_interfaces"] = str(err)
-      interfaces = None
-      platform_info = {
-          "platform": "",
-          "detection_method": "failed",
-          "smsp_cluster_uuid": "",
-      }
-    payload["platform"] = platform_info.get("platform") or ""
-    payload["platform_detection_method"] = (
-        platform_info.get("detection_method") or "")
-    payload["smsp_cluster_uuid"] = (
-        platform_info.get("smsp_cluster_uuid") or "")
-    LOG.info(
-        "Platform %s (method=%s smsp_uuid=%s)",
-        payload["platform"] or "<empty>",
-        payload["platform_detection_method"] or "<empty>",
-        payload["smsp_cluster_uuid"] or "<none>")
-    if interfaces is None:
-      LOG.warning("Skipping FlowInterfaces datasets; OVN/OVS/idfcli already written")
-    else:
-      LOG.info("FlowInterfaces ready; collecting AG/SG/EG/policies + idf maps")
-      jobs = [
-          ("address_groups", lambda: fetch_address_groups(interfaces)),
-          ("service_groups", lambda: fetch_service_groups(interfaces)),
-          ("entity_groups", lambda: fetch_entity_groups(interfaces)),
-          ("policies", lambda: fetch_policies(interfaces)),
-          ("hosts", lambda: fetch_hosts(interfaces)),
-          ("unique_uuids", fetch_unique_uuids),
-          ("fqdn_to_ip_map", lambda: fetch_fqdn_map(interfaces)),
-          ("vms", lambda: fetch_vms(interfaces)),
-          ("subnets", lambda: fetch_subnets(interfaces)),
-          ("vpcs", lambda: fetch_vpcs(interfaces)),
-          ("clusters", lambda: fetch_clusters(interfaces)),
-          ("projects", lambda: fetch_projects(interfaces)),
-          ("categories", lambda: fetch_categories(interfaces)),
-          ("network_functions", lambda: fetch_network_functions(interfaces)),
-          ("entity_capabilities",
-           lambda: fetch_entity_capabilities(interfaces)),
-      ]
-      payload.update(_run_jobs_parallel(
-          jobs, workers, flow_timeout, errors))
-      unique = payload.pop("unique_uuids", {}) or {}
-      if unique.get("vlan_unique_uuid"):
-        payload["vlan_unique_uuid"] = unique.get("vlan_unique_uuid") or ""
-      if unique.get("global_unique_uuid"):
-        payload["global_unique_uuid"] = unique.get("global_unique_uuid") or ""
-      try:
-        payload["network_function_by_id"] = fetch_network_function_by_id(
-            interfaces, payload.get("network_functions") or [],
-            _policy_nf_uuids(payload))
-        _post_fetch_enrich(payload)
-      except Exception as err:
-        errors["post_fetch_enrich"] = str(err)
-        LOG.error("post_fetch_enrich FAILED: %s", err)
-
-  payload["dump_errors"] = errors
-  if interfaces is not None:
-    _write_outputs(payload, output_dir, combined_path, workers)
-  else:
-    _write_json_file(combined_path, payload)
-    _write_json_file(os.path.join(output_dir, "dump_errors.json"), errors)
-
-  LOG.info("===== DUMP SUMMARY =====")
-  for key in (
-      "address_groups", "service_groups", "entity_groups", "policies",
-      "vms", "subnets", "vpcs", "hosts", "clusters", "projects",
-      "categories", "network_functions"):
-    value = payload.get(key)
-    if value is None:
-      continue
-    LOG.info("  %-22s %s", key, len(value) if isinstance(value, list) else value)
+  LOG.info("===== DUMP SUMMARY (idfcli + OVN + OVS + atlas) =====")
   LOG.info("  %-22s %s", "vlan_unique_uuid",
            payload.get("vlan_unique_uuid") or "<empty>")
   LOG.info("  %-22s %s", "global_unique_uuid",
@@ -5907,21 +5803,15 @@ def dump_pc(output_dir, workers=8, skip_idf=False, skip_ahv=False,
       (atlas.get("error") or "")[:80] or "<none>")
   LOG.info("  %-22s %s", "port_set_list", len(payload.get("port_set_list") or []))
   LOG.info("  %-22s %s", "port_set_get", len(payload.get("port_set_get") or {}))
-  LOG.info("  %-22s %s", "platform", payload.get("platform") or "<empty>")
   if errors:
     LOG.warning("Failed datasets: %s", ", ".join(sorted(errors)))
     if fail_on_error:
       return 2
-  LOG.info("Done. Combined file: %s", combined_path)
-  LOG.info("idfcli=%s/idfcli  ovs=%s/ahv_gateway  ovn=%s/cmsp_ovn",
-           output_dir, output_dir, output_dir)
-  if interfaces is not None:
-    LOG.info("FlowInterfaces convert done on PC (policies/AG/SG/EG JSON).")
-    LOG.info("Ingest off-PC: python3 flow_pc_process.py --dump_dir %s "
-             "--skip-convert --ingest", output_dir)
-  else:
-    LOG.info("Convert off-PC with: python3 flow_pc_process.py --dump_dir %s",
-             output_dir)
+  LOG.info("Done. Index: %s", combined_path)
+  LOG.info("idfcli=%s/idfcli  ovs=%s/ahv_gateway  ovn=%s/cmsp_ovn  atlas=%s",
+           output_dir, output_dir, output_dir, output_dir)
+  LOG.info("Convert locally: python3 flow_pc_process.py --dump_dir %s",
+           output_dir)
   return 0
 
 
@@ -5949,7 +5839,6 @@ def split_from_json(from_json, output_dir, combined_path="", log_file="",
 
 
 DEFAULT_OUTPUT = "/home/nutanix/upgrade/flow_pc_dump"
-FLOW_PYTHON = "/home/nutanix/.venvs/flow/bin/python3"
 
 
 def build_parser():
@@ -5957,39 +5846,33 @@ def build_parser():
       prog="flow_pc_dump.py",
       formatter_class=argparse.RawDescriptionHelpFormatter,
       description=(
-          "Dump FlowInterfaces (AG/SG/EG/policies), idfcli, atlas_cli, "
-          "AHV Gateway OVS, and CMSP OVN on the PCVM."),
+          "PC dump only: idfcli, atlas_cli, AHV Gateway OVS, and CMSP OVN. "
+          "No convert or enrich. Run on PCVM with system python3."),
       epilog="""
-Must use the Flow venv so FlowInterfaces is collected:
+On PC (collect only, system python3):
 
-  %(py)s %(prog)s --output_dir %(out)s
-
-That interpreter is the same one live flow / microseg use. System python3
-cannot import flow.common and will not collect AG/SG/EG/policies.
+  python3 %(prog)s --output_dir %(out)s
 
 Writes under --output_dir:
-  policies.json address_groups.json service_groups.json entity_groups.json
-  vms.json subnets.json vpcs.json hosts.json clusters.json projects.json
-  categories.json network_functions.json fqdn_to_ip_map.json
   idfcli/<entity_type>.json and .txt
   ahv_gateway/   (OVS via AHV Gateway mTLS :7030)
   cmsp_ovn/      (OVN NB/SB via kubectl ovsdb-client dump)
   port_set_list.json / port_set_get.json  (atlas_cli)
-  all.json dump.log meta.json dump_errors.json
+  unique_uuids.json dump.log all.json dump_errors.json
 
-FLAGS(argv) is parsed before FlowInterfaces() is constructed. That is
-required on PC (otherwise Zeus UnparsedFlagAccessError).
+Convert/enrich locally (not on PC):
+
+  python3 flow_pc_process.py --dump_dir <dump> --ingest --log_bundle_id N
 
 Examples:
-  %(py)s %(prog)s --help
-  %(py)s %(prog)s --output_dir %(out)s
-  %(py)s %(prog)s --output_dir %(out)s --workers 16 --atlas_get_workers 32
-  python3 %(prog)s --skip_flow --output_dir %(out)s
-""" % {"py": FLOW_PYTHON, "prog": "flow_pc_dump.py", "out": DEFAULT_OUTPUT})
+  python3 %(prog)s --help
+  python3 %(prog)s --output_dir %(out)s
+  python3 %(prog)s --output_dir %(out)s --workers 16 --atlas_get_workers 32
+""" % {"prog": "flow_pc_dump.py", "out": DEFAULT_OUTPUT})
   ap.add_argument(
       "--output_dir", default=DEFAULT_OUTPUT,
-      help="Directory for prefetch JSON, idfcli/, ahv_gateway/, cmsp_ovn/, "
-           "atlas (default: %(default)s)")
+      help="Directory for idfcli/, ahv_gateway/, cmsp_ovn/, atlas "
+           "(default: %(default)s)")
   ap.add_argument(
       "--output", default="",
       help="Combined JSON path. Default: <output_dir>/all.json")
@@ -6001,16 +5884,13 @@ Examples:
       help="Split an existing combined JSON into output_dir files; skip fetch")
   ap.add_argument(
       "--workers", type=int, default=16,
-      help="Parallel workers for FlowInterfaces datasets and writes")
+      help="Parallel workers for idfcli types and writes")
   ap.add_argument(
-      "--dataset_timeout_secs", type=int, default=600,
-      help="Timeout for the FlowInterfaces dataset batch and per-idfcli type")
+      "--dataset_timeout_secs", type=int, default=180,
+      help="Per-idfcli-type timeout")
   ap.add_argument(
       "--fail_on_error", action="store_true",
       help="Exit non-zero if any dataset fetch fails")
-  ap.add_argument(
-      "--skip_flow", action="store_true",
-      help="Skip FlowInterfaces (AG/SG/EG/policies). Default collects them")
   ap.add_argument(
       "--skip_idfcli", action="store_true",
       help="Skip idfcli entity dumps")
@@ -6053,21 +5933,11 @@ Examples:
   return ap
 
 
-def _need_flow_venv(script):
-  sys.stderr.write(
-      "FlowInterfaces is not importable. Collect AG/SG/EG/policies with:\n"
-      "  %s %s --output_dir %s\n"
-      "Use --skip_flow only for idfcli+OVN+OVS+atlas without policies.\n"
-      % (FLOW_PYTHON, script, DEFAULT_OUTPUT))
-
-
 def main(argv=None):
   argv = list(sys.argv if argv is None else argv)
-  script = argv[0] if argv else "flow_pc_dump.py"
   parser = build_parser()
   args, _unknown = parser.parse_known_args(argv[1:])
 
-  # Parse gflags before FlowInterfaces() (Zeus UnparsedFlagAccessError).
   if gflags is not None:
     try:
       parsed = False
@@ -6094,11 +5964,6 @@ def main(argv=None):
         log_file=args.log_file or "",
         workers=max(1, int(args.workers)))
 
-  if not args.skip_flow and FlowInterfaces is None:
-    _need_flow_venv(script)
-    return 1
-
-  flow_timeout = max(600, int(args.dataset_timeout_secs))
   return dump_pc(
       args.output_dir or DEFAULT_OUTPUT,
       workers=max(1, int(args.workers)),
@@ -6106,13 +5971,12 @@ def main(argv=None):
       skip_ahv=bool(args.skip_ahv_gateway),
       skip_cmsp=bool(args.skip_cmsp_ovn),
       skip_atlas=bool(args.skip_atlas),
-      skip_flow=bool(args.skip_flow),
+      skip_flow=True,
       ahv_gw_timeout=max(60, int(args.ahv_gateway_timeout_secs)),
       cmsp_ovn_timeout=max(60, int(args.cmsp_ovn_timeout_secs)),
       atlas_timeout=max(60, int(args.atlas_timeout_secs)),
       atlas_get_workers=max(1, int(args.atlas_get_workers)),
       idf_timeout=max(60, int(args.dataset_timeout_secs)),
-      flow_timeout=flow_timeout,
       fail_on_error=bool(args.fail_on_error),
       log_file=args.log_file or "",
       combined_path=args.output or "")
