@@ -1,4 +1,4 @@
-# flow_pc_dump_for_neo4j
+# flow_pc_dump.py
 
 Dump Prism Central Flow policy and infra objects into JSON that `neo4j_db_insert.py` can prefetch.
 
@@ -23,12 +23,11 @@ That is the same interpreter the live `flow` / `microseg` services use:
 From your laptop / jump host:
 
 ```bash
-scp flow_pc_dump.py flow_pc_dump_for_neo4j.py \
-  nutanix@<PC_IP>:/home/nutanix/data/
+scp flow_pc_dump.py nutanix@<PC_IP>:/home/nutanix/data/
 ssh nutanix@<PC_IP>
 ```
 
-Place both scripts in `/home/nutanix/data/` (do **not** use `/tmp`; it is a small loop on many PCs).
+Copy **only** `flow_pc_dump.py` (idfcli, FlowInterfaces, atlas, OVN, and OVS are all in that file). Place it in `/home/nutanix/data/` (do **not** use `/tmp`; it is a small loop on many PCs).
 
 ## Run
 

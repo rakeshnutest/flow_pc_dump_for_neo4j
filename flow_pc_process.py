@@ -54,7 +54,7 @@ def main(argv=None):
     if HERE not in sys.path:
       sys.path.insert(0, HERE)
     try:
-      from flow_pc_dump_for_neo4j import process_dump
+      from flow_pc_dump import process_dump
     except ImportError as exc:
       print(
           "Cannot import dump helpers (%s). Convert on PCVM with the "
