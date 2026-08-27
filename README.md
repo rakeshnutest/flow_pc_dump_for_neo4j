@@ -1,8 +1,8 @@
 # flow_pc_dump.py
 
-PC dump is **collect only**. Convert and enrich run locally with `flow_pc_process.py`.
+PC dump is **collect only**. Copy **only** `flow_pc_dump.py` to the PC (system python3, no Flow venv). Convert/enrich is `flow_pc_map.py` + `flow_pc_process.py` on this workstation — do not copy those to the PC.
 
-On the PCVM, copy **one file** and use **system python3** (no Flow venv):
+On the PCVM:
 
 ```bash
 python3 /home/nutanix/data/flow_pc_dump.py \
@@ -18,7 +18,7 @@ python3 flow_pc_process.py --dump_dir /path/to/dump
 python3 flow_pc_process.py --dump_dir /path/to/dump --ingest --log_bundle_id N
 ```
 
-`process_dump` maps `idfcli/*.json` into `policies.json`, AG/SG/EG, VMs, NICs (stdlib only; no Flow venv).
+`flow_pc_process.py` calls `flow_pc_map.process_dump`, which maps `idfcli/*.json` into `policies.json`, AG/SG/EG, VMs, NICs (stdlib only; no Flow venv).
 
 ## Copy the script to the PC
 
@@ -84,8 +84,7 @@ Flags are argparse on the dump CLI. Flow venv is **not** required for dump.
 | `--output_dir` | `/home/nutanix/upgrade/flow_pc_dump` | Directory for per-dataset JSON + `all.json` + `dump.log` |
 | `--output` | `<output_dir>/all.json` | Combined JSON path |
 | `--log_file` | `<output_dir>/dump.log` | Log file |
-| `--from_json` | unset | Split an existing combined JSON; skip live fetch |
-| `--workers` | `16` | Parallel workers for dataset fetch + writes |
+| `--workers` | `16` | Parallel workers for idfcli types + writes |
 | `--dataset_timeout_secs` | `180` | Per-idfcli-type timeout |
 | `--fail_on_error` | off | Exit non-zero if any dataset fails |
 | `--skip_atlas` | off | Skip `atlas_cli port_set.list` / `port_set.get` |
@@ -140,25 +139,25 @@ python3 /home/nutanix/data/flow_pc_dump.py --help
 
 ## What process writes (local)
 
-`flow_pc_process.py` maps idfcli into prefetch JSON. Logged as `DUMP start` / `DUMP done` / `DATASET … dumped N records`.
+`flow_pc_process.py` / `flow_pc_map.py` map idfcli into prefetch JSON locally. Logged as `DUMP start` / `DUMP done` / `DATASET … dumped N records`. Source is **idfcli files**, not FlowInterfaces.
 
 | JSON key | Source | Used by `neo4j_db_insert.py` |
 |---|---|---|
-| `address_groups` | `interfaces.address_group_manager.iter_all()` | `create_ag_map` |
-| `service_groups` | `interfaces.service_group_manager.iter_all()` | `create_service_group_map` |
-| `entity_groups` | `interfaces.entity_group_manager.iter_all()` | `create_entity_group_map` |
-| `policies` | `interfaces.network_security_policy_manager.iter_all()` | `insert_policy_graph` (`policy["data"]`) |
-| `hosts` | `host_manager`, else `idfcli` `node` | `load_infrastructure_data` |
+| `address_groups` | `idfcli` `network_address_group` | `create_ag_map` |
+| `service_groups` | `idfcli` `network_service_group` (`.txt` zprotobuf ports) | `create_service_group_map` |
+| `entity_groups` | `idfcli` `network_entity_group` | `create_entity_group_map` |
+| `policies` | `idfcli` `network_security_policy` (`.txt` zprotobuf rules) | `insert_policy_graph` (`policy["data"]`) |
+| `hosts` | `idfcli` `node` | `load_infrastructure_data` |
 | `vms` | `idfcli` `vm` / `mh_vm`; NIC join from `virtual_nic`; VM categories from `abac_entity_capability` (`kind=vm`) | `_fetch_vms` |
 | `subnets` | `idfcli` `virtual_network` / `subnet` (`overlay_network_uuid`, `advanced_networking`); subnet categories from `abac_entity_capability` | `_fetch_subnets` |
 | `vpcs` | Overlay stubs from `overlay_network_uuid` plus ALL_VLAN `00000000-0000-0000-0000-000000000001` named `VLAN` | `create_vpc_map` |
 | `categories` | `idfcli` `abac_category` merged with `category` (`key:value`) | `create_category_map` |
-| `clusters` | `idfcli` `cluster` plus ncli VIP enrich | `load_infrastructure_data` |
+| `clusters` | `idfcli` `cluster` | `load_infrastructure_data` |
 | `projects` | `idfcli` `project` | `load_projects_data` |
 | `categories` | `idfcli` `category` | `create_category_map` |
 | `network_functions` | `idfcli` `network_function` | `load_network_functions_data` |
 | `vlan_unique_uuid` / `global_unique_uuid` | `zkcat` Flow ZK paths | `get_flow_unique_uuid` |
-| `fqdn_to_ip_map` | `fqdn_resolution_manager` or `idfcli` `fns_fqdn_to_ip_info` | EG FQDN expansion |
+| `fqdn_to_ip_map` | `idfcli` `fns_fqdn_to_ip_info` | EG FQDN expansion |
 | `port_set_list` | `atlas_cli -o json port_set.list` (SMSP/CMSP wrapped) | Atlas port-set inventory |
 | `port_set_get` | `atlas_cli -o json port_set.get <uuid>` for each listed UUID | Atlas port-set details (`virtual_nic_uuid_list`, …) |
 | `ahv_gateway` | PC mTLS AHV Gateway `:7030` per hypervisor | Host OVS / virsh / tap / brAtlas |
@@ -231,6 +230,7 @@ python3 clickhouse_flow/observe_leftovers.py \
 
 - Call Prism `v4_client` or construct `FlowInterfaces()` from the PC dump (Zeus)
 - Run dump from `/tmp` (small loop filesystem on many PCs)
+- Copy `flow_pc_map.py` or `flow_pc_process.py` to the PC (convert stays local)
 
 ## Example collected on a lab PC
 

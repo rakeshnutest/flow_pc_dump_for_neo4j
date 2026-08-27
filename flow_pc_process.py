@@ -54,11 +54,11 @@ def main(argv=None):
     if HERE not in sys.path:
       sys.path.insert(0, HERE)
     try:
-      from flow_pc_dump import process_dump
+      from flow_pc_map import process_dump
     except ImportError as exc:
       print(
-          "Cannot import dump helpers (%s). Convert on PCVM with the "
-          "flow venv, or pass --skip-convert --ingest for OVN only." % exc)
+          "Cannot import flow_pc_map (%s). Convert stays local "
+          "(not on PC). Pass --skip-convert --ingest for OVN only." % exc)
       if not args.ingest:
         return 1
     else:
