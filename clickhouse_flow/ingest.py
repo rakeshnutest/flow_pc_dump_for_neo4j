@@ -137,7 +137,7 @@ def scope_unique_uuid(scope, is_flex, vlan_uuid, global_uuid, policy_vpc_uuids):
         return GLOBAL_SCOPE_UNIQUE_ID if is_flex else global_uuid
     if scope in ("ALL_VLAN", "kAllVlan"):
         return VLAN_SCOPE_UNIQUE_ID if is_flex else vlan_uuid
-    if scope in ("VPC_AS_CATEGORY", "VPC_LIST") and policy_vpc_uuids:
+    if scope in ("VPC_AS_CATEGORY", "VPC_LIST", "VPC") and policy_vpc_uuids:
         return policy_vpc_uuids[0]
     return ""
 
@@ -440,12 +440,21 @@ def ips_in_range(start_ip, end_ip, cap=8192):
 def cidrs_from_addresses(addresses):
     out = []
     for addr in addresses or []:
+        if isinstance(addr, str):
+            text = addr.strip()
+            if text:
+                out.append(text)
+            continue
         if not isinstance(addr, dict):
             continue
         value = addr.get("value")
         prefix = addr.get("prefix_length")
         if value is not None and prefix is not None:
             out.append("%s/%s" % (value, prefix))
+        elif addr.get("ipv4") or addr.get("cidr"):
+            text = str(addr.get("ipv4") or addr.get("cidr") or "").strip()
+            if text:
+                out.append(text)
     return out
 
 
@@ -694,7 +703,7 @@ def policy_hash_vpc_refs(policy, scope):
     """Dump vpc_references / scope_references used as VPC_LIST unique uuid."""
     if scope == "VPC_AS_CATEGORY":
         return uuid_list(policy.get("scope_references"))
-    if scope == "VPC_LIST":
+    if scope in ("VPC_LIST", "VPC"):
         return uuid_list(
             policy.get("vpc_references") or policy.get("scope_references"))
     return []
@@ -1360,6 +1369,8 @@ def add_component(
         vlan_uuid, global_uuid, is_flex, is_endpoint,
         ipv4_only, ipv6_only, allowed, role=role)
     if not port_set:
+        if sel.get("addresses"):
+            return "ag_na"
         return "no_hash"
     rule_uuid = as_uuid(rule.get("ext_id")) or ZERO
     policy_uuid = as_uuid(policy.get("ext_id")) or ZERO
@@ -1877,6 +1888,10 @@ def _side_ag_sel(spec, prefix, ag_map):
     cidrs = []
     for uid in ag:
         cidrs.extend((ag_map.get(uid) or {}).get("subnet_list") or [])
+    # AG UUID list without dump CIDRs is not a hashable address-set.
+    # Fall through to category / EG selectors (APPLICATION order).
+    if not cidrs:
+        return None
     return {"addresses": ag, "subnet_list": cidrs}
 
 
@@ -1996,11 +2011,36 @@ def selectors_from_spec(spec, ag_map=None, rule_type=""):
     return out
 
 
+def unwrap_atlas_get_record(rec, uid=""):
+    """Handle atlas_cli data wrapped as {uuid: record, 'uuid': uuid}."""
+    if not isinstance(rec, dict):
+        return {}
+    nested = rec.get(uid) if uid else None
+    if isinstance(nested, dict) and (
+            "virtual_nic_uuid_list" in nested or nested.get("name") is not None):
+        nested = dict(nested)
+        nested.setdefault("uuid", uid)
+        return nested
+    if "virtual_nic_uuid_list" not in rec:
+        candidates = [
+            value for key, value in rec.items()
+            if key != "uuid" and isinstance(value, dict) and (
+                "virtual_nic_uuid_list" in value or value.get("name") is not None)]
+        if len(candidates) == 1:
+            inner = dict(candidates[0])
+            inner.setdefault("uuid", uid or inner.get("uuid"))
+            return inner
+    return rec
+
+
 def atlas_by_uuid(port_set_list, port_set_get):
     if isinstance(port_set_get, dict):
-        records = list(port_set_get.values())
+        records = [
+            unwrap_atlas_get_record(rec, uid)
+            for uid, rec in port_set_get.items()]
     else:
-        records = port_set_get or []
+        records = [
+            unwrap_atlas_get_record(rec) for rec in (port_set_get or [])]
     by_uuid = {}
     for rec in records:
         if not isinstance(rec, dict):
