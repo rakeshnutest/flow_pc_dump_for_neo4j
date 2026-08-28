@@ -5,11 +5,12 @@
 | Where | Script | What it does | How to invoke |
 |---|---|---|---|
 | **PCVM** | `flow_pc_dump.py` | Collect only (raw stdout/tarballs): idfcli, atlas_cli, flow_cli/kratos policy.list+get, AHV Gateway OVS, CMSP OVN | system `python3` on the PC (no Flow venv) |
+| **PCVM** | `vm_host_collect.py` | Dump one JSON: VM, IP, NIC, host, cluster | `python3 vm_host_collect.py` → `/tmp/vms.json` |
 | **This workstation** | `flow_pc_process.py` | Convert/enrich the dump, optional ClickHouse ingest | `python3 flow_pc_process.py --dump_dir …` |
-| **This workstation** | `vm_host_inventory.py` | One row per NIC: VM, IP, subnet, host, cluster | `python3 vm_host_inventory.py --dump_dir …` |
+| **This workstation** | `vm_host_inventory.py` | Same inventory from processed dump JSON | `python3 vm_host_inventory.py --dump_dir …` |
 | **This workstation** (not run by hand) | `flow_pc_map.py` | Maps `idfcli/` (and `policy_get.json`) into `policies.json` / AG / SG / EG / VMs | imported by `flow_pc_process.py` |
 
-Copy **only** `flow_pc_dump.py` to the PC. Do **not** copy `flow_pc_process.py` or `flow_pc_map.py`.
+Copy `flow_pc_dump.py` and `vm_host_collect.py` to the PC. Do **not** copy `flow_pc_process.py` or `flow_pc_map.py`.
 
 ## End-to-end: invoke in this order
 
@@ -31,6 +32,7 @@ tar member (~23G on a 32-host cluster). OVS/virsh/OVN alone is ~6G.
 
 ```bash
 scp "$REPO/flow_pc_dump.py" nutanix@$PC_IP:/home/nutanix/data/flow_pc_dump.py
+scp "$REPO/vm_host_collect.py" nutanix@$PC_IP:/home/nutanix/data/vm_host_collect.py
 ```
 
 ### 2. Collect on the PC (system python3, no Flow venv)
