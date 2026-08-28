@@ -4,13 +4,115 @@
 
 | Where | Script | What it does | How to invoke |
 |---|---|---|---|
-| **PCVM** | `flow_pc_dump.py` | Collect only: idfcli, atlas_cli, flow_cli/kratos policy.list+get, AHV Gateway OVS, CMSP OVN, Flow proto field map | system `python3` on the PC (no Flow venv) |
+| **PCVM** | `flow_pc_dump.py` | Collect only (raw stdout/tarballs): idfcli, atlas_cli, flow_cli/kratos policy.list+get, AHV Gateway OVS, CMSP OVN | system `python3` on the PC (no Flow venv) |
 | **This workstation** | `flow_pc_process.py` | Convert/enrich the dump, optional ClickHouse ingest | `python3 flow_pc_process.py --dump_dir …` |
 | **This workstation** (not run by hand) | `flow_pc_map.py` | Maps `idfcli/` (and `policy_get.json`) into `policies.json` / AG / SG / EG / VMs | imported by `flow_pc_process.py` |
 
 Copy **only** `flow_pc_dump.py` to the PC. Do **not** copy `flow_pc_process.py` or `flow_pc_map.py`.
 
-### PC — collect
+## End-to-end: invoke in this order
+
+Run these from a workstation that can SSH to the PC. ClickHouse is local
+`127.0.0.1:19000`. Set the three values once:
+
+```bash
+PC_IP=<PC_IP>
+DUMP=/path/to/dump          # local copy of the PC output
+BUNDLE=1                    # flow_policy / flow_ovn log_bundle_id
+REPO=/path/to/flow_pc_dump_github
+```
+
+Do **not** write the PC dump under `/tmp` (small loop). Use
+`/home/nutanix/upgrade/…`. AHV Gateway extracts every networking/avm/ovn
+tar member (~23G on a 32-host cluster). OVS/virsh/OVN alone is ~6G.
+
+### 1. Copy the dump script to the PC
+
+```bash
+scp "$REPO/flow_pc_dump.py" nutanix@$PC_IP:/home/nutanix/data/flow_pc_dump.py
+```
+
+### 2. Collect on the PC (system python3, no Flow venv)
+
+```bash
+ssh nutanix@$PC_IP
+python3 /home/nutanix/data/flow_pc_dump.py \
+  --output_dir /home/nutanix/upgrade/flow_pc_dump \
+  --workers 16 \
+  --atlas_get_workers 32 \
+  --dataset_timeout_secs 180 \
+  --atlas_timeout_secs 1800 \
+  --flow_cli_timeout_secs 1800 \
+  --ahv_gateway_timeout_secs 1800 \
+  --cmsp_ovn_timeout_secs 1800
+```
+
+Wait until `DUMP done` is in `/home/nutanix/upgrade/flow_pc_dump/dump.log`
+and `all.json` exists. Convert is **not** run on the PC.
+
+### 3. Copy the dump off the PC
+
+```bash
+mkdir -p "$DUMP"
+rsync -a nutanix@$PC_IP:/home/nutanix/upgrade/flow_pc_dump/ "$DUMP/"
+```
+
+### 4. Optional: drop an existing ClickHouse bundle
+
+Skip if `BUNDLE` is new. Re-ingest of the same id already drops that
+partition first. To wipe one id and stop:
+
+```bash
+cd "$REPO"
+python3 clickhouse_flow/ingest.py --drop-bundle "$BUNDLE"
+python3 clickhouse_ovn/ingest.py --drop-bundle "$BUNDLE"
+```
+
+### 5. Convert locally, then ingest OVN + flow_policy
+
+```bash
+cd "$REPO"
+python3 flow_pc_process.py \
+  --dump_dir "$DUMP" \
+  --timeout_secs 1800 \
+  --ingest \
+  --log_bundle_id "$BUNDLE"
+```
+
+That writes `policies.json` / `vms.json` / … under `$DUMP`, then:
+
+- `clickhouse_ovn/ingest.py --dump_dir "$DUMP" --log_bundle_id "$BUNDLE"`
+- `clickhouse_flow/ingest.py --dump_dir "$DUMP" --log_bundle_id "$BUNDLE"`
+
+Ingest only (dump already converted):
+
+```bash
+python3 flow_pc_process.py --dump_dir "$DUMP" --skip-convert --ingest --log_bundle_id "$BUNDLE"
+```
+
+### 6. Compare computed port-sets to Atlas
+
+```bash
+cd "$REPO"
+python3 clickhouse_flow/compare.py --log_bundle_id "$BUNDLE"
+```
+
+Identity is **port-set UUID**. Names are display. A FAIL with four Atlas
+leftover empty-NIC UUIDs (`App_680_No_VMs` / `App_681_No_VMs`) is the
+known leftover set, not a dump failure.
+
+### 7. Optional: leftover observations
+
+```bash
+cd "$REPO"
+python3 clickhouse_flow/observe_leftovers.py \
+  --from_ch --log_bundle_id "$BUNDLE" \
+  --dump_dir "$DUMP" \
+  --out clickhouse_flow/leftover_observations.md
+```
+
+### PC — collect (flags and output layout)
+
 
 From your laptop / jump host:
 
@@ -37,7 +139,7 @@ python3 /home/nutanix/data/flow_pc_dump.py \
   --atlas_timeout_secs 1800
 ```
 
-That writes `idfcli/`, `ahv_gateway/` (OVS), `cmsp_ovn/` (OVN), atlas `port_set_list.json` / `port_set_get.json`, `policy_list.json` / `policy_get.json` from `flow_cli` (CMSP on the PC or kratos on SMSP), and `service_group_list.json` / `service_group_get.json` from v4 `ServiceGroupGet`. It does **not** call FlowInterfaces, convert policies, or write `policies.json`. Help: `python3 /home/nutanix/data/flow_pc_dump.py --help`.
+That writes **raw** command output: `idfcli/` (`idfcli get entity --all -o json` stdout as-is), `ahv_gateway/` (all AHV Gateway OVS/virsh tar members), `cmsp_ovn/` (OVN), atlas `port_set_list.json` / `port_set_get.json`, `policy_list.json` / `policy_get.json` from `flow_cli` (CMSP on the PC or kratos on SMSP), and `service_group_list.json` / `service_group_get.json` from v4 `ServiceGroupGet`. Dump does **not** flatten, unwrap, convert, or write `policies.json`. Help: `python3 /home/nutanix/data/flow_pc_dump.py --help`.
 
 ### Local — convert (after rsync)
 
@@ -68,7 +170,7 @@ Writes under `--output_dir` (default `/home/nutanix/upgrade/flow_pc_dump/`).
   all.json                 # dump index (not prefetch policies)
   dump.log
   unique_uuids.json
-  idfcli/                  # raw idfcli get entitytype
+  idfcli/                  # idfcli get entity --all -o json (raw stdout)
   port_set_list.json
   port_set_get.json
   policy_list.json
@@ -101,7 +203,7 @@ Flags are argparse on the dump CLI. Flow venv is **not** required for dump.
 | `--flow_cli_timeout_secs` | `1800` | Timeout for `policy.list` and the `policy.get` batch |
 | `--flow_cli_get_workers` | `32` | Parallel `policy.get` (capped at 8 inside the kratos pod) |
 | `--skip_ahv_gateway` | off | Skip AHV Gateway host collect (default **on**: OVS/virsh/tap/brAtlas from every PE hypervisor) |
-| `--ahv_gateway_timeout_secs` | `1800` | Retry budget across all hosts until every required artifact exists |
+| `--ahv_gateway_timeout_secs` | `1800` | Unused for filtering; kept for CLI compatibility |
 | `--ahv_gateway_class_timeout_secs` | `300` | Per-class bugtool HTTP timeout |
 | `--ahv_gateway_workers` | `8` | Parallel hypervisor collects |
 | `--ahv_gateway_port` | `7030` | AHV Gateway HTTPS port |
@@ -109,21 +211,13 @@ Flags are argparse on the dump CLI. Flow venv is **not** required for dump.
 | `--skip_cmsp_ovn` | off | Skip CMSP kubectl OVN NB/SB dump (default **on**) |
 | `--cmsp_ovn_timeout_secs` | `1800` | Retry budget until NB and SB `ovsdb-client dump` exist |
 | `--cmsp_ovn_namespace` | empty | Kubernetes namespace; empty searches all namespaces |
-| `--skip_flow_proto` | **on** | Skip Flow protobuf field map (unused; convert uses CLI/v4 JSON) |
-| `--collect_flow_proto` | off | Opt in to copy this PC's `*_pb2.py` field map |
+| `--skip_flow_proto` | **on** | No-op (Flow proto field map is not collected) |
 
 **SMSP vs CMSP (auto-detected, no flag):** `mspctl cluster get flow --verbose` `ClusterUUID` (same as `AtlasCliHelper` / `FnsPortSetValidator`), with `mspctl cluster list` as fallback. A flow MSP UUID is SMSP → every `atlas_cli` uses `-u ws://smsp-<uuid>.ntnx-ikat.svc:2060/atlas_cli`. OVN kubectl uses `mspctl cluster kubeconfig flow` (pods such as `anc-ovn-0` live in the flow cluster, often `ntnx-flow`, not PC MSP kube). `vlan_unique_uuid` / `global_unique_uuid` also come from the flow Atlas pod ZooKeeper (`ZookeeperSession.get` of `/appliance/logical/flow/{vlan,global}_unique_uuid`), not PC `zkcat` — same as `MicrosegHelper.get_flow_unique_uuid` when `flow_smsp`. Policy details: `kubectl -n ntnx-flow exec <kratos-pod> -- bash -lc 'kratos_cli|flow_cli -o json policy.list|get <uuid>'` (never `-it`; this image's binary is `flow_cli`, runbook name `kratos_cli`). If the kratos exec fails, dump falls back to PC `flow_cli -u ws://smsp-<uuid>.ntnx-ikat.svc:2051/flow_cli`. No `flow` cluster (404 / only `controller_msp`) plus a local `genesis status` Atlas process is CMSP → `atlas_cli` on the PCVM, `bash -lc 'flow_cli -o json policy.list|get <uuid>'` on the PCVM, PC `zkcat` for unique UUIDs, and default PC kubectl for OVN. `port_set.list` → `port_set_list.json`; each `port_set.get <uuid>` → `port_set_get.json`. `policy.list` → `policy_list.json`; each `policy.get <uuid>` → `policy_get.json`. Convert requires `policy_get.json` for rules. Service groups: v4 `ServiceGroupGet` (not v3 `POST /service_groups/list`) → `service_group_list.json` / `service_group_get.json`; convert requires those files. SMSP runs that RPC inside the kratos pod.
 
-**AHV Gateway host collect (default on, never SSH to AHV):** The script mTLS-calls each PE hypervisor at `:7030` with the PC `ClusterHealthService` cert and **retries until all of these exist per host**:
+**AHV Gateway host collect (default on, never SSH to AHV):** mTLS to each PE hypervisor at `:7030` with the PC `ClusterHealthService` cert. Downloads advertised networking / avm / ovn / ovs bugtool classes and **extracts every tar member** (no keep-filter). Convert/OVN tools read those files later.
 
-- `ovs-vsctl show`
-- `ovs-dpctl -s show`
-- `ovs-ofctl dump-flows brAtlas` (and any other `brAtlas` ofctl outputs in the `networking` class)
-- `virsh list --all` + `virsh dumpxml` (tap/MAC per VM)
-- tap devices
-- OVN/OVS DB (`ovn*.db` / `conf.db`, plus an `ovn` bugtool class if advertised)
-
-Layout: `<output_dir>/ahv_gateway/<hypervisor_ip>/` plus `ahv_gateway.json`. Complete when **every** PE host has the required OVS/virsh/tap artifacts.
+Layout: `<output_dir>/ahv_gateway/<hypervisor_ip>/` plus `ahv_gateway.json`.
 
 **OVN NB/SB (default on):** OVN Northbound/Southbound live in kubectl pods (`anc-ovn-0` / container `anc-ovn`), not on AHV. CMSP uses PC kubectl; SMSP uses the flow-cluster kubeconfig. The dump runs (no `-it`):
 
@@ -134,7 +228,7 @@ sudo kubectl exec anc-ovn-0 -c anc-ovn -- ovsdb-client dump unix:/var/run/ovn/ov
 
 It retries until both dumps exist. Layout: `<output_dir>/cmsp_ovn/anc-ovn/commands/ovsdb-client_dump_{nb,sb}.txt`.
 
-**Flow proto field map (default off):** Convert no longer decodes IDF `__zprotobuf__`. Policy rules come from `policy_get.json`; service-group ports come from `service_group_get.json`. Pass `--collect_flow_proto` only if you still want this PC's `*_pb2.py` FileDescriptor copied into `<output_dir>/flow_proto/fields.json`.
+**Flow proto field map:** Not collected. Convert does not decode IDF `__zprotobuf__`. Policy rules come from `policy_get.json`; service-group ports come from `service_group_get.json`. `--skip_flow_proto` / `--collect_flow_proto` are accepted and ignored.
 
 **Policy CLI (default on, always bash, never `-it`):** Required for convert. Writes `policy_list.json` / `policy_get.json`.
 
@@ -206,6 +300,30 @@ Each VM NIC `nic_network_info` includes:
 - `vpc.ext_id`, `vpc.name` (never empty; overlay name inferred from subnet prefix), `vpc.categories`, `vpc.category_ids`
 
 The IDF `vm` entity has no `category_id_list`. VM/subnet/VPC categories are joined from `idfcli abac_entity_capability` (`kind` + `kind_id` / `uuid` + `category_id_list`).
+
+**VMs / NICs / subnets / categories source:** dump collects Insights **JSON**, not proto-text and not Prism.
+
+```bash
+idfcli get entity -e vm --all -o json
+idfcli get entity -e virtual_nic --all -o json
+idfcli get entity -e virtual_network --all -o json
+idfcli get entity -e abac_category --all -o json
+idfcli get entity -e category --all -o json
+idfcli get entity -e abac_entity_capability --all -o json
+```
+
+Dump writes that JSON **as-is**. Convert (`flow_pc_process.py`) flattens `entity_guid` + `attribute_data_map` into named-attribute dicts (`ext_id`, `vm_name`, `virtual_nic_uuids`, `connected`, `nic_index`, `advanced_networking`, `overlay_network_uuid`, `category_id_list`, …) and **drops `__zprotobuf__`**. Convert still reads older already-flat `idfcli/*.json` and proto-text `idfcli/*.txt` dumps.
+
+Ways that do **not** work for this dump (no Prism user/pass, no SSH to AHV):
+
+| Source | Why not |
+|---|---|
+| Prism v4 VMM / networking / categories | OIDC |
+| v3 `/vms/list`, `/subnets/list`, `/categories/list` | Prism auth; next-gen/EPM blocks v3 |
+| `ncli` / `acli` | Not a PC JSON inventory; would need AHV |
+| `atlas_cli` | Port-sets only |
+| `flow_cli` | Policies, not VM/NIC/subnet/category inventory |
+| `idfcli get entitytype` proto-text | Named attrs plus `__zprotobuf__`; convert never needed the blob |
 
 VLAN NICs use the same ALL_VLAN VPC as `neo4j_db_insert.py`: uuid `00000000-0000-0000-0000-000000000001`, name `VLAN`. Overlay NICs use `overlay_network_uuid`.
 

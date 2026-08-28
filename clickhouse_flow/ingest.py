@@ -2083,9 +2083,15 @@ def selectors_from_spec(spec, ag_map=None, rule_type=""):
 
 
 def unwrap_atlas_get_record(rec, uid=""):
-    """Handle atlas_cli data wrapped as {uuid: record, 'uuid': uuid}."""
+    """Handle atlas_cli {data:{uuid: record}} and {uuid: record} wrappers."""
     if not isinstance(rec, dict):
         return {}
+    if "data" in rec and "virtual_nic_uuid_list" not in rec:
+        data = rec.get("data")
+        if isinstance(data, dict):
+            rec = data
+        elif isinstance(data, list) and data and isinstance(data[0], dict):
+            rec = data[0]
     nested = rec.get(uid) if uid else None
     if isinstance(nested, dict) and (
             "virtual_nic_uuid_list" in nested or nested.get("name") is not None):
@@ -2121,7 +2127,15 @@ def atlas_by_uuid(port_set_list, port_set_get):
             by_uuid[uid] = rec
     listed = port_set_list or []
     if isinstance(listed, dict):
-        listed = list(listed.values())
+        data = listed.get("data")
+        if isinstance(data, list):
+            listed = data
+        elif isinstance(data, dict):
+            listed = [
+                dict(v, uuid=k) if isinstance(v, dict) else k
+                for k, v in data.items()]
+        else:
+            listed = list(listed.values())
     out = {}
     for item in listed:
         uid = as_uuid(item.get("uuid") if isinstance(item, dict) else item)

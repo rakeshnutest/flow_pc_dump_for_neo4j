@@ -1221,7 +1221,8 @@ def _unwrap_list(payload):
 
 # ---------------------------------------------------------------------------
 # Read dumped idfcli files. process_dump sets _IDF_FILE_DIR to dump_dir/idfcli.
-# _idfcli_one then loads <type>.json (or .txt for SG/policy zprotobuf).
+# _idfcli_one then loads <type>.json (flattened Insights JSON). Older dumps
+# may still have proto-text <type>.txt; convert still reads that fallback.
 # ---------------------------------------------------------------------------
 
 def _idfcli_bin():
@@ -1321,6 +1322,12 @@ def _idfcli_one(entity_type, timeout=180):
 
 
 def _idf_loaded_rows(parsed):
+  if isinstance(parsed, dict) and (
+      parsed.get("entity") is not None
+      or parsed.get("entities") is not None
+      or parsed.get("attribute_data_map")
+      or parsed.get("entity_guid")):
+    return _parse_idf_json_entities(parsed)
   rows = []
   if isinstance(parsed, list):
     rows = parsed
@@ -1333,10 +1340,19 @@ def _idf_loaded_rows(parsed):
       if isinstance(val, dict) and val:
         rows = [val]
         break
+  out = []
   for row in rows:
-    if isinstance(row, dict):
-      row.pop("__zprotobuf__", None)
-  return rows
+    if not isinstance(row, dict):
+      continue
+    if row.get("attribute_data_map") or row.get("entity_guid"):
+      flat = _flatten_idf_json_entity(row)
+      if flat:
+        out.append(flat)
+      continue
+    row = dict(row)
+    row.pop("__zprotobuf__", None)
+    out.append(row)
+  return out
 
 
 def _idf_unquote(raw):
@@ -1362,6 +1378,122 @@ def _idf_bytes_to_value(raw):
     return _uuid_str(data) or data.hex()
   decoded = data.decode("utf-8", "replace")
   return _uuid_str(decoded) or decoded
+
+
+def _idf_json_value(value):
+  """Unwrap Insights JSON value wrappers. Not protobuf field numbers."""
+  if value is None:
+    return None
+  if isinstance(value, list):
+    return [_idf_json_value(item) for item in value]
+  if not isinstance(value, dict):
+    return value
+  if "str_list" in value:
+    inner = value.get("str_list")
+    items = []
+    if isinstance(inner, dict):
+      items = list(inner.get("value_list") or [])
+    elif isinstance(inner, list):
+      items = inner
+    out = []
+    for item in items:
+      if isinstance(item, str):
+        out.append(_uuid_str(item) or _idf_unquote(item))
+      else:
+        out.append(item)
+    return out
+  if "value_list" in value and set(value.keys()) <= set(
+      ("value_list", "timestamp_usecs")):
+    return [_idf_json_value(item) for item in (value.get("value_list") or [])]
+  if "str_value" in value:
+    text = str(value.get("str_value") or "")
+    return _uuid_str(text) or _idf_unquote(text)
+  if "bool_value" in value:
+    return bool(value.get("bool_value"))
+  for key in ("int64_value", "uint64_value", "int32_value"):
+    if key in value:
+      try:
+        return int(value.get(key))
+      except (TypeError, ValueError):
+        return value.get(key)
+  for key in ("double_value", "float_value"):
+    if key in value:
+      try:
+        return float(value.get(key))
+      except (TypeError, ValueError):
+        return value.get(key)
+  if "bytes_value" in value:
+    return _idf_bytes_to_value(value.get("bytes_value") or "")
+  if "bytes_list" in value:
+    inner = value.get("bytes_list")
+    items = inner.get("value_list") if isinstance(inner, dict) else inner
+    return [_idf_bytes_to_value(item) for item in (items or [])]
+  return value
+
+
+def _flatten_idf_json_entity(ent):
+  if not isinstance(ent, dict):
+    return None
+  attrs = {}
+  guid = ent.get("entity_guid") or {}
+  if isinstance(guid, dict):
+    uid = _uuid_str(guid.get("entity_id") or "") or str(guid.get("entity_id") or "")
+    if uid:
+      attrs["ext_id"] = uid
+  elif ent.get("ext_id") or ent.get("entity_id"):
+    uid = _uuid_str(ent.get("ext_id") or ent.get("entity_id") or "")
+    if uid:
+      attrs["ext_id"] = uid
+  adm = ent.get("attribute_data_map")
+  items = []
+  if isinstance(adm, list):
+    items = adm
+  elif isinstance(adm, dict):
+    if adm.get("name"):
+      items = [adm]
+    else:
+      items = [{"name": key, "value": val} for key, val in adm.items()]
+  if not items and not adm:
+    row = dict(ent)
+    row.pop("attribute_data_map", None)
+    row.pop("__zprotobuf__", None)
+    if attrs.get("ext_id"):
+      row.setdefault("ext_id", attrs["ext_id"])
+    return row
+  for item in items:
+    if not isinstance(item, dict):
+      continue
+    name = item.get("name") or ""
+    if not name or name == "__zprotobuf__":
+      continue
+    if "value" in item:
+      attrs[name] = _idf_json_value(item.get("value"))
+    else:
+      attrs[name] = _idf_json_value(
+          {key: val for key, val in item.items() if key != "name"})
+  return attrs or None
+
+
+def _parse_idf_json_entities(payload):
+  ents = []
+  if isinstance(payload, dict):
+    raw = payload.get("entity")
+    if raw is None:
+      raw = payload.get("entities")
+    if isinstance(raw, list):
+      ents = raw
+    elif isinstance(raw, dict):
+      ents = [raw]
+    elif payload.get("attribute_data_map") or payload.get("entity_guid"):
+      ents = [payload]
+  elif isinstance(payload, list):
+    ents = payload
+  rows = []
+  for ent in ents:
+    row = _flatten_idf_json_entity(ent)
+    if row:
+      rows.append(row)
+  return rows
 
 
 def _parse_idf_entities(text):
@@ -3251,25 +3383,29 @@ def _map_service_group(row):
 
 
 def fetch_service_groups_from_dump():
-  """v4 service_group_get.json only. No IDF zprotobuf."""
-  gets = {}
-  listed = []
+  """Raw ServiceGroupGet JSON or older uuid-keyed file."""
+  gets, listed = {}, []
   if _DUMP_DIR:
     gets = _load_json_if_present(
         os.path.join(_DUMP_DIR, "service_group_get.json"), {})
     listed = _load_json_if_present(
         os.path.join(_DUMP_DIR, "service_group_list.json"), [])
   records = []
-  if isinstance(gets, dict) and gets:
+  if isinstance(gets, dict) and isinstance(gets.get("service_group_list"), list):
+    records = [x for x in gets["service_group_list"] if isinstance(x, dict)]
+  elif isinstance(listed, dict) and isinstance(listed.get("service_group_list"), list):
+    records = [x for x in listed["service_group_list"] if isinstance(x, dict)]
+  elif isinstance(gets, dict) and gets:
     for uid, rec in gets.items():
-      if isinstance(rec, dict):
-        row = dict(rec)
-        row.setdefault("extId", uid)
-        records.append(row)
+      if uid == "service_group_list" or not isinstance(rec, dict):
+        continue
+      row = dict(rec)
+      row.setdefault("extId", uid)
+      records.append(row)
   elif isinstance(gets, list):
-    records = [item for item in gets if isinstance(item, dict)]
+    records = [x for x in gets if isinstance(x, dict)]
   if not records and isinstance(listed, list):
-    records = [item for item in listed if isinstance(item, dict)]
+    records = [x for x in listed if isinstance(x, dict)]
   rows = []
   for rec in records:
     mapped = _map_service_group(rec)
@@ -4744,7 +4880,7 @@ def fetch_fqdn_map(interfaces):
 
 
 def _normalize_port_set_get(gets):
-  """Unwrap atlas_cli nested {uuid: rec} so ingest sees one rec per UUID."""
+  """Unwrap atlas_cli {data:{uuid: rec}} so ingest sees one rec per UUID."""
   if not isinstance(gets, dict):
     return gets or {}
   out = {}
@@ -4752,13 +4888,19 @@ def _normalize_port_set_get(gets):
     if not isinstance(rec, dict):
       continue
     inner = rec
-    nested = rec.get(uid)
+    if "data" in inner and "virtual_nic_uuid_list" not in inner:
+      data = inner.get("data")
+      if isinstance(data, dict):
+        inner = data
+      elif isinstance(data, list) and data and isinstance(data[0], dict):
+        inner = data[0]
+    nested = inner.get(uid) if uid else None
     if isinstance(nested, dict) and (
         "virtual_nic_uuid_list" in nested or nested.get("name") is not None):
       inner = nested
-    elif "virtual_nic_uuid_list" not in rec:
+    elif "virtual_nic_uuid_list" not in inner:
       candidates = [
-          value for key, value in rec.items()
+          value for key, value in inner.items()
           if key != "uuid" and isinstance(value, dict) and (
               "virtual_nic_uuid_list" in value or value.get("name") is not None)]
       if len(candidates) == 1:
