@@ -1,8 +1,10 @@
 #!/usr/bin/env python
-"""Process an idfcli + OVN + OVS + atlas dump off the PC. No live PC APIs.
+"""Process an idfcli + OVN + OVS + atlas + flow_cli dump off the PC. No live PC APIs.
 
-Maps idfcli/*.json into prefetch JSON (vms, policies, AG/SG/EG, ...).
-Does not call idfcli, kubectl, AHV Gateway, FlowInterfaces, or atlas_cli.
+Maps idfcli/*.json plus policy_get.json and service_group_get.json into prefetch JSON.
+Does not call idfcli, kubectl, AHV Gateway, FlowInterfaces, atlas_cli, or flow_cli.
+flow_cli policy.get is required for policies. v4 ServiceGroupGet is required
+for service groups. No IDF zprotobuf.
 
   python3 flow_pc_process.py --dump_dir /path/to/dump
   python3 flow_pc_process.py --dump_dir /path/to/dump --ingest --log_bundle_id 2

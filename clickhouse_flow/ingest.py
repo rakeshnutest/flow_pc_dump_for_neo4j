@@ -2,7 +2,13 @@
 """Ingest dump JSON into the flat flow_policy.portset table.
 
 Self-contained: stdlib + clickhouse-client. No nutest, no neo4j, no pip.
-Hash is in this file (uuid5 for APPLICATION, MD5 salus+scope for FLEX).
+Hash is in this file:
+
+- Security Policy (APPLICATION / INTRA_GROUP / ISOLATION / QUARANTINE
+  non-FLEX rules): uuid5(dump unique UUID, Python list). CMSP unique UUIDs
+  come from PC zkcat; SMSP from Atlas-pod ZK. Dump already picked the source.
+- FLEX rules (any policy.type, SMSP or CMSP): MD5(Salus + scope-id + Go
+  slice). Allow-any is the empty slice ``[]``, not ``[all]``.
 """
 
 from __future__ import annotations
@@ -25,12 +31,15 @@ ZERO = "00000000-0000-0000-0000-000000000000"
 ALL_VLAN_VPC = "00000000-0000-0000-0000-000000000001"
 DEFAULT_PROJECT_EXT_ID = ZERO
 ISOLATION_RULE_TYPES = frozenset(("TWO_ENV_ISOLATION", "MULTI_ENV_ISOLATION"))
+FLEX_RULE_TYPES = frozenset(("FLEX", "KFLEX"))
 ALLOW_ANY_SPECS = frozenset(("ALL", "NONE"))
 GLOBAL_SCOPE_UNIQUE_ID = "global-scope-unique-id"
 VLAN_SCOPE_UNIQUE_ID = "vlan-scope-unique-id"
-SALUS_SERVICE_NAME = "salus"
+# flow-salus common/constants.go: SalusServiceName
+SALUS_SERVICE_NAME = "Salus"
 ATLAS_ALLOW_ANY = "all"
 CATEGORY_SELECTION_TYPE_MAP = {"VM": "kVM", "SUBNET": "kSubnet", "VPC": "kVPC"}
+CAT_ENTITY_KINDS = ("VM", "SUBNET", "VPC")
 UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -78,31 +87,63 @@ def uuid_list(values):
     return out
 
 
+def is_flex_rule(rule_or_type):
+    """True for FLEX rules. Policy.type APPLICATION is Security Policy."""
+    if isinstance(rule_or_type, dict):
+        rule_or_type = rule_or_type.get("type")
+    return str(rule_or_type or "").upper() in FLEX_RULE_TYPES
+
+
+def cat_entity_kind(value, default="VM"):
+    """VM / SUBNET / VPC. Accept dump kSubnet and a one-item list."""
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else default
+    text = str(value or default).strip()
+    if text.lower().startswith("k") and len(text) > 1:
+        text = text[1:]
+    upper = text.upper()
+    if upper in CAT_ENTITY_KINDS:
+        return upper
+    return default
+
+
+def _port_set_identifier(entity_type, refs, project_uuid, is_flex):
+    refs = list(refs or [])
+    if is_flex:
+        body = "[" + " ".join(sorted(str(item) for item in refs)) + "]"
+    else:
+        body = str(sorted(list(refs)))
+        body = _U_QUOTE.sub(lambda m: "u" + m.group(0), body)
+    kind = str(entity_type or "")
+    if kind and kind not in ("VM", "EG"):
+        kind = cat_entity_kind(kind, "")
+        suffix = CATEGORY_SELECTION_TYPE_MAP.get(kind)
+        if suffix:
+            body = body + ":" + str(suffix)
+    if project_uuid and project_uuid != DEFAULT_PROJECT_EXT_ID:
+        body = body + ":project:" + project_uuid
+    return body
+
+
 def atlas_port_set_id(entity_type, refs, unique_uuid, project_uuid=None,
                       is_flex=False):
-    """APPLICATION: uuid5(scope uuid, sorted refs). FLEX: MD5(salus+scope+refs)."""
-    refs = list(refs or [])
+    """Security Policy: uuid5(scope UUID, Python list). FLEX: Salus MD5."""
     if not unique_uuid:
         return ""
+    body = _port_set_identifier(entity_type, refs, project_uuid, is_flex)
     if is_flex:
-        body = "[" + " ".join(sorted(refs)) + "]"
-        body = _U_QUOTE.sub(lambda m: "u" + m.group(0), body)
-        if entity_type and entity_type not in ("VM", "EG"):
-            suffix = CATEGORY_SELECTION_TYPE_MAP.get(entity_type)
-            if suffix:
-                body = body + ":" + str(suffix)
-        if project_uuid and project_uuid != DEFAULT_PROJECT_EXT_ID:
-            body = body + ":project:" + project_uuid
         digest = hashlib.md5(
             (SALUS_SERVICE_NAME + unique_uuid + body).encode()).digest()
         return str(uuid_lib.UUID(bytes=digest))
-    body = str(sorted(list(refs)))
-    body = _U_QUOTE.sub(lambda m: "u" + m.group(0), body)
-    if entity_type and entity_type not in ("VM", "EG"):
-        body = body + ":" + str(CATEGORY_SELECTION_TYPE_MAP.get(entity_type))
-    if project_uuid and project_uuid != DEFAULT_PROJECT_EXT_ID:
-        body = body + ":project:" + project_uuid
     return str(uuid_lib.uuid5(uuid_lib.UUID(str(unique_uuid)), body))
+
+
+def generate_port_set_id(
+        reference_info, unique_uuid, project_uuid=None, is_flex=False):
+    """neo4j_db_insert / observe_leftovers: (entity_type, refs), namespace."""
+    entity_type, refs = reference_info
+    return atlas_port_set_id(
+        entity_type, refs, unique_uuid, project_uuid, is_flex=is_flex)
 
 
 def apply_ip_version_combo(
@@ -129,6 +170,21 @@ def dump_allow_any(sel):
         or sel.get("should_allow_any_dst")
         or sel.get("src_allow_spec") in ALLOW_ANY_SPECS
         or sel.get("dest_allow_spec") in ALLOW_ANY_SPECS)
+
+
+def skip_computed_port_set(sel, is_flex=False):
+    """Skip selectors that Atlas does not store as a hashed port-set.
+
+    FLEX missing applied_to_entity_group_references is UI Global (no port-set).
+    Security Policy allow-any uses Atlas token all — not a hashed UUID.
+    FLEX allow-any is a real port-set (empty Go slice).
+    """
+    if ("applied_to_entity_group_references" in sel
+            and sel.get("applied_to_entity_group_references") is None):
+        return True
+    if is_flex:
+        return False
+    return dump_allow_any(sel)
 
 
 def scope_unique_uuid(scope, is_flex, vlan_uuid, global_uuid, policy_vpc_uuids):
@@ -163,7 +219,8 @@ def port_set_uuid(
         refs = [eg]
     elif allow_any:
         entity_type = "VM"
-        refs = [ATLAS_ALLOW_ANY]
+        # FLEX Salus: fmt %v of empty []string is "[]". Security Policy: "all".
+        refs = [] if is_flex else [ATLAS_ALLOW_ANY]
     elif uuid_list(sel.get("vm_category_refs")):
         entity_type = "VM"
         refs = uuid_list(sel.get("vm_category_refs"))
@@ -183,7 +240,7 @@ def port_set_uuid(
         return "", [], ""
     unique = scope_unique_uuid(
         scope, is_flex, vlan_uuid, global_uuid, policy_vpc_uuids)
-    if not entity_type or not refs or not unique:
+    if entity_type is None or refs is None or not unique:
         return "", [], ""
     hashed = atlas_port_set_id(
         entity_type, refs, unique, project_uuid, is_flex=is_flex)
@@ -203,9 +260,6 @@ def compute_addressset_hashes(entity_uuid, has_ipv4, has_ipv6):
     else:
         hashes.append(str(uuid_lib.uuid5(vid, "IPv4")))
     return hashes
-
-
-generate_port_set_id = atlas_port_set_id
 
 
 def namespace_for_policy(policy, vlan_uuid, global_uuid):
@@ -715,10 +769,7 @@ def is_allow_all_selector(sel):
     FLEX applied_to with applied_to_entity_group_references missing is
     UI Global (no Atlas port-set).
     """
-    if dump_allow_any(sel):
-        return True
-    if ("applied_to_entity_group_references" in sel
-            and sel.get("applied_to_entity_group_references") is None):
+    if skip_computed_port_set(sel, is_flex=False):
         return True
     return False
 
@@ -747,20 +798,19 @@ def hash_selector(
     """Dump selector -> Atlas port-set UUID via port_set_uuid.
 
     Skip FLEX Global applied_to (dump key applied_to_entity_group_references
-    missing). AppliedTo hashes in global-scope-unique-id with no CIDRs.
+    missing). AppliedTo uses the policy scope, same as Salus.
+    FLEX allow-any is hashed; Security Policy allow-any is skipped.
     """
-    # FnsPortSetValidator skips Atlas token "all". Do not emit a computed
-    # port-set UUID Atlas will never list.
-    if is_allow_all_selector(sel):
+    if skip_computed_port_set(sel, is_flex):
         return "", [], ""
     applied = role == "applied_to"
     return port_set_uuid(
         sel,
-        scope="GLOBAL" if applied else scope,
+        scope=scope,
         project_uuid=project_uuid or DEFAULT_PROJECT_EXT_ID,
         vlan_uuid=vlan_uuid,
         global_uuid=global_uuid,
-        policy_vpc_uuids=[] if applied else vpc_refs,
+        policy_vpc_uuids=vpc_refs,
         is_flex=is_flex,
         as_address_set=(is_flex or is_endpoint) and not applied,
         skip_cidrs=applied,
@@ -962,12 +1012,16 @@ def match_nics(
         sel.get("exception_list") or [], ipv4_only, ipv6_only,
         is_ipv6_traffic_allowed)
 
-    if is_allow_all_selector(sel):
-        if role not in ("src", "dest"):
-            return set()
-        if project_uuid and project_uuid != ZERO:
-            return set(index["by_project"].get(project_uuid, set()))
-        return set(index["all_nics"])
+    # FnsPortSetValidator: Skip if 'all' is present (vm_category_refs /
+    # subnet_category_refs / vpc_category_refs). Skip 'any' on VPC refs.
+    # Do not expand those NICs into computed_nic_uuids.
+    if (
+            "all" in (sel.get("vm_category_refs") or [])
+            or "all" in (sel.get("subnet_category_refs") or [])
+            or "all" in (sel.get("vpc_category_refs") or [])
+            or "any" in (sel.get("vpc_category_refs") or [])
+            or dump_allow_any(sel)):
+        return set()
 
     if vm_ext or sub_ext:
         out = set()
@@ -1161,6 +1215,8 @@ def collect_nics(vms, subnets=None, vpc_names=None, host_map=None, vpc_map=None)
         name = str(vm.get("name") or "")
         if (name.startswith("VMx_") or name.startswith("VMx")
                 or name.startswith("flow-") or name.startswith("auto_pc_")):
+            # FnsPortSetValidator matchingEvals: skip VMx_{vpc}; neo4j
+            # get_all_pc_vms_by_vpc also skips flow- and auto_pc_.
             continue
         vm_uuid = as_uuid(vm.get("ext_id"))
         vm_cat_ids = _entity_cat_ids(vm)
@@ -1339,16 +1395,16 @@ def add_component(
         project_uuid, vlan_uuid, global_uuid):
     sel = expand_selector(sel, eg_map)
     rule_type = str(rule.get("type") or "")
-    is_flex = rule_type == "FLEX"
+    is_flex = is_flex_rule(rule_type)
     # Isolation groups hash as Secured (not Endpoint address-set).
     isolation = (
         rule_type in ISOLATION_RULE_TYPES
         or str(role).startswith("isolation"))
     is_endpoint = (not isolation) and role not in ("secured", "applied_to")
-    # FnsPortSetValidator step 2: skip inbound/outbound EG that is AG/NA
-    # (entity_group_ref with no VM/subnet/VPC category refs). UUID and
-    # REGEX members count even when name resolve found zero VMs this dump.
-    if is_endpoint and sel.get("entity_group_uuid"):
+    # FnsPortSetValidator step 2: Skip if entitygroup is in inbound/outbound
+    # and type is AG/NA (entity_group_ref with no VM/subnet/VPC category
+    # refs). FLEX EG is still a Salus port-set, including 0-NIC groups.
+    if (not is_flex) and is_endpoint and sel.get("entity_group_uuid"):
         if not (
                 uuid_list(sel.get("vm_category_refs"))
                 or uuid_list(sel.get("subnet_category_refs"))
@@ -1361,7 +1417,7 @@ def add_component(
     # Kube EGs are not Atlas port-sets (neo4j kube_cluster path).
     if sel.get("is_kube"):
         return "kube"
-    if is_allow_all_selector(sel):
+    if skip_computed_port_set(sel, is_flex):
         return "allow_all"
     ipv4_only, ipv6_only, allowed, link_local = ip_version_flags(policy, rule)
     entity_type, refs, port_set = hash_selector(
@@ -1383,8 +1439,8 @@ def add_component(
         "rule_uuid": rule_uuid,
         "role": role,
         "component_id": component_id,
-        "namespace_uuid": global_uuid if role == "applied_to" else namespace,
-        "policy_scope": "GLOBAL" if role == "applied_to" else scope,
+        "namespace_uuid": namespace,
+        "policy_scope": scope,
         "policy_project_uuid": (
             project_uuid if project_uuid and project_uuid != ZERO else ""),
         "virtual_network_uuid": ZERO,
@@ -1403,7 +1459,9 @@ def add_component(
         "eg_exception_address_grp": list(
             sel.get("eg_exception_address_grp") or []),
         **empty_rule_service_columns(),
-        "vm_category_names": list(sel.get("vm_category_names") or []),
+        "vm_category_names": (
+            ["all"] if dump_allow_any(sel)
+            else list(sel.get("vm_category_names") or [])),
         "subnet_category_names": list(sel.get("subnet_category_names") or []),
         "vpc_category_names": list(sel.get("vpc_category_names") or []),
         "effective_vpc_refs": [],
@@ -1595,7 +1653,7 @@ def rule_u_sg_entry(rule_uuid, role, spec, u_sg_row, policy, rule):
         "policy_uuid": as_uuid(policy.get("ext_id")) or ZERO,
         "policy_type": policy_type_value(policy, rule),
         "policy_mode": policy_mode_value(policy),
-        "flex_policy": 1 if str(rule.get("type") or "") == "FLEX" else 0,
+        "flex_policy": 1 if is_flex_rule(rule) else 0,
         "rule_priority": rule_priority_value(rule, spec),
         "type": rule_side_type(role),
     }
@@ -1862,7 +1920,8 @@ def _side_category_sel(spec, prefix):
     refs = uuid_list(spec.get("%s_category_references" % prefix))
     if not refs:
         return None
-    et = str(spec.get("%s_category_associated_entity_type" % prefix) or "VM")
+    et = cat_entity_kind(
+        spec.get("%s_category_associated_entity_type" % prefix), "VM")
     return {
         "vm_category_refs": refs if et == "VM" else [],
         "subnet_category_refs": refs if et == "SUBNET" else [],
@@ -1914,11 +1973,11 @@ def peer_selector(spec, side, ag_map, rule_type=""):
     """One src or dest selector from dump spec keys.
 
     FLEX: EG elif should_allow_any_* elif subnet elif AG.
-    APPLICATION: subnet elif AG elif category elif EG elif should_allow_any
-    / src_allow_spec|dest_allow_spec ALL|NONE.
+    Security Policy APPLICATION: subnet elif AG elif category elif EG elif
+    should_allow_any / src_allow_spec|dest_allow_spec ALL|NONE.
     """
     prefix = "src" if side == "src" else "dest"
-    if str(rule_type) == "FLEX":
+    if is_flex_rule(rule_type):
         eg = _side_eg_uuid(spec, prefix)
         if eg:
             return {"entity_group_uuid": eg}
@@ -1947,10 +2006,10 @@ def peer_selector(spec, side, ag_map, rule_type=""):
 def applied_to_selector(spec, rule_type=""):
     """FLEX dump applied_to_entity_group_references -> role applied_to.
 
-    Key missing (UI Global): no Atlas port-set. Empty list: no hash.
-    EG hashes in global-scope-unique-id with no CIDRs.
+    Key missing (UI Global applied_to): no extra applied_to port-set.
+    EG hashes in the policy scope (GLOBAL / ALL_VLAN / VPC), same as Salus.
     """
-    if str(rule_type) != "FLEX":
+    if not is_flex_rule(rule_type):
         return None
     applied = uuid_list(spec.get("applied_to_entity_group_references"))
     if applied:
@@ -1966,7 +2025,8 @@ def selectors_from_spec(spec, ag_map=None, rule_type=""):
     sg_refs = uuid_list(spec.get("secured_group_category_references"))
     sg_eg = as_uuid(spec.get("secured_group_entity_group_reference"))
     if sg_refs:
-        et = str(spec.get("secured_group_category_associated_entity_type") or "VM")
+        et = cat_entity_kind(
+            spec.get("secured_group_category_associated_entity_type"), "VM")
         sel = {
             "vm_category_refs": sg_refs if et == "VM" else [],
             "subnet_category_refs": sg_refs if et == "SUBNET" else [],
@@ -1996,7 +2056,8 @@ def selectors_from_spec(spec, ag_map=None, rule_type=""):
     nested = ((spec.get("spec") or {}).get("isolation_groups")) or []
     for idx, group in enumerate(nested):
         refs = uuid_list(group.get("group_category_references"))
-        et = str(group.get("group_category_associated_entity_type") or "VM")
+        et = cat_entity_kind(
+            group.get("group_category_associated_entity_type"), "VM")
         eg = as_uuid(group.get("group_entity_group_reference"))
         role = "isolation_%s" % idx
         if refs:
@@ -2008,6 +2069,16 @@ def selectors_from_spec(spec, ag_map=None, rule_type=""):
             out.append((role, sel))
         elif eg:
             out.append((role, {"entity_group_uuid": eg}))
+    # FLEX with no src/dest/secured/applied-to EG (Default Workload): empty [].
+    # A missing applied_to key is only a skip sentinel, not a hashable selector.
+    hashable = [
+        item for item in out
+        if not (
+            item[0] == "applied_to"
+            and "applied_to_entity_group_references" in item[1]
+            and item[1].get("applied_to_entity_group_references") is None)]
+    if is_flex_rule(rule_type) and not hashable:
+        out.append(("dest", {"should_allow_any_dst": True}))
     return out
 
 
@@ -2252,8 +2323,15 @@ def main():
         return 0
 
     meta = load_json(os.path.join(dump_dir, "meta.json"), {})
-    vlan_uuid = as_uuid(meta.get("vlan_unique_uuid"))
-    global_uuid = as_uuid(meta.get("global_unique_uuid"))
+    uuids = load_json(os.path.join(dump_dir, "unique_uuids.json"), {})
+    vlan_uuid = as_uuid(
+        meta.get("vlan_unique_uuid") or uuids.get("vlan_unique_uuid"))
+    global_uuid = as_uuid(
+        meta.get("global_unique_uuid") or uuids.get("global_unique_uuid"))
+    unique_src = (
+        str(meta.get("unique_uuid_source") or uuids.get("source") or "")
+        or ("smsp_atlas_zk" if uuids.get("source") else "cmsp_pc_zk"))
+    print("unique_uuid_source=%s" % unique_src)
     vms = load_json(os.path.join(dump_dir, "vms.json"), [])
     policies = [unwrap(p) for p in load_json(os.path.join(dump_dir, "policies.json"), [])]
     egs = [unwrap(e) for e in load_json(os.path.join(dump_dir, "entity_groups.json"), [])]

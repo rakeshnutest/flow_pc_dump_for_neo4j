@@ -2,11 +2,31 @@
 #
 # Copyright (c) 2026 Nutanix Inc. All rights reserved.
 #
-# Local convert/enrich only. Do not copy this file to the PC.
-#   python3 flow_pc_process.py --dump_dir /path/to/dump
+# flow_pc_map.py — LOCAL convert/enrich only. Do not copy this file to the PC.
+# PC collect is flow_pc_dump.py (system python3). This file never runs there.
 #
-# Maps idfcli/*.json (and .txt for SG/policy zprotobuf) into prefetch JSON.
-# Stdlib only. No idfcli, kubectl, AHV Gateway, atlas_cli, or FlowInterfaces.
+# Invoke from this repo (stdlib, no Flow venv):
+#   python3 flow_pc_process.py --dump_dir /path/to/dump
+#   python3 flow_pc_process.py --dump_dir /path/to/dump --ingest --log_bundle_id N
+# Do not run this file directly; flow_pc_process.py imports process_dump.
+#
+# What process_dump does:
+#   1. Read dump_dir/policy_get.json (flow_cli / kratos policy.get).
+#      Read dump_dir/service_group_get.json (v4 ServiceGroupGet).
+#      Read dump_dir/idfcli/<entity_type>.json for everything else.
+#      No IDF __zprotobuf__.
+#   2. Map rows to prefetch JSON: policies, address_groups, service_groups,
+#      entity_groups, vms (+ NICs), subnets, categories, ...
+#   3. Enrich NIC VLAN vs overlay, projects, service-group L4, FQDN
+#   4. Write policies.json and the rest under dump_dir (or --output_dir)
+#
+# Identity is UUID-only. Names are display.
+# convert_* turns protobuf-shaped objects into prefetch dicts (after
+# zprotobuf decode). Field numbers and enum values come from
+# dump_dir/flow_proto/fields.json (this PC's *_pb2.py). Hardcoded numbers
+# are fallback for dumps that predate flow_proto collect.
+# _map_* turns dumped IDF attribute dicts into the same prefetch shape.
+# fetch_*(None) is the process_dump path: no live PC APIs.
 #
 
 import argparse
@@ -71,6 +91,8 @@ class _EnumStub(object):
     raise ValueError(value)
 
 
+# Optional Flow venv types. process_dump does not construct FlowInterfaces().
+# If gflags/flow is missing, enum stubs below keep convert_* working.
 try:
   import gflags
   import flow.common.flags  # pylint: disable=unused-import
@@ -179,9 +201,9 @@ except ImportError:
   NetworkSecurityPolicyScope = _EnumStub(
       kALL_VLAN=1, kVPC=2, kGLOBAL=3)
 
-LOG = logging.getLogger("flow_pc_dump")
+LOG = logging.getLogger("flow_pc_map")
 
-# neo4j_db_insert.py create_vpc_map / ALL_VLAN scope
+# create_vpc_map / ALL_VLAN scope
 ALL_VLAN_VPC_UUID = "00000000-0000-0000-0000-000000000001"
 ALL_VLAN_VPC_NAME = "VLAN"
 DEFAULT_PROJECT_UUID = "00000000-0000-0000-0000-000000000000"
@@ -413,14 +435,22 @@ def _project_fields(proto):
 def _row_project_id(row):
   if not isinstance(row, dict):
     return None
-  for name in ("project_uuid", "project_id", "project_reference"):
+  for name in (
+      "project_uuid", "project_id", "project_reference", "projectExtId",
+      "project_ext_id"):
     uid = _uuid_str(row.get(name))
-    if uid:
+    if uid and uid != "00000000-0000-0000-0000-000000000000":
       return uid
   project = row.get("project")
   if isinstance(project, dict):
-    return _uuid_str(project.get("ext_id") or project.get("uuid") or project.get("id"))
-  return _uuid_str(project)
+    uid = _uuid_str(
+        project.get("ext_id") or project.get("uuid") or project.get("id"))
+    if uid and uid != "00000000-0000-0000-0000-000000000000":
+      return uid
+  uid = _uuid_str(project)
+  if uid and uid != "00000000-0000-0000-0000-000000000000":
+    return uid
+  return None
 
 
 def _project_blob(entity):
@@ -489,6 +519,11 @@ def _ip_group_to_v4(ip_group):
       ipv4_ranges.append(row)
   return ipv4_addresses, ip_ranges, ipv6_addresses, ipv4_ranges
 
+
+# ---------------------------------------------------------------------------
+# convert_* : protobuf-shaped objects -> prefetch JSON.
+# Used after zprotobuf decode (policy rules, SG ports). Not the PC dump path.
+# ---------------------------------------------------------------------------
 
 def convert_address_group(item):
   proto = _item_proto(item)
@@ -589,12 +624,18 @@ def _service_lists_from_service_list(service_list):
       protocol_name = service.Protocol.Name(protocol)
     except Exception:
       pass
-    all_allowed = protocol_name in ("kALL", "kAll", "1") or protocol in (1,)
+    all_allowed = (
+        protocol_name in ("kALL", "kAll", "1")
+        or _proto_is_all(protocol))
     port_ranges = list(getattr(service, "port_range_list", []) or [])
     tcp_ranges = list(getattr(service, "tcp_port_range_list", []) or []) or (
-        port_ranges if protocol_name in ("kTCP", "3") or protocol == 3 else [])
+        port_ranges if (
+            protocol_name in ("kTCP", "3")
+            or _proto_is_tcp(protocol)) else [])
     udp_ranges = list(getattr(service, "udp_port_range_list", []) or []) or (
-        port_ranges if protocol_name in ("kUDP", "4") or protocol == 4 else [])
+        port_ranges if (
+            protocol_name in ("kUDP", "4")
+            or _proto_is_udp(protocol)) else [])
     if all_allowed:
       tcp_services.append(_port_row(0, 65535, True))
       udp_services.append(_port_row(0, 65535, True))
@@ -607,11 +648,11 @@ def _service_lists_from_service_list(service_list):
     for port in udp_ranges:
       udp_services.append(_port_row(
           getattr(port, "start_port", 0), getattr(port, "end_port", 0)))
-    if protocol == 3 and not tcp_ranges and port_ranges:
+    if _proto_is_tcp(protocol) and not tcp_ranges and port_ranges:
       for port in port_ranges:
         tcp_services.append(_port_row(
             getattr(port, "start_port", 0), getattr(port, "end_port", 0)))
-    if protocol == 4 and not udp_ranges and port_ranges:
+    if _proto_is_udp(protocol) and not udp_ranges and port_ranges:
       for port in port_ranges:
         udp_services.append(_port_row(
             getattr(port, "start_port", 0), getattr(port, "end_port", 0)))
@@ -782,7 +823,7 @@ def _services_to_spec(services):
     if sg_uuid:
       spec["service_group_references"].append(sg_uuid)
     protocol = getattr(service, "protocol", 0)
-    if protocol in (1,):
+    if _proto_is_all(protocol):
       spec["is_all_protocol_allowed"] = True
       spec["tcp_services"].append(_port_row(0, 65535, True))
       spec["udp_services"].append(_port_row(0, 65535, True))
@@ -790,11 +831,11 @@ def _services_to_spec(services):
       spec["icmp_v6_services"].append(_icmp_row(all_allowed=True))
       continue
     port_ranges = list(getattr(service, "port_range_list", []) or [])
-    if protocol == 3:
+    if _proto_is_tcp(protocol):
       for port in port_ranges:
         spec["tcp_services"].append(_port_row(
             getattr(port, "start_port", 0), getattr(port, "end_port", 0)))
-    elif protocol == 4:
+    elif _proto_is_udp(protocol):
       for port in port_ranges:
         spec["udp_services"].append(_port_row(
             getattr(port, "start_port", 0), getattr(port, "end_port", 0)))
@@ -844,7 +885,7 @@ def _endpoint_to_side(endpoint, side):
     categories = _uuid_list(getattr(entity, "category_uuid_list", []))
     if categories:
       spec["%s_category_references" % side] = categories
-      spec["%s_category_associated_entity_type" % side] = CAT_ENTITY.get(
+      spec["%s_category_associated_entity_type" % side] = _cat_entity_label(
           getattr(entity, "category_selection_type", None), "VM")
   return spec
 
@@ -859,7 +900,7 @@ def _secured_group_to_spec(secured):
   categories = _uuid_list(getattr(secured, "category_uuid_list", []))
   if categories:
     spec["secured_group_category_references"] = categories
-    spec["secured_group_category_associated_entity_type"] = CAT_ENTITY.get(
+    spec["secured_group_category_associated_entity_type"] = _cat_entity_label(
         getattr(secured, "category_selection_type", None), "VM")
   return spec
 
@@ -876,9 +917,13 @@ def _base_rule(rule_info, rule_type, spec):
 
 
 def _set_ip_version(msg, spec):
-  ip_version = IP_VERSION.get(getattr(msg, "rule_ip_version", 0) or 0)
+  ip_version = _proto_enum_label(
+      getattr(msg, "rule_ip_version", 0) or 0, IP_VERSION, "",
+      "FlexPolicyRule.RuleIpVersion", "RuleIpVersion", "IpVersion")
   if not ip_version:
-    ip_version = IP_VERSION.get(getattr(msg, "ip_version", 0) or 0)
+    ip_version = _proto_enum_label(
+        getattr(msg, "ip_version", 0) or 0, IP_VERSION, "",
+        "FlexPolicyRule.RuleIpVersion", "RuleIpVersion", "IpVersion")
   if ip_version:
     spec["ip_version"] = ip_version
   return spec
@@ -889,7 +934,10 @@ def _convert_application_rule(app_rule, fallback_type="APPLICATION"):
   spec = {}
   spec.update(_secured_group_to_spec(
       app_rule.secured_group if _has(app_rule, "secured_group") else None))
-  direction = APP_DIR.get(getattr(app_rule, "direction", 0), "INBOUND")
+  direction = _proto_enum_label(
+      getattr(app_rule, "direction", 0), APP_DIR, "INBOUND",
+      "ApplicationRule.FlowDirection", "FlexPolicyRule.FlowDirection",
+      "FlowDirection")
   spec["direction"] = direction
   side = "src" if direction == "INBOUND" else "dest"
   spec.update(_endpoint_to_side(
@@ -905,8 +953,13 @@ def _convert_application_rule(app_rule, fallback_type="APPLICATION"):
 def _convert_flex_rule(flex_rule):
   rule_info = flex_rule.rule_info if _has(flex_rule, "rule_info") else None
   spec = {
-      "direction": FLEX_DIR.get(getattr(flex_rule, "direction", 0), "IN_OUT"),
-      "action": FLEX_ACTION.get(getattr(flex_rule, "action", 0), "ALLOW"),
+      "direction": _proto_enum_label(
+          getattr(flex_rule, "direction", 0), FLEX_DIR, "IN_OUT",
+          "FlexPolicyRule.FlowDirection", "ApplicationRule.FlowDirection",
+          "FlowDirection"),
+      "action": _proto_enum_label(
+          getattr(flex_rule, "action", 0), FLEX_ACTION, "ALLOW",
+          "FlexPolicyRule.FlowAction", "FlowAction", "RuleAction"),
       "priority": getattr(flex_rule, "rule_priority", 0) or 0,
   }
   _set_ip_version(flex_rule, spec)
@@ -968,7 +1021,7 @@ def _convert_multi_env_rule(iso_rule):
       row = {
           "group_category_references": _uuid_list(
               getattr(group, "category_uuid_list", [])),
-          "group_category_associated_entity_type": CAT_ENTITY.get(
+          "group_category_associated_entity_type": _cat_entity_label(
               getattr(group, "category_selection_type", None), "VM"),
       }
       if eg_list:
@@ -981,7 +1034,11 @@ def _convert_multi_env_rule(iso_rule):
 
 def convert_rule(rule):
   if _has(rule, "flex_policy_rule"):
-    return _convert_flex_rule(rule.flex_policy_rule)
+    body = rule.flex_policy_rule
+    if (_classify_rule_shape(body) == "flex"
+        or _attr_present(body, "src_endpoint")
+        or _attr_present(body, "dest_endpoint")):
+      return _convert_flex_rule(body)
   if _has(rule, "secured_group_rule"):
     return _convert_secured_group_rule(rule.secured_group_rule)
   if _has(rule, "isolation_rule"):
@@ -994,7 +1051,7 @@ def convert_rule(rule):
     return _convert_application_rule(rule.shared_services_rule, "APPLICATION")
   if _has(rule, "application_rule"):
     return _convert_application_rule(rule.application_rule, "APPLICATION")
-  return None
+  return _convert_rule_by_shape(rule)
 
 
 def _iter_rules_map(proto):
@@ -1073,6 +1130,9 @@ def _dump_manager(label, manager, converter):
   LOG.info("DUMP done %s count=%s", label, len(rows))
   return rows
 
+
+# Leftover FlowInterfaces fetchers. process_dump passes interfaces=None and
+# uses _idf_mapped / _map_* on dumped files instead.
 
 def fetch_address_groups(interfaces):
   manager = _get_manager(interfaces, "address_group_manager")
@@ -1159,6 +1219,11 @@ def _unwrap_list(payload):
   return []
 
 
+# ---------------------------------------------------------------------------
+# Read dumped idfcli files. process_dump sets _IDF_FILE_DIR to dump_dir/idfcli.
+# _idfcli_one then loads <type>.json (or .txt for SG/policy zprotobuf).
+# ---------------------------------------------------------------------------
+
 def _idfcli_bin():
   for path in (
       "/home/docker/msp_controller/bootstrap/msp_tools/cmsp-scripts/idfcli",
@@ -1175,8 +1240,10 @@ _IDF_LOCKS = {}
 _IDF_GUARD = threading.Lock()
 # If set, _idfcli_one reads <dir>/<entity_type>.json instead of running idfcli.
 _IDF_FILE_DIR = ""
+_DUMP_DIR = ""
 
-# Every IDF entity type this dump collects. Process maps these later.
+# IDF types the PC dump writes under idfcli/. Wrong names (address_group,
+# service_group, entity_group) are empty; real types are network_*.
 IDF_DUMP_TYPES = (
     "vm", "mh_vm", "ahv_vm", "virtual_nic",
     "virtual_network", "subnet", "vpc", "virtual_private_cloud",
@@ -1194,6 +1261,7 @@ IDF_DUMP_TYPES = (
 
 
 def _idfcli_one(entity_type, timeout=180):
+  """Load one IDF type from dump files. Does not call idfcli when _IDF_FILE_DIR is set."""
   with _IDF_GUARD:
     lock = _IDF_LOCKS.setdefault(entity_type, threading.Lock())
   with lock:
@@ -1206,22 +1274,6 @@ def _idfcli_one(entity_type, timeout=180):
     if file_dir:
       json_path = os.path.join(file_dir, "%s.json" % entity_type)
       txt_path = os.path.join(file_dir, "%s.txt" % entity_type)
-      # Service groups only have ports in IDF __zprotobuf__; prefer .txt.
-      prefer_txt = entity_type in (
-          "network_service_group", "service_group",
-          "network_security_policy", "security_policy")
-      if prefer_txt and os.path.isfile(txt_path):
-        try:
-          with open(txt_path, "r") as handle:
-            parsed = _parse_idf_entities(handle.read())
-        except Exception as exc:
-          parsed, err = [], "%s: %s" % (entity_type, exc)
-          _IDF_RESULTS[entity_type] = (parsed, err)
-          return _IDF_RESULTS[entity_type]
-        LOG.info("DUMP idfcli entitytype %s from txt count=%s",
-                 entity_type, len(parsed))
-        _IDF_RESULTS[entity_type] = (parsed, None)
-        return _IDF_RESULTS[entity_type]
       if os.path.isfile(json_path):
         try:
           with open(json_path, "r") as handle:
@@ -1269,16 +1321,22 @@ def _idfcli_one(entity_type, timeout=180):
 
 
 def _idf_loaded_rows(parsed):
+  rows = []
   if isinstance(parsed, list):
-    return parsed
-  if isinstance(parsed, dict):
+    rows = parsed
+  elif isinstance(parsed, dict):
     for key in ("entities", "entity", "data"):
       val = parsed.get(key)
       if isinstance(val, list):
-        return val
+        rows = val
+        break
       if isinstance(val, dict) and val:
-        return [val]
-  return []
+        rows = [val]
+        break
+  for row in rows:
+    if isinstance(row, dict):
+      row.pop("__zprotobuf__", None)
+  return rows
 
 
 def _idf_unquote(raw):
@@ -1337,9 +1395,8 @@ def _parse_idf_entities(text):
         attrs[name] = _uuid_str(str_val.group(1)) or str_val.group(1)
       elif bytes_list:
         if name == "__zprotobuf__":
-          attrs[name] = _idf_bytes_raw(bytes_list[0])
-        else:
-          attrs[name] = _idf_bytes_to_value(bytes_list[0])
+          continue
+        attrs[name] = _idf_bytes_to_value(bytes_list[0])
       elif int_val:
         attrs[name] = int(int_val.group(1))
       elif bool_val:
@@ -1347,6 +1404,640 @@ def _parse_idf_entities(text):
     if attrs:
       entities.append(attrs)
   return entities
+
+
+# ---------------------------------------------------------------------------
+# Decode IDF __zprotobuf__ (zlib + protobuf wire).
+# NetworkServiceGroup field names (service_list, ...) and
+# NetworkSecurityPolicy field names (rules_map, ...) are resolved from
+# dump_dir/flow_proto/fields.json when present. Hardcoded numbers below
+# are fallbacks for older dumps.
+# ---------------------------------------------------------------------------
+
+_FLOW_PROTO = None
+
+_FIELD_ALIASES = {
+    "rules_map": ("rules_map", "rule_map", "rules"),
+    "application_rule": ("application_rule",),
+    "isolation_rule": ("isolation_rule", "two_env_isolation_rule"),
+    "quarantine_rule": ("quarantine_rule",),
+    "secured_group_rule": ("secured_group_rule", "intra_group_rule"),
+    "multi_env_isolation_rule": (
+        "multi_env_isolation_rule", "multi_env_rule",
+        "multi_environment_isolation_rule"),
+    "shared_services_rule": ("shared_services_rule", "shared_service_rule"),
+    "flex_policy_rule": (
+        "flex_policy_rule", "flex_rule", "flexible_policy_rule", "flex_policy"),
+    "all_to_all_isolation_group": (
+        "all_to_all_isolation_group", "all_to_all", "isolation_groups"),
+    "isolation_group_list": ("isolation_group_list", "isolation_groups"),
+    "service_list": ("service_list", "services"),
+    "tcp_start_port_list": ("tcp_start_port_list",),
+    "tcp_end_port_list": ("tcp_end_port_list",),
+    "udp_start_port_list": ("udp_start_port_list",),
+    "udp_end_port_list": ("udp_end_port_list",),
+    "icmp_type_list": ("icmp_type_list",),
+    "icmp_code_list": ("icmp_code_list",),
+    "icmp_v6_type_list": ("icmp_v6_type_list",),
+    "icmp_v6_code_list": ("icmp_v6_code_list",),
+}
+
+_MSG_HINTS = {
+    "policy": (
+        "NetworkSecurityPolicy", "network_security_policy",
+        "SecurityPolicy"),
+    "rule": (
+        "Rule", "NetworkSecurityRule", "SecurityRule",
+        "SecurityPolicyRule"),
+    "app_rule": ("ApplicationRule",),
+    "two_env": (
+        "IsolationRule", "TwoEnvIsolationRule", "TwoEnvironmentIsolationRule"),
+    "multi_env": (
+        "MultiEnvIsolationRule", "MultiEnvironmentIsolationRule"),
+    "all_to_all": (
+        "AllToAllIsolationGroup", "AllToAllIsolation"),
+    "secured_group": ("SecuredGroup",),
+    "endpoint": ("Endpoint", "RuleEndpoint"),
+    "endpoint_entity": ("EndpointEntity", "CategoryEntity"),
+    "rule_services": ("RuleService", "Service", "NetworkService"),
+    "port_range": ("PortRange", "PortRangeEntity"),
+    "icmp": ("IcmpTypeCode", "IcmpService"),
+    "sg_rule": ("SecuredGroupRule", "IntraGroupRule"),
+    "flex": ("FlexPolicyRule", "FlexRule"),
+    "rule_info": ("BaseRuleInfo", "RuleInfo"),
+    "nsg": (
+        "NetworkServiceGroup", "ServiceGroup", "network_service_group"),
+    "nsg_service": ("NetworkService", "Service", "ServiceListEntity"),
+    "map_entry": (
+        "RulesMapEntry", "RulesEntry", "MapFieldEntry"),
+}
+
+
+class _FlowProtoSchema(object):
+  def __init__(self, payload):
+    self.messages = (payload or {}).get("messages") or {}
+    self.enums = (payload or {}).get("enums") or {}
+
+  def _msg(self, *hints):
+    """Prefer a descriptor that has fields. Empty stubs (NetworkSecurityRule) lose."""
+    empty = None
+    for hint in hints:
+      rec = self.messages.get(hint)
+      if rec:
+        if rec.get("fields"):
+          return rec
+        empty = empty or rec
+        continue
+      low = str(hint or "").lower()
+      for key, rec in self.messages.items():
+        if str(key).split(".")[-1].lower() != low:
+          continue
+        if rec.get("fields"):
+          return rec
+        empty = empty or rec
+    return empty
+
+  def fields(self, *hints):
+    rec = self._msg(*hints)
+    return (rec or {}).get("fields") or {}
+
+  def _field_names(self, field_name):
+    names = _FIELD_ALIASES.get(field_name, (field_name,))
+    if field_name not in names:
+      names = (field_name,) + tuple(names)
+    return names
+
+  def _field_in(self, rec, field_name):
+    fdict = (rec or {}).get("fields") or {}
+    for name in self._field_names(field_name):
+      info = fdict.get(name)
+      if not info:
+        continue
+      number = info.get("number")
+      if number in (None, 0, "0"):
+        continue
+      try:
+        return int(number)
+      except (TypeError, ValueError):
+        continue
+    return None
+
+  def lookup(self, field_name, *msg_hints):
+    """Return field number or None. None = not on this build (do not guess)."""
+    rec = self._msg(*msg_hints) if msg_hints else None
+    if rec is not None:
+      return self._field_in(rec, field_name)
+    hits = []
+    for rec in self.messages.values():
+      number = self._field_in(rec, field_name)
+      if number is not None:
+        hits.append(number)
+    uniq = list(dict.fromkeys(hits))
+    if len(uniq) == 1:
+      return uniq[0]
+    return None
+
+  def has_field(self, field_name, *msg_hints):
+    return self.lookup(field_name, *msg_hints) is not None
+
+  def has_message(self, *msg_hints):
+    return self._msg(*msg_hints) is not None
+
+  def find_with_any(self, *field_names):
+    for rec in self.messages.values():
+      for name in field_names:
+        if self._field_in(rec, name) is not None:
+          return rec
+    return None
+
+  def find_with_all(self, *field_names):
+    for rec in self.messages.values():
+      if all(self._field_in(rec, n) is not None for n in field_names):
+        return rec
+    return None
+
+  def field_number(self, field_name, default, *msg_hints):
+    found = self.lookup(field_name, *msg_hints)
+    if found is not None:
+      return found
+    if msg_hints and self._msg(*msg_hints) is not None:
+      return 0
+    return default
+
+  def _enum(self, *hints):
+    for hint in hints:
+      rec = self.enums.get(hint)
+      if rec:
+        return rec
+      text = str(hint or "")
+      if not text:
+        continue
+      for key, rec in self.enums.items():
+        if key == text or key.endswith("." + text):
+          return rec
+      low = text.lower()
+      for key, rec in self.enums.items():
+        klow = str(key).lower()
+        if klow == low or klow.endswith("." + low):
+          return rec
+        if str(key).split(".")[-1].lower() == low:
+          return rec
+    return None
+
+  def enum_name(self, value, *hints):
+    """Name from the hinted enum only. Never scan every enum (kNoMatchEntity=0)."""
+    try:
+      number = int(value)
+    except (TypeError, ValueError):
+      return str(value or "")
+    rec = self._enum(*hints)
+    if not rec:
+      return ""
+    for name, num in rec.items():
+      try:
+        if int(num) == number:
+          return name
+      except (TypeError, ValueError):
+        continue
+    return ""
+
+  def enum_number(self, token, default, *hints):
+    want = set()
+    text = str(token or "")
+    want.add(text)
+    want.add(text.lower())
+    if text.startswith("k"):
+      want.add(text[1:])
+    else:
+      want.add("k" + text)
+      want.add("k" + text[:1].upper() + text[1:])
+    rec = self._enum(*hints)
+    candidates = [rec] if rec else list(self.enums.values())
+    for enum in candidates:
+      for name, num in (enum or {}).items():
+        if name in want or name.lower() in want:
+          try:
+            return int(num)
+          except (TypeError, ValueError):
+            continue
+    return default
+
+
+def load_flow_proto(dump_dir):
+  """Load dump_dir/flow_proto/fields.json. No-op if missing (old dumps)."""
+  global _FLOW_PROTO
+  _FLOW_PROTO = None
+  if not dump_dir:
+    return None
+  path = os.path.join(dump_dir, "flow_proto", "fields.json")
+  payload = None
+  try:
+    with open(path) as handle:
+      payload = json.load(handle)
+  except Exception:
+    payload = None
+  if not isinstance(payload, dict) or not payload.get("messages"):
+    LOG.info("flow_proto schema missing (%s); using builtin field numbers",
+             path)
+    return None
+  _FLOW_PROTO = _FlowProtoSchema(payload)
+  LOG.info(
+      "flow_proto schema messages=%s enums=%s file=%s",
+      len(payload.get("messages") or {}),
+      len(payload.get("enums") or {}),
+      path)
+  return _FLOW_PROTO
+
+
+def _f(field_name, default, *msg_hints):
+  """Field number for this dump's proto. 0 = field absent on this build."""
+  if _FLOW_PROTO is None:
+    return default
+  found = _FLOW_PROTO.lookup(field_name, *msg_hints)
+  if found is not None:
+    return found
+  if msg_hints and _FLOW_PROTO.has_message(*msg_hints):
+    return 0
+  return default
+
+
+def _schema_has_field(field_name, *msg_hints):
+  if _FLOW_PROTO is None:
+    return True
+  if not _FLOW_PROTO.has_message(*msg_hints):
+    return True
+  return _FLOW_PROTO.has_field(field_name, *msg_hints)
+
+
+_PB_TYPE_BOOL = 8
+_PB_TYPE_STRING = 9
+_PB_TYPE_MESSAGE = 11
+_PB_TYPE_BYTES = 12
+_PB_TYPE_ENUM = 14
+_PB_LABEL_REPEATED = 3
+
+
+def _schema_msg_rec(*hints):
+  if _FLOW_PROTO is None:
+    return None
+  rec = _FLOW_PROTO._msg(*hints)
+  if rec:
+    return rec
+  for hint in hints:
+    name = str(hint or "").lstrip(".")
+    rec = _FLOW_PROTO.messages.get(name)
+    if rec:
+      return rec
+    short = name.split(".")[-1]
+    rec = _FLOW_PROTO.messages.get(short)
+    if rec:
+      return rec
+    for key, rec in _FLOW_PROTO.messages.items():
+      if str(key).split(".")[-1] == short:
+        return rec
+  return None
+
+
+def _schema_is_map_entry(rec):
+  fields = (rec or {}).get("fields") or {}
+  return "key" in fields and "value" in fields and len(fields) <= 4
+
+
+def _schema_decode(buf, msg_rec, depth=0):
+  """Decode protobuf bytes into a dict keyed by this build's field names."""
+  if not buf or not msg_rec or depth > 40:
+    return {}
+  wire = _proto_decode(buf)
+  out = {}
+  for fname, finfo in ((msg_rec.get("fields") or {})).items():
+    try:
+      number = int(finfo.get("number") or 0)
+    except (TypeError, ValueError):
+      continue
+    if not number:
+      continue
+    try:
+      ftype = int(finfo.get("type") or 0)
+      label = int(finfo.get("label") or 0)
+    except (TypeError, ValueError):
+      ftype, label = 0, 0
+    type_name = str(finfo.get("type_name") or "").lstrip(".")
+    repeated = label == _PB_LABEL_REPEATED
+    # Enums have type_name too (FlowDirection). Only MESSAGE is nested;
+    # treating enums as messages dropped the varint (direction stayed 0).
+    if ftype == _PB_TYPE_MESSAGE:
+      nested = _schema_msg_rec(type_name) if type_name else None
+      blobs = _proto_bytes_list(wire, number)
+      if not blobs:
+        continue
+      if nested and _schema_is_map_entry(nested):
+        mapping = {}
+        key_n = int(((nested.get("fields") or {}).get("key") or {}).get("number") or 1)
+        val_info = (nested.get("fields") or {}).get("value") or {}
+        val_n = int(val_info.get("number") or 2)
+        val_nested = _schema_msg_rec(str(val_info.get("type_name") or "").lstrip("."))
+        for blob in blobs:
+          entry = _proto_decode(blob)
+          key = _proto_str(entry, key_n)
+          if not key:
+            key = str(_proto_first_varint(entry, key_n, 0))
+          val_blob = _proto_first_bytes(entry, val_n)
+          if val_nested and val_blob:
+            mapping[key] = _schema_decode(val_blob, val_nested, depth + 1)
+          elif val_blob:
+            mapping[key] = val_blob
+        out[fname] = mapping
+      elif repeated or len(blobs) > 1:
+        if nested:
+          out[fname] = [
+              _schema_decode(item, nested, depth + 1) for item in blobs]
+        else:
+          out[fname] = list(blobs)
+      elif nested:
+        out[fname] = _schema_decode(blobs[0], nested, depth + 1)
+      else:
+        out[fname] = blobs[0]
+    elif ftype == _PB_TYPE_STRING:
+      if repeated:
+        items = _proto_str_list(wire, number)
+        if items:
+          out[fname] = items
+      else:
+        text = _proto_str(wire, number)
+        if text:
+          out[fname] = text
+    elif ftype == _PB_TYPE_BYTES:
+      items = _proto_bytes_list(wire, number)
+      if repeated and items:
+        out[fname] = items
+      elif items:
+        out[fname] = items[0]
+    elif ftype == _PB_TYPE_BOOL:
+      nums = _proto_varints(wire.get(number) or [])
+      if repeated:
+        out[fname] = [bool(n) for n in nums]
+      elif nums:
+        out[fname] = bool(nums[0])
+    else:
+      nums = _proto_varints(wire.get(number) or [])
+      if repeated and nums:
+        out[fname] = nums
+      elif nums:
+        out[fname] = nums[0]
+  return out
+
+
+def _dict_to_attr(value):
+  if isinstance(value, dict):
+    kwargs = {}
+    for key, item in value.items():
+      kwargs[str(key)] = _dict_to_attr(item)
+    if "allow_type" in kwargs:
+      kwargs.setdefault("AllowType", _AllowType)
+    if "protocol" in kwargs:
+      names = _nsg_protocol_names()
+      kwargs.setdefault(
+          "Protocol",
+          _Attr(Name=lambda num, table=names: table.get(int(num or 0), str(num))))
+    return _Attr(**kwargs)
+  if isinstance(value, list):
+    return [_dict_to_attr(item) for item in value]
+  return value
+
+
+def _attr_items(obj):
+  data = getattr(obj, "__dict__", None)
+  if isinstance(data, dict):
+    return list(data.items())
+  return []
+
+
+def _attr_present(obj, *names):
+  for name in names:
+    val = getattr(obj, name, None)
+    if val not in (None, "", [], 0, False, b""):
+      return True
+  return False
+
+
+def _classify_rule_shape(body):
+  if _attr_present(body, "src_endpoint") and _attr_present(body, "dest_endpoint"):
+    return "flex"
+  if _attr_present(body, "first_secured_group") and _attr_present(
+      body, "second_secured_group"):
+    return "two_env"
+  nested = getattr(body, "all_to_all_isolation_group", None)
+  if nested is not None and _attr_present(nested, "isolation_group_list"):
+    return "multi"
+  if _attr_present(body, "isolation_group_list", "all_to_all_isolation_group"):
+    return "multi"
+  if _attr_present(body, "endpoint") and _attr_present(body, "secured_group"):
+    return "app"
+  if _attr_present(body, "secured_group") and _attr_present(body, "services"):
+    return "intra"
+  if _attr_present(body, "src_endpoint") or _attr_present(body, "dest_endpoint"):
+    return "flex"
+  return ""
+
+
+def _convert_rule_by_shape(rule):
+  bodies = [rule]
+  for _name, val in _attr_items(rule):
+    if val is None or isinstance(val, (str, bytes, int, float, bool, list)):
+      continue
+    bodies.append(val)
+  for body in bodies:
+    kind = _classify_rule_shape(body)
+    if kind == "flex":
+      return _convert_flex_rule(body)
+    if kind == "two_env":
+      return _convert_two_env_rule(body)
+    if kind == "multi":
+      return _convert_multi_env_rule(body)
+    if kind == "intra":
+      return _convert_secured_group_rule(body)
+    if kind == "app":
+      return _convert_application_rule(body, "APPLICATION")
+  return None
+
+
+def _extract_rule_dicts(decoded):
+  for key in ("rules_map", "rule_map", "rules", "rule_list"):
+    val = (decoded or {}).get(key)
+    if val is None:
+      continue
+    if isinstance(val, dict):
+      return [item for item in val.values() if isinstance(item, dict)]
+    if isinstance(val, list):
+      out = []
+      for item in val:
+        if isinstance(item, dict) and isinstance(item.get("value"), dict):
+          out.append(item.get("value"))
+        elif isinstance(item, dict):
+          out.append(item)
+      return out
+  return []
+
+
+def _enum_num(token, default, *hints):
+  if _FLOW_PROTO is None:
+    return default
+  return _FLOW_PROTO.enum_number(token, default, *hints)
+
+
+_UNSET_ENUM_TOKS = (
+    "nomatch", "unspecified", "unknown", "invalid", "unused", "notset",
+    "none", "unset",
+)
+# Proto short names (kIn) vs prefetch hash tokens (INBOUND).
+_ENUM_NAME_ALIASES = {
+    "IN": "INBOUND",
+    "OUT": "OUTBOUND",
+    "INOUT": "IN_OUT",
+    "INGRESS": "INBOUND",
+    "EGRESS": "OUTBOUND",
+    "BIDIR": "IN_OUT",
+    "BOTHIPV4IPV6": "IPV4_IPV6",
+    "IPV4IPV6": "IPV4_IPV6",
+    "BOTH": "IPV4_IPV6",
+}
+
+
+def _enum_name_unset(name):
+  compact = "".join(ch for ch in str(name or "").lower() if ch.isalnum())
+  return any(tok in compact for tok in _UNSET_ENUM_TOKS)
+
+
+def _fit_enum_label(name, fallback_map):
+  """Map kIn/kOut/kInOut/kBothIpv4Ipv6 onto hash tokens when the map wants them."""
+  if not name:
+    return ""
+  text = str(name)
+  if text.startswith("k") and len(text) > 1:
+    text = text[1:]
+  pretty = text.upper().replace("-", "_")
+  compact = "".join(ch for ch in pretty if ch.isalnum())
+  alias = _ENUM_NAME_ALIASES.get(compact, pretty)
+  wanted = set((fallback_map or {}).values())
+  if not wanted:
+    return alias
+  if pretty in wanted:
+    return pretty
+  if alias in wanted:
+    return alias
+  return ""
+
+
+def _proto_enum_label(value, fallback_map, default="", *hints):
+  """Label for hashing. Schema names win when they fit; else numeric map.
+
+  Do not use a global enum scan: kNoMatchEntity=0 is on unrelated enums.
+  """
+  number = None
+  try:
+    number = int(value)
+  except (TypeError, ValueError):
+    number = None
+  schema_label = ""
+  if _FLOW_PROTO is not None:
+    raw = ""
+    if number is not None:
+      raw = _FLOW_PROTO.enum_name(number, *hints) or ""
+    elif value not in (None, ""):
+      raw = str(value)
+    if raw and not _enum_name_unset(raw):
+      schema_label = _fit_enum_label(raw, fallback_map)
+      if not schema_label and fallback_map is None:
+        text = raw[1:] if raw.startswith("k") and len(raw) > 1 else raw
+        schema_label = text.upper()
+  if schema_label:
+    return schema_label
+  if fallback_map is not None and number is not None:
+    mapped = fallback_map.get(number)
+    if mapped:
+      return mapped
+  if number is None and value not in (None, ""):
+    fitted = _fit_enum_label(str(value), fallback_map)
+    if fitted:
+      return fitted
+  return default
+
+
+def _is_proto_token(value, *tokens):
+  try:
+    number = int(value)
+  except (TypeError, ValueError):
+    number = None
+  text = str(value or "")
+  for token in tokens:
+    if text == token or text.lower() == str(token).lower():
+      return True
+    if number is not None and number == _enum_num(token, None):
+      return True
+    if _FLOW_PROTO is None:
+      continue
+    if number is not None and _FLOW_PROTO.enum_name(number) == token:
+      return True
+  return False
+
+
+def _proto_enum_known(self_hints):
+  if _FLOW_PROTO is None:
+    return False
+  return _FLOW_PROTO._enum(*self_hints) is not None
+
+
+def _proto_is_all(protocol):
+  if _is_proto_token(protocol, "kAll", "kALL", "ALL"):
+    return True
+  if _FLOW_PROTO is None or not _proto_enum_known(
+      ("Protocol", "IpProtocol", "NetworkServiceProtocol")):
+    return protocol in (1,)
+  return False
+
+
+def _proto_is_tcp(protocol):
+  if _is_proto_token(protocol, "kTCP", "TCP"):
+    return True
+  if _FLOW_PROTO is None or not _proto_enum_known(
+      ("Protocol", "IpProtocol", "NetworkServiceProtocol")):
+    return protocol == 3
+  return False
+
+
+def _proto_is_udp(protocol):
+  if _is_proto_token(protocol, "kUDP", "UDP"):
+    return True
+  if _FLOW_PROTO is None or not _proto_enum_known(
+      ("Protocol", "IpProtocol", "NetworkServiceProtocol")):
+    return protocol == 4
+  return False
+
+
+def _cat_entity_label(value, default="VM"):
+  """VM / VPC / SUBNET. flow_cli JSON uses kVM / kVPC / kSubnet strings."""
+  if value in (None, "", 0, "0"):
+    return default
+  if isinstance(value, str):
+    compact = _camel_upper(value)
+    if compact in ("VM", "VPC", "SUBNET"):
+      return compact
+  if _FLOW_PROTO is not None:
+    label = _proto_enum_label(
+        value, None, "",
+        "CategoryEntitySelectionType", "CategorySelectionType")
+    if label in ("VM", "VPC", "SUBNET"):
+      return label
+  mapped = CAT_ENTITY.get(value)
+  if mapped:
+    return mapped
+  try:
+    mapped = CAT_ENTITY.get(int(value))
+    if mapped:
+      return mapped
+  except (TypeError, ValueError):
+    pass
+  return default
 
 
 def _zprotobuf_bytes(value):
@@ -1480,41 +2171,62 @@ _NSG_PROTO_NAMES = {
 }
 
 
+def _nsg_protocol_names():
+  names = dict(_NSG_PROTO_NAMES)
+  if _FLOW_PROTO is None:
+    return names
+  rec = _FLOW_PROTO._enum("Protocol", "IpProtocol", "NetworkServiceProtocol")
+  if rec:
+    return {int(num): name for name, num in rec.items()}
+  return names
+
+
 def _nsg_port_objs(fields, number):
   rows = []
+  start_n = _f("start_port", 1, *_MSG_HINTS["port_range"])
+  end_n = _f("end_port", 2, *_MSG_HINTS["port_range"])
   for raw in _proto_bytes_list(fields, number):
     inner = _proto_decode(raw)
-    start = _proto_first_varint(inner, 1, 0)
-    end = _proto_first_varint(inner, 2, start)
+    start = _proto_first_varint(inner, start_n, 0)
+    end = _proto_first_varint(inner, end_n, start)
     rows.append(_Attr(start_port=start, end_port=end))
   return rows
 
 
 def _nsg_icmp_objs(fields, number):
   rows = []
+  type_n = _f("icmp_type", 1, *_MSG_HINTS["icmp"])
+  code_n = _f("icmp_code", 2, *_MSG_HINTS["icmp"])
   for raw in _proto_bytes_list(fields, number):
     inner = _proto_decode(raw)
     rows.append(_Attr(
-        icmp_type=_proto_first_varint(inner, 1, 0),
-        icmp_code=_proto_first_varint(inner, 2, 0)))
+        icmp_type=_proto_first_varint(inner, type_n, 0),
+        icmp_code=_proto_first_varint(inner, code_n, 0)))
   return rows
 
 
 def _nsg_service_obj(raw):
   fields = _proto_decode(raw)
-  protocol = _proto_first_varint(fields, 1, 0)
+  hints = _MSG_HINTS["nsg_service"]
+  protocol = _proto_first_varint(fields, _f("protocol", 1, *hints), 0)
+  names = _nsg_protocol_names()
 
-  def _proto_name(value, names=_NSG_PROTO_NAMES):
-    return names.get(int(value or 0), str(value))
+  def _proto_name(value, table=names):
+    return table.get(int(value or 0), str(value))
 
   return _Attr(
       protocol=protocol,
       Protocol=_Attr(Name=_proto_name),
-      port_range_list=_nsg_port_objs(fields, 2),
-      icmp_type_code_list=_nsg_icmp_objs(fields, 3),
-      tcp_port_range_list=_nsg_port_objs(fields, 4),
-      udp_port_range_list=_nsg_port_objs(fields, 5),
-      icmp_v6_type_code_list=_nsg_icmp_objs(fields, 6),
+      port_range_list=_nsg_port_objs(
+          fields, _f("port_range_list", 2, *hints)),
+      icmp_type_code_list=_nsg_icmp_objs(
+          fields, _f("icmp_type_code_list", 3, *hints)),
+      tcp_port_range_list=_nsg_port_objs(
+          fields, _f("tcp_port_range_list", 4, *hints)),
+      udp_port_range_list=_nsg_port_objs(
+          fields, _f("udp_port_range_list", 5, *hints)),
+      icmp_v6_type_code_list=_nsg_icmp_objs(
+          fields, _f("icmp_v6_type_code_list", 6, *hints)),
   )
 
 
@@ -1522,27 +2234,43 @@ def _service_lists_from_zprotobuf(raw):
   data = _zprotobuf_bytes(raw)
   if not data:
     return [], [], [], []
-  fields = _proto_decode(_zlib_decompress(data))
-  services = [_nsg_service_obj(item) for item in _proto_bytes_list(fields, 6)]
+  buf = _zlib_decompress(data)
+  if _FLOW_PROTO is not None:
+    rec = (_FLOW_PROTO._msg(*_MSG_HINTS["nsg"])
+           or _FLOW_PROTO.find_with_any("service_list"))
+    if rec:
+      decoded = _schema_decode(buf, rec)
+      services = []
+      for item in decoded.get("service_list") or []:
+        if isinstance(item, dict):
+          services.append(_dict_to_attr(item))
+      tcp, udp, icmp, icmp6 = _service_lists_from_service_list(services)
+      if tcp or udp or icmp or icmp6:
+        return tcp, udp, icmp, icmp6
+  fields = _proto_decode(buf)
+  nsg = _MSG_HINTS["nsg"]
+  services = [
+      _nsg_service_obj(item) for item in _proto_bytes_list(
+          fields, _f("service_list", 6, *nsg))]
   tcp, udp, icmp, icmp6 = _service_lists_from_service_list(services)
   if not tcp:
-    starts = _proto_varints(fields.get(8) or [])
-    ends = _proto_varints(fields.get(9) or [])
+    starts = _proto_varints(fields.get(_f("tcp_start_port_list", 8, *nsg)) or [])
+    ends = _proto_varints(fields.get(_f("tcp_end_port_list", 9, *nsg)) or [])
     for idx, start in enumerate(starts):
       tcp.append(_port_row(start, ends[idx] if idx < len(ends) else start))
   if not udp:
-    starts = _proto_varints(fields.get(10) or [])
-    ends = _proto_varints(fields.get(11) or [])
+    starts = _proto_varints(fields.get(_f("udp_start_port_list", 10, *nsg)) or [])
+    ends = _proto_varints(fields.get(_f("udp_end_port_list", 11, *nsg)) or [])
     for idx, start in enumerate(starts):
       udp.append(_port_row(start, ends[idx] if idx < len(ends) else start))
   if not icmp:
-    types = _proto_varints(fields.get(12) or [])
-    codes = _proto_varints(fields.get(13) or [])
+    types = _proto_varints(fields.get(_f("icmp_type_list", 12, *nsg)) or [])
+    codes = _proto_varints(fields.get(_f("icmp_code_list", 13, *nsg)) or [])
     for idx, icmp_type in enumerate(types):
       icmp.append(_icmp_row(icmp_type, codes[idx] if idx < len(codes) else 0))
   if not icmp6:
-    types = _proto_varints(fields.get(14) or [])
-    codes = _proto_varints(fields.get(15) or [])
+    types = _proto_varints(fields.get(_f("icmp_v6_type_list", 14, *nsg)) or [])
+    codes = _proto_varints(fields.get(_f("icmp_v6_code_list", 15, *nsg)) or [])
     for idx, icmp_type in enumerate(types):
       icmp6.append(_icmp_row(
           icmp_type, codes[idx] if idx < len(codes) else 0))
@@ -1550,6 +2278,7 @@ def _service_lists_from_zprotobuf(raw):
 
 
 def _inflate_nsg_zprotobuf(row):
+  """Fill tcp_services/udp_services/icmp_* on an IDF service-group row."""
   if not isinstance(row, dict):
     return row
   has_ports = (
@@ -1580,16 +2309,22 @@ def _inflate_nsg_zprotobuf(row):
 class _AllowType(object):
   @staticmethod
   def Name(value):
+    if _FLOW_PROTO is not None:
+      name = _FLOW_PROTO.enum_name(
+          value, "AllowType", "AllowedType", "EndpointAllowType")
+      if name:
+        return name
     return {1: "kTypeAll", 2: "kTypeNone"}.get(int(value or 0), str(value))
 
 
 def _attr_base_rule_info(raw):
   fields = _proto_decode(raw or b"")
+  hints = _MSG_HINTS["rule_info"]
   return _Attr(
-      uuid=_proto_str(fields, 1),
-      description=_proto_str(fields, 2),
-      unique_id=_proto_first_varint(fields, 7, 0),
-      rule_name=_proto_str(fields, 8),
+      uuid=_proto_str(fields, _f("uuid", 1, *hints)),
+      description=_proto_str(fields, _f("description", 2, *hints)),
+      unique_id=_proto_first_varint(fields, _f("unique_id", 7, *hints), 0),
+      rule_name=_proto_str(fields, _f("rule_name", 8, *hints)),
   )
 
 
@@ -1597,12 +2332,16 @@ def _attr_secured_group(raw):
   if not raw:
     return None
   fields = _proto_decode(raw)
+  hints = _MSG_HINTS["secured_group"]
   return _Attr(
-      category_uuid_list=_proto_str_list(fields, 1),
-      uuid=_proto_str(fields, 2),
-      unique_id=_proto_first_varint(fields, 3, 0),
-      entity_group_uuid_list=_proto_str_list(fields, 4),
-      category_selection_type=_proto_first_varint(fields, 5, 0),
+      category_uuid_list=_proto_str_list(
+          fields, _f("category_uuid_list", 1, *hints)),
+      uuid=_proto_str(fields, _f("uuid", 2, *hints)),
+      unique_id=_proto_first_varint(fields, _f("unique_id", 3, *hints), 0),
+      entity_group_uuid_list=_proto_str_list(
+          fields, _f("entity_group_uuid_list", 4, *hints)),
+      category_selection_type=_proto_first_varint(
+          fields, _f("category_selection_type", 5, *hints), 0),
   )
 
 
@@ -1610,140 +2349,194 @@ def _attr_endpoint(raw):
   if not raw:
     return None
   fields = _proto_decode(raw)
+  hints = _MSG_HINTS["endpoint"]
   entity = None
-  ent_raw = _proto_first_bytes(fields, 1)
+  ent_raw = _proto_first_bytes(fields, _f("endpoint_entity", 1, *hints))
   if ent_raw:
     ent_fields = _proto_decode(ent_raw)
+    eh = _MSG_HINTS["endpoint_entity"]
     entity = _Attr(
-        category_uuid_list=_proto_str_list(ent_fields, 1),
-        category_selection_type=_proto_first_varint(ent_fields, 2, 0),
+        category_uuid_list=_proto_str_list(
+            ent_fields, _f("category_uuid_list", 1, *eh)),
+        category_selection_type=_proto_first_varint(
+            ent_fields, _f("category_selection_type", 2, *eh), 0),
     )
   return _Attr(
       endpoint_entity=entity,
-      ip_subnet=_proto_str(fields, 2),
-      address_group_uuid=_proto_str(fields, 3),
-      allow_type=_proto_first_varint(fields, 4, 0),
+      ip_subnet=_proto_str(fields, _f("ip_subnet", 2, *hints)),
+      address_group_uuid=_proto_str(
+          fields, _f("address_group_uuid", 3, *hints)),
+      allow_type=_proto_first_varint(fields, _f("allow_type", 4, *hints), 0),
       AllowType=_AllowType,
-      entity_group_uuid_list=_proto_str_list(fields, 5),
-      ipv6_subnet=_proto_str(fields, 6),
+      entity_group_uuid_list=_proto_str_list(
+          fields, _f("entity_group_uuid_list", 5, *hints)),
+      ipv6_subnet=_proto_str(fields, _f("ipv6_subnet", 6, *hints)),
   )
 
 
 def _attr_rule_services(raw):
   fields = _proto_decode(raw or b"")
+  hints = _MSG_HINTS["rule_services"]
   ports = []
-  for item in _proto_bytes_list(fields, 2):
+  for item in _proto_bytes_list(fields, _f("port_range_list", 2, *hints)):
     inner = _proto_decode(item)
     ports.append(_Attr(
-        start_port=_proto_first_varint(inner, 1, 0),
-        end_port=_proto_first_varint(inner, 2, 0)))
+        start_port=_proto_first_varint(
+            inner, _f("start_port", 1, *_MSG_HINTS["port_range"]), 0),
+        end_port=_proto_first_varint(
+            inner, _f("end_port", 2, *_MSG_HINTS["port_range"]), 0)))
   icmp = []
-  for item in _proto_bytes_list(fields, 3):
+  for item in _proto_bytes_list(fields, _f("icmp_type_code_list", 3, *hints)):
     inner = _proto_decode(item)
     icmp.append(_Attr(
-        icmp_type=_proto_first_varint(inner, 1, 0),
-        icmp_code=_proto_first_varint(inner, 2, 0)))
+        icmp_type=_proto_first_varint(
+            inner, _f("icmp_type", 1, *_MSG_HINTS["icmp"]), 0),
+        icmp_code=_proto_first_varint(
+            inner, _f("icmp_code", 2, *_MSG_HINTS["icmp"]), 0)))
   icmp6 = []
-  for item in _proto_bytes_list(fields, 5):
+  for item in _proto_bytes_list(
+      fields, _f("icmp_v6_type_code_list", 5, *hints)):
     inner = _proto_decode(item)
     icmp6.append(_Attr(
-        icmp_type=_proto_first_varint(inner, 1, 0),
-        icmp_code=_proto_first_varint(inner, 2, 0)))
+        icmp_type=_proto_first_varint(
+            inner, _f("icmp_type", 1, *_MSG_HINTS["icmp"]), 0),
+        icmp_code=_proto_first_varint(
+            inner, _f("icmp_code", 2, *_MSG_HINTS["icmp"]), 0)))
   return _Attr(
-      protocol=_proto_first_varint(fields, 1, 0),
+      protocol=_proto_first_varint(fields, _f("protocol", 1, *hints), 0),
       port_range_list=ports,
       icmp_type_code_list=icmp,
-      service_group_uuid=_proto_str(fields, 4),
+      service_group_uuid=_proto_str(
+          fields, _f("service_group_uuid", 4, *hints)),
       icmp_v6_type_code_list=icmp6,
   )
 
 
 def _attr_application_rule(raw):
   fields = _proto_decode(raw or b"")
+  hints = _MSG_HINTS["app_rule"]
   return _Attr(
-      rule_info=_attr_base_rule_info(_proto_first_bytes(fields, 1)),
-      secured_group=_attr_secured_group(_proto_first_bytes(fields, 2)),
-      endpoint=_attr_endpoint(_proto_first_bytes(fields, 3)),
-      services=[_attr_rule_services(item) for item in _proto_bytes_list(fields, 4)],
-      direction=_proto_first_varint(fields, 5, 0),
-      network_function_uuid=_proto_str(fields, 7),
+      rule_info=_attr_base_rule_info(
+          _proto_first_bytes(fields, _f("rule_info", 1, *hints))),
+      secured_group=_attr_secured_group(
+          _proto_first_bytes(fields, _f("secured_group", 2, *hints))),
+      endpoint=_attr_endpoint(
+          _proto_first_bytes(fields, _f("endpoint", 3, *hints))),
+      services=[
+          _attr_rule_services(item) for item in _proto_bytes_list(
+              fields, _f("services", 4, *hints))],
+      direction=_proto_first_varint(fields, _f("direction", 5, *hints), 0),
+      network_function_uuid=_proto_str(
+          fields, _f("network_function_uuid", 7, *hints)),
   )
 
 
 def _attr_two_env_rule(raw):
   fields = _proto_decode(raw or b"")
+  hints = _MSG_HINTS["two_env"]
   return _Attr(
-      rule_info=_attr_base_rule_info(_proto_first_bytes(fields, 1)),
-      first_secured_group=_attr_secured_group(_proto_first_bytes(fields, 2)),
-      second_secured_group=_attr_secured_group(_proto_first_bytes(fields, 3)),
+      rule_info=_attr_base_rule_info(
+          _proto_first_bytes(fields, _f("rule_info", 1, *hints))),
+      first_secured_group=_attr_secured_group(
+          _proto_first_bytes(fields, _f("first_secured_group", 2, *hints))),
+      second_secured_group=_attr_secured_group(
+          _proto_first_bytes(fields, _f("second_secured_group", 3, *hints))),
   )
 
 
 def _attr_multi_env_rule(raw):
   fields = _proto_decode(raw or b"")
+  hints = _MSG_HINTS["multi_env"]
   groups = []
-  all_raw = _proto_first_bytes(fields, 3)
+  all_raw = _proto_first_bytes(
+      fields, _f("all_to_all_isolation_group", 3, *hints))
   if all_raw:
     inner = _proto_decode(all_raw)
     groups = [
-        _attr_secured_group(item) for item in _proto_bytes_list(inner, 1)]
+        _attr_secured_group(item) for item in _proto_bytes_list(
+            inner, _f("isolation_group_list", 1, *_MSG_HINTS["all_to_all"]))]
   return _Attr(
-      rule_info=_attr_base_rule_info(_proto_first_bytes(fields, 1)),
-      isolation_type=_proto_first_varint(fields, 2, 0),
+      rule_info=_attr_base_rule_info(
+          _proto_first_bytes(fields, _f("rule_info", 1, *hints))),
+      isolation_type=_proto_first_varint(
+          fields, _f("isolation_type", 2, *hints), 0),
       all_to_all_isolation_group=_Attr(isolation_group_list=groups),
   )
 
 
 def _attr_secured_group_rule(raw):
   fields = _proto_decode(raw or b"")
+  hints = _MSG_HINTS["sg_rule"]
   return _Attr(
-      rule_info=_attr_base_rule_info(_proto_first_bytes(fields, 1)),
-      secured_group=_attr_secured_group(_proto_first_bytes(fields, 2)),
-      action=bool(_proto_first_varint(fields, 3, 0)),
-      services=[_attr_rule_services(item) for item in _proto_bytes_list(fields, 4)],
+      rule_info=_attr_base_rule_info(
+          _proto_first_bytes(fields, _f("rule_info", 1, *hints))),
+      secured_group=_attr_secured_group(
+          _proto_first_bytes(fields, _f("secured_group", 2, *hints))),
+      action=bool(_proto_first_varint(fields, _f("action", 3, *hints), 0)),
+      services=[
+          _attr_rule_services(item) for item in _proto_bytes_list(
+              fields, _f("services", 4, *hints))],
   )
 
 
 def _attr_flex_rule(raw):
   fields = _proto_decode(raw or b"")
+  hints = _MSG_HINTS["flex"]
   return _Attr(
-      rule_info=_attr_base_rule_info(_proto_first_bytes(fields, 1)),
-      src_endpoint=_attr_endpoint(_proto_first_bytes(fields, 2)),
-      dest_endpoint=_attr_endpoint(_proto_first_bytes(fields, 3)),
-      services=[_attr_rule_services(item) for item in _proto_bytes_list(fields, 4)],
-      action=_proto_first_varint(fields, 5, 0),
-      direction=_proto_first_varint(fields, 6, 0),
-      rule_priority=_proto_first_varint(fields, 7, 0),
-      network_function_uuid=_proto_str(fields, 9),
-      applied_to_entity_group_uuid_list=_proto_str_list(fields, 10),
-      rule_ip_version=_proto_first_varint(fields, 11, 0),
+      rule_info=_attr_base_rule_info(
+          _proto_first_bytes(fields, _f("rule_info", 1, *hints))),
+      src_endpoint=_attr_endpoint(
+          _proto_first_bytes(fields, _f("src_endpoint", 2, *hints))),
+      dest_endpoint=_attr_endpoint(
+          _proto_first_bytes(fields, _f("dest_endpoint", 3, *hints))),
+      services=[
+          _attr_rule_services(item) for item in _proto_bytes_list(
+              fields, _f("services", 4, *hints))],
+      action=_proto_first_varint(fields, _f("action", 5, *hints), 0),
+      direction=_proto_first_varint(fields, _f("direction", 6, *hints), 0),
+      rule_priority=_proto_first_varint(
+          fields, _f("rule_priority", 7, *hints), 0),
+      network_function_uuid=_proto_str(
+          fields, _f("network_function_uuid", 9, *hints)),
+      applied_to_entity_group_uuid_list=_proto_str_list(
+          fields, _f("applied_to_entity_group_uuid_list", 10, *hints)),
+      rule_ip_version=_proto_first_varint(
+          fields, _f("rule_ip_version", 11, *hints), 0),
   )
 
 
+_RULE_ONEOF = (
+    ("application_rule", "application_rule", _attr_application_rule, 1),
+    ("isolation_rule", "isolation_rule", _attr_two_env_rule, 2),
+    ("quarantine_rule", "quarantine_rule", _attr_application_rule, 3),
+    ("secured_group_rule", "secured_group_rule", _attr_secured_group_rule, 4),
+    ("multi_env_isolation_rule", "multi_env_isolation_rule",
+     _attr_multi_env_rule, 5),
+    ("shared_services_rule", "shared_services_rule", _attr_application_rule, 6),
+    ("flex_policy_rule", "flex_policy_rule", _attr_flex_rule, 7),
+)
+
+
 def _attr_rule(raw):
+  if _FLOW_PROTO is not None:
+    rec = (_FLOW_PROTO._msg(*_MSG_HINTS["rule"])
+           or _FLOW_PROTO.find_with_any(
+               "application_rule", "flex_policy_rule", "isolation_rule",
+               "multi_env_isolation_rule", "secured_group_rule"))
+    if rec:
+      return _dict_to_attr(_schema_decode(raw or b"", rec))
   fields = _proto_decode(raw or b"")
   kwargs = {}
-  app = _proto_first_bytes(fields, 1)
-  if app:
-    kwargs["application_rule"] = _attr_application_rule(app)
-  iso = _proto_first_bytes(fields, 2)
-  if iso:
-    kwargs["isolation_rule"] = _attr_two_env_rule(iso)
-  quar = _proto_first_bytes(fields, 3)
-  if quar:
-    kwargs["quarantine_rule"] = _attr_application_rule(quar)
-  sgr = _proto_first_bytes(fields, 4)
-  if sgr:
-    kwargs["secured_group_rule"] = _attr_secured_group_rule(sgr)
-  multi = _proto_first_bytes(fields, 5)
-  if multi:
-    kwargs["multi_env_isolation_rule"] = _attr_multi_env_rule(multi)
-  shared = _proto_first_bytes(fields, 6)
-  if shared:
-    kwargs["shared_services_rule"] = _attr_application_rule(shared)
-  flex = _proto_first_bytes(fields, 7)
-  if flex:
-    kwargs["flex_policy_rule"] = _attr_flex_rule(flex)
+  rule_hints = _MSG_HINTS["rule"]
+  for attr, field_name, parser, default_n in _RULE_ONEOF:
+    if not _schema_has_field(field_name, *rule_hints):
+      continue
+    number = _f(field_name, default_n, *rule_hints)
+    if not number:
+      continue
+    blob = _proto_first_bytes(fields, number)
+    if blob:
+      kwargs[attr] = parser(blob)
   return _Attr(**kwargs)
 
 
@@ -1751,14 +2544,27 @@ def _rules_from_policy_zprotobuf(raw):
   data = _zprotobuf_bytes(raw)
   if not data:
     return None
-  fields = _proto_decode(_zlib_decompress(data))
+  buf = _zlib_decompress(data)
+  if _FLOW_PROTO is not None:
+    rec = (_FLOW_PROTO._msg(*_MSG_HINTS["policy"])
+           or _FLOW_PROTO.find_with_any("rules_map", "rule_map", "rules"))
+    if rec:
+      decoded = _schema_decode(buf, rec)
+      rules = []
+      for rule_dict in _extract_rule_dicts(decoded):
+        converted = convert_rule(_dict_to_attr(rule_dict))
+        if converted:
+          rules.append(converted)
+      return rules
+  fields = _proto_decode(buf)
   rules = []
-  for entry_raw in _proto_bytes_list(fields, 6):
+  blobs = _proto_bytes_list(fields, _f("rules_map", 6, *_MSG_HINTS["policy"]))
+  value_n = _f("value", 2, *_MSG_HINTS["map_entry"])
+  for entry_raw in blobs:
     entry = _proto_decode(entry_raw)
-    value = _proto_first_bytes(entry, 2)
-    if not value:
-      continue
-    converted = convert_rule(_attr_rule(value))
+    value = _proto_first_bytes(entry, value_n)
+    blob = value or entry_raw
+    converted = convert_rule(_attr_rule(blob))
     if converted:
       rules.append(converted)
   return rules
@@ -1778,7 +2584,7 @@ def _idfcli_entities(entity_types):
 
 
 def dump_idfcli(output_dir, workers=8, timeout=180):
-  """Run idfcli get entitytype for every IDF_DUMP_TYPES and write JSON."""
+  """Unused here. Live idfcli collect belongs in flow_pc_dump.py on the PC."""
   dest = os.path.join(output_dir, "idfcli")
   os.makedirs(dest, exist_ok=True)
   index = {
@@ -1790,13 +2596,9 @@ def dump_idfcli(output_dir, workers=8, timeout=180):
   def _one(entity_type):
     parsed, err = _idfcli_one(entity_type, timeout=timeout)
     rows = parsed or []
-    if entity_type in ("network_service_group", "service_group"):
-      for row in rows:
-        _inflate_nsg_zprotobuf(row)
-    else:
-      for row in rows:
-        if isinstance(row, dict):
-          row.pop("__zprotobuf__", None)
+    for row in rows:
+      if isinstance(row, dict):
+        row.pop("__zprotobuf__", None)
     path = os.path.join(dest, "%s.json" % entity_type)
     _write_json_file(path, rows)
     raw = _IDF_RAW.get(entity_type) or ""
@@ -1825,6 +2627,10 @@ def dump_idfcli(output_dir, workers=8, timeout=180):
   LOG.info("DUMP idfcli wrote %s types under %s", len(IDF_DUMP_TYPES), dest)
   return index, errors
 
+
+# ---------------------------------------------------------------------------
+# _map_* : dumped IDF attribute dicts -> prefetch JSON (ingest / neo4j shape).
+# ---------------------------------------------------------------------------
 
 def _first_attr(row, *names, default=None):
   for name in names:
@@ -2358,11 +3164,73 @@ def _map_address_group(row):
   return data
 
 
+def _v4_port_rows(items):
+  rows = []
+  for item in items or []:
+    if not isinstance(item, dict):
+      continue
+    rows.append(_port_row(
+        item.get("startPort", item.get("start_port")),
+        item.get("endPort", item.get("end_port", item.get("startPort"))),
+        bool(item.get("isAllAllowed") or item.get("is_all_allowed"))))
+  return rows
+
+
+def _v4_icmp_rows(items):
+  rows = []
+  for item in items or []:
+    if not isinstance(item, dict):
+      continue
+    rows.append(_icmp_row(
+        item.get("type", item.get("icmp_type")),
+        item.get("code", item.get("icmp_code")),
+        bool(item.get("isAllAllowed") or item.get("is_all_allowed"))))
+  return rows
+
+
+def _inflate_nsg_v4(row):
+  """Fill tcp_services from v4 tcpServices / proto service_list."""
+  if not isinstance(row, dict):
+    return row
+  if row.get("service_list"):
+    services = []
+    for item in row.get("service_list") or []:
+      if isinstance(item, dict):
+        services.append(_dict_to_attr(item))
+    tcp, udp, icmp, icmp6 = _service_lists_from_service_list(services)
+    if tcp:
+      row["tcp_services"] = tcp
+    if udp:
+      row["udp_services"] = udp
+    if icmp:
+      row["icmp_services"] = icmp
+    if icmp6:
+      row["icmp_v6_services"] = icmp6
+    return row
+  if (row.get("tcpServices") or row.get("udpServices") or
+      row.get("icmpServices") or row.get("icmpV6Services")):
+    tcp = _v4_port_rows(row.get("tcpServices"))
+    udp = _v4_port_rows(row.get("udpServices"))
+    icmp = _v4_icmp_rows(row.get("icmpServices"))
+    icmp6 = _v4_icmp_rows(row.get("icmpV6Services"))
+    if tcp:
+      row["tcp_services"] = tcp
+    if udp:
+      row["udp_services"] = udp
+    if icmp:
+      row["icmp_services"] = icmp
+    if icmp6:
+      row["icmp_v6_services"] = icmp6
+  return row
+
+
 def _map_service_group(row):
   if isinstance(row, dict):
-    _inflate_nsg_zprotobuf(row)
+    _inflate_nsg_v4(row)
+    row.pop("__zprotobuf__", None)
   data = {
-      "ext_id": _uuid_str(_first_attr(row, "ext_id", "uuid", "id")) or "",
+      "ext_id": _uuid_str(
+          _first_attr(row, "ext_id", "extId", "uuid", "id")) or "",
       "name": _first_attr(row, "name") or "",
       "description": _first_attr(row, "description") or "",
       "tcp_services": _port_rows_from_idf(row, "tcp"),
@@ -2373,7 +3241,47 @@ def _map_service_group(row):
   project_id = _row_project_id(row)
   if project_id:
     _apply_project(data, project_id)
+  shared = row.get("isSharedWithAllProjects")
+  if shared is None:
+    shared = row.get("shared_with_all_projects")
+  if shared is not None:
+    data["shared_with_all_projects"] = bool(shared)
+    data["sharedWithAllProjects"] = bool(shared)
   return data
+
+
+def fetch_service_groups_from_dump():
+  """v4 service_group_get.json only. No IDF zprotobuf."""
+  gets = {}
+  listed = []
+  if _DUMP_DIR:
+    gets = _load_json_if_present(
+        os.path.join(_DUMP_DIR, "service_group_get.json"), {})
+    listed = _load_json_if_present(
+        os.path.join(_DUMP_DIR, "service_group_list.json"), [])
+  records = []
+  if isinstance(gets, dict) and gets:
+    for uid, rec in gets.items():
+      if isinstance(rec, dict):
+        row = dict(rec)
+        row.setdefault("extId", uid)
+        records.append(row)
+  elif isinstance(gets, list):
+    records = [item for item in gets if isinstance(item, dict)]
+  if not records and isinstance(listed, list):
+    records = [item for item in listed if isinstance(item, dict)]
+  rows = []
+  for rec in records:
+    mapped = _map_service_group(rec)
+    if mapped and mapped.get("ext_id"):
+      rows.append(mapped)
+  if not rows:
+    raise RuntimeError(
+        "PROCESS need service_group_get.json from v4 ServiceGroupGet")
+  LOG.info(
+      "PROCESS service_groups from service_group_get.json count=%s",
+      len(rows))
+  return rows
 
 
 def _idf_entity_refs(row, *names):
@@ -2465,6 +3373,31 @@ def _map_entity_group(row):
   return data
 
 
+# IDF ints: type 1=APP 2=ISO 3=QUAR; mode 1=MONITOR 2=ENFORCE;
+# scope 1=ALL_VLAN 3=VPC 4=GLOBAL 5=VPC_AS_CATEGORY.
+# flow_cli uses kApplication / kWorkload / kApply / kAllVlan.
+POLICY_TYPE_MAP = {
+    "1": "APPLICATION", "APPLICATION": "APPLICATION", "APP": "APPLICATION",
+    "WORKLOAD": "APPLICATION", "CRITICAL": "APPLICATION", "ZONE": "APPLICATION",
+    "CORE_INFRASTRUCTURE": "APPLICATION", "COREINFRASTRUCTURE": "APPLICATION",
+    "2": "ISOLATION", "ISOLATION": "ISOLATION",
+    "3": "QUARANTINE", "QUARANTINE": "QUARANTINE",
+}
+POLICY_MODE_MAP = {
+    "0": "SAVE", "SAVE": "SAVE",
+    "1": "MONITOR", "MONITOR": "MONITOR",
+    "2": "ENFORCE", "ENFORCE": "ENFORCE", "APPLY": "ENFORCE",
+    "3": "SAVE",
+}
+POLICY_SCOPE_MAP = {
+    "1": "ALL_VLAN", "ALL_VLAN": "ALL_VLAN", "VLAN": "ALL_VLAN",
+    "ALLVLAN": "ALL_VLAN",
+    "2": "VPC", "3": "VPC", "VPC": "VPC", "VPC_LIST": "VPC",
+    "4": "GLOBAL", "GLOBAL": "GLOBAL",
+    "5": "VPC_AS_CATEGORY", "VPC_AS_CATEGORY": "VPC_AS_CATEGORY",
+}
+
+
 def _policy_enum_label(value, mapping, default):
   if value in (None, ""):
     return default
@@ -2484,33 +3417,11 @@ def _policy_enum_label(value, mapping, default):
 
 
 def _map_policy(row):
-  # Live IDF ints: type 1=APP 2=ISO 3=QUAR; mode 1=MONITOR 2=ENFORCE;
-  # scope 1=ALL_VLAN 3=VPC 4=GLOBAL 5=VPC_AS_CATEGORY.
-  type_map = {
-      "1": "APPLICATION", "APPLICATION": "APPLICATION", "APP": "APPLICATION",
-      "2": "ISOLATION", "ISOLATION": "ISOLATION",
-      "3": "QUARANTINE", "QUARANTINE": "QUARANTINE",
-  }
-  mode_map = {
-      "0": "SAVE", "SAVE": "SAVE",
-      "1": "MONITOR", "MONITOR": "MONITOR",
-      "2": "ENFORCE", "ENFORCE": "ENFORCE", "APPLY": "ENFORCE",
-      "3": "SAVE",
-  }
-  scope_map = {
-      "1": "ALL_VLAN", "ALL_VLAN": "ALL_VLAN", "VLAN": "ALL_VLAN",
-      "2": "VPC", "3": "VPC", "VPC": "VPC", "VPC_LIST": "VPC",
-      "4": "GLOBAL", "GLOBAL": "GLOBAL",
-      "5": "VPC_AS_CATEGORY", "VPC_AS_CATEGORY": "VPC_AS_CATEGORY",
-  }
-  proto_rules = None
-  if isinstance(row, dict) and row.get("__zprotobuf__"):
-    try:
-      proto_rules = _rules_from_policy_zprotobuf(row.get("__zprotobuf__"))
-    except Exception as err:
-      LOG.warning("policy zprotobuf rules failed name=%s: %s",
-                  _first_attr(row, "name") or "", err)
-      proto_rules = None
+  """IDF network_security_policy row -> prefetch policy. No zprotobuf."""
+  type_map = POLICY_TYPE_MAP
+  mode_map = POLICY_MODE_MAP
+  scope_map = POLICY_SCOPE_MAP
+  if isinstance(row, dict):
     row.pop("__zprotobuf__", None)
   rules = _first_attr(row, "rules", "rule_list", default=[])
   parsed_rules = _maybe_json(rules)
@@ -2519,17 +3430,14 @@ def _map_policy(row):
   if not isinstance(rules, list):
     rules = []
   wrapped = []
-  if proto_rules is not None:
-    wrapped = proto_rules
-  else:
-    for rule in rules:
+  for rule in rules:
       if not isinstance(rule, dict):
         continue
       if "spec" in rule or "data" in rule:
         wrapped.append(rule)
       else:
         wrapped.append({"spec": rule, "type": rule.get("type") or "APPLICATION"})
-  if not wrapped and proto_rules is None:
+  if not wrapped:
     spec = {}
     src_cats = _idf_entity_refs(
         row, "source_category_uuid_list", "src_category_references")
@@ -2616,6 +3524,116 @@ def _map_policy(row):
   if project_id:
     _apply_project(data, project_id)
   return {"data": data}
+
+
+def _unwrap_cli_policy(rec, pol_uuid=""):
+  if not isinstance(rec, dict):
+    return {}
+  if isinstance(rec.get("network_security_policy"), dict):
+    rec = rec["network_security_policy"]
+  data = rec.get("data")
+  if isinstance(data, dict):
+    nsp = data.get("network_security_policy")
+    if isinstance(nsp, dict):
+      rec = nsp
+    elif data.get("uuid") or data.get("name") or data.get("rules_list"):
+      rec = data
+    elif pol_uuid and isinstance(data.get(pol_uuid), dict):
+      rec = data[pol_uuid]
+  rec = dict(rec)
+  if pol_uuid:
+    rec.setdefault("uuid", pol_uuid)
+  return rec
+
+
+def _cli_rule_items(policy):
+  rules = policy.get("rules_list")
+  if isinstance(rules, list):
+    return rules
+  rules_map = policy.get("rules_map")
+  if isinstance(rules_map, dict):
+    return list(rules_map.values())
+  rules = policy.get("rules")
+  if isinstance(rules, list):
+    return rules
+  return []
+
+
+def _map_policy_from_cli(pol_uuid, rec):
+  """flow_cli/kratos_cli policy.get JSON -> prefetch policy. Replaces zprotobuf."""
+  policy = _unwrap_cli_policy(rec, pol_uuid)
+  if not policy:
+    return None
+  rules = []
+  for item in _cli_rule_items(policy):
+    if not isinstance(item, dict):
+      continue
+    try:
+      converted = convert_rule(_dict_to_attr(item))
+    except Exception as err:
+      LOG.warning("policy.get convert rule failed uuid=%s: %s", pol_uuid, err)
+      continue
+    if converted:
+      rules.append(converted)
+  options = policy.get("options") if isinstance(policy.get("options"), dict) else {}
+  data = {
+      "ext_id": _uuid_str(
+          policy.get("uuid") or policy.get("ext_id") or pol_uuid) or "",
+      "name": policy.get("name") or "",
+      "description": policy.get("description") or "",
+      "type": _policy_enum_label(
+          _camel_upper(policy.get("policy_type") or policy.get("type")),
+          POLICY_TYPE_MAP, "APPLICATION"),
+      "state": _policy_enum_label(
+          _camel_upper(policy.get("mode") or policy.get("state")),
+          POLICY_MODE_MAP, "SAVE"),
+      "scope": _policy_enum_label(
+          _camel_upper(policy.get("scope") or policy.get("policy_scope")),
+          POLICY_SCOPE_MAP, "ALL_VLAN"),
+      "vpc_references": _uuid_list(
+          policy.get("vpc_uuid_list") or policy.get("vpc_references") or []),
+      "scope_references": _uuid_list(
+          policy.get("reference_uuid_list") or policy.get("scope_references") or []),
+      "priority": _int_attr(policy, "policy_priority", "priority", default=0),
+      "is_ipv6_traffic_allowed": _as_bool(
+          options.get("allow_ipv6_traffic", policy.get("allow_ipv6_traffic")),
+          False),
+      "is_ipv4_address_scope": _as_bool(
+          options.get("ipv4_address_scope", policy.get("ipv4_address_scope")),
+          False),
+      "is_ipv6_address_scope": _as_bool(
+          options.get("ipv6_address_scope", policy.get("ipv6_address_scope")),
+          False),
+      "is_logging_enabled": _as_bool(
+          options.get(
+              "is_policy_hitlog_enabled",
+              policy.get("is_policy_hitlog_enabled")),
+          False),
+      "rules": rules,
+  }
+  vpc_one = _uuid_str(policy.get("vpc_uuid"))
+  if vpc_one and vpc_one not in data["vpc_references"]:
+    data["vpc_references"].append(vpc_one)
+  data.update(_project_fields(_dict_to_attr(policy)))
+  return {"data": data}
+
+
+def fetch_policies_from_dump():
+  """flow_cli policy_get.json only. No IDF zprotobuf."""
+  gets = {}
+  if _DUMP_DIR:
+    gets = _load_json_if_present(os.path.join(_DUMP_DIR, "policy_get.json"), {})
+  if not (isinstance(gets, dict) and gets):
+    raise RuntimeError("PROCESS need policy_get.json from flow_cli policy.get")
+  rows = []
+  for uid, rec in gets.items():
+    mapped = _map_policy_from_cli(uid, rec)
+    if mapped:
+      rows.append(mapped)
+  if not rows:
+    raise RuntimeError("PROCESS policy_get.json had no mappable policies")
+  LOG.info("PROCESS policies from policy_get.json count=%s", len(rows))
+  return rows
 
 
 def _fetch_mapped(entity_types, mapper):
@@ -2802,6 +3820,7 @@ def convert_project(item):
 
 
 def _idf_mapped(entity_types, mapper):
+  """Try IDF type names in order; map the first type that has rows."""
   raw, errors = _idfcli_entities(entity_types)
   rows = []
   for item in raw:
@@ -2811,6 +3830,9 @@ def _idf_mapped(entity_types, mapper):
       LOG.debug("map failed %s: %s", entity_types, err)
   return rows, errors
 
+
+# fetch_*(interfaces=None): process_dump path. Manager code is skipped;
+# rows come from dumped idfcli files via _idf_mapped.
 
 def fetch_hosts(interfaces):
   LOG.info("DUMP start hosts")
@@ -2841,6 +3863,7 @@ def fetch_hosts(interfaces):
 
 
 def fetch_vms(_interfaces):
+  """Join idfcli vm + virtual_nic into prefetch vms.json."""
   LOG.info("DUMP start vms")
   with ThreadPoolExecutor(max_workers=2) as pool:
     vm_fut = pool.submit(_idf_mapped, ("vm", "mh_vm", "ahv_vm"), _map_vm)
@@ -2940,6 +3963,11 @@ def _cap_target(kind):
     return "vm"
   return "both"
 
+
+# ---------------------------------------------------------------------------
+# Enrich after mapping: NIC VLAN vs overlay, projects, SG L4 on rules, FQDN.
+# Overlay is never Basic VLAN. Secured-group drops VLAN Basic.
+# ---------------------------------------------------------------------------
 
 def _enrich_nics_and_vlan_vpc(payload):
   """Fill NIC VPC/subnet/VM category fields for neo4j_db_insert.py.
@@ -3716,7 +4744,7 @@ def fetch_fqdn_map(interfaces):
 
 
 def _normalize_port_set_get(gets):
-  """Unwrap atlas_cli {data: {uuid: rec}} accidentally stored as the rec."""
+  """Unwrap atlas_cli nested {uuid: rec} so ingest sees one rec per UUID."""
   if not isinstance(gets, dict):
     return gets or {}
   out = {}
@@ -3746,7 +4774,7 @@ DATASET_FILES = (
     "vms", "subnets", "vpcs", "hosts", "clusters", "projects",
     "categories", "network_functions", "network_function_by_id",
     "fqdn_to_ip_map", "port_set_list", "port_set_get",
-    "ahv_gateway", "cmsp_ovn", "dump_errors")
+    "ahv_gateway", "cmsp_ovn", "flow_proto", "dump_errors")
 
 
 def _json_default(value):
@@ -3779,6 +4807,7 @@ def _write_outputs(payload, output_dir, combined_path, workers,
       "dumped_at": payload.get("dumped_at"),
       "vlan_unique_uuid": payload.get("vlan_unique_uuid", ""),
       "global_unique_uuid": payload.get("global_unique_uuid", ""),
+      "unique_uuid_source": payload.get("unique_uuid_source", ""),
       "platform": payload.get("platform"),
       "platform_detection_method": payload.get("platform_detection_method"),
       "smsp_cluster_uuid": payload.get("smsp_cluster_uuid", ""),
@@ -3802,7 +4831,7 @@ def _empty_for(name):
     return {"vlan_unique_uuid": "", "global_unique_uuid": ""}
   if name in (
       "fqdn_to_ip_map", "network_function_by_id", "port_set_get",
-      "ahv_gateway", "cmsp_ovn"):
+      "ahv_gateway", "cmsp_ovn", "flow_proto"):
     return {}
   return []
 
@@ -3886,6 +4915,7 @@ def _enrich_entity_group_refs(payload):
 
 
 def _post_fetch_enrich(payload):
+  """Join mapped datasets (categories, projects, SG ports, FQDN) onto VMs/rules."""
   _merge_network_functions(payload)
   _enrich_nics_and_vlan_vpc(payload)
   _enrich_projects(payload)
@@ -3896,8 +4926,15 @@ def _post_fetch_enrich(payload):
 
 def process_dump(dump_dir, output_dir=None, workers=16, timeout_secs=90,
                  fail_on_error=False):
-  """Map idfcli JSON into prefetch files. No live PC APIs."""
-  global _IDF_FILE_DIR
+  """Map a PC dump's idfcli/ into prefetch JSON. No live PC APIs.
+
+  dump_dir must contain idfcli/ from flow_pc_dump.py plus policy_get.json
+  and service_group_get.json. Writes policies.json, address_groups.json,
+  service_groups.json, entity_groups.json, vms.json, and the rest under
+  output_dir (default: dump_dir). Atlas/OVN/OVS files are copied through,
+  not re-collected. No IDF zprotobuf.
+  """
+  global _IDF_FILE_DIR, _DUMP_DIR
   dump_dir = os.path.abspath(dump_dir)
   output_dir = os.path.abspath(output_dir or dump_dir)
   idf_dir = os.path.join(dump_dir, "idfcli")
@@ -3907,6 +4944,7 @@ def process_dump(dump_dir, output_dir=None, workers=16, timeout_secs=90,
   log_file = os.path.join(output_dir, "process.log")
   _setup_logging(log_file)
   _IDF_FILE_DIR = idf_dir
+  _DUMP_DIR = dump_dir
   _IDF_RESULTS.clear()
   combined_path = os.path.join(output_dir, "all.json")
   errors = {}
@@ -3928,15 +4966,27 @@ def process_dump(dump_dir, output_dir=None, workers=16, timeout_secs=90,
       "smsp_cluster_uuid": "",
       "vlan_unique_uuid": uuids.get("vlan_unique_uuid") or "",
       "global_unique_uuid": uuids.get("global_unique_uuid") or "",
+      "unique_uuid_source": uuids.get("source") or "",
       "ahv_gateway": _load_json_if_present(
           os.path.join(dump_dir, "ahv_gateway.json"), {}),
       "cmsp_ovn": _load_json_if_present(
           os.path.join(dump_dir, "cmsp_ovn.json"), {}),
+      "flow_proto": _load_json_if_present(
+          os.path.join(dump_dir, "flow_proto.json"), {}),
       "port_set_list": _load_json_if_present(
           os.path.join(dump_dir, "port_set_list.json"), []),
       "port_set_get": _normalize_port_set_get(_load_json_if_present(
           os.path.join(dump_dir, "port_set_get.json"), {})),
+      "policy_list": _load_json_if_present(
+          os.path.join(dump_dir, "policy_list.json"), []),
+      "policy_get": _load_json_if_present(
+          os.path.join(dump_dir, "policy_get.json"), {}),
+      "service_group_list": _load_json_if_present(
+          os.path.join(dump_dir, "service_group_list.json"), []),
+      "service_group_get": _load_json_if_present(
+          os.path.join(dump_dir, "service_group_get.json"), {}),
   }
+  # interfaces=None: read dumped idfcli files, do not call PC APIs.
   jobs = [
       ("hosts", lambda: fetch_hosts(None)),
       ("fqdn_to_ip_map", lambda: fetch_fqdn_map(None)),
@@ -3950,12 +5000,10 @@ def process_dump(dump_dir, output_dir=None, workers=16, timeout_secs=90,
       ("entity_capabilities", lambda: fetch_entity_capabilities(None)),
       ("address_groups", lambda: _fetch_mapped(
           ("address_group", "network_address_group"), _map_address_group)),
-      ("service_groups", lambda: _fetch_mapped(
-          ("service_group", "network_service_group"), _map_service_group)),
+      ("service_groups", fetch_service_groups_from_dump),
       ("entity_groups", lambda: _fetch_mapped(
           ("entity_group", "network_entity_group"), _map_entity_group)),
-      ("policies", lambda: _fetch_mapped(
-          ("network_security_policy", "security_policy"), _map_policy)),
+      ("policies", fetch_policies_from_dump),
   ]
   payload.update(_run_jobs_parallel(jobs, workers, timeout_secs, errors))
   try:
@@ -3970,13 +5018,27 @@ def process_dump(dump_dir, output_dir=None, workers=16, timeout_secs=90,
   LOG.info("PROCESS wrote prefetch JSON under %s", output_dir)
   LOG.info(
       "  policies=%s address_groups=%s service_groups=%s entity_groups=%s "
-      "port_set_list=%s port_set_get=%s",
+      "port_set_list=%s port_set_get=%s policy_get=%s service_group_get=%s",
       len(payload.get("policies") or []),
       len(payload.get("address_groups") or []),
       len(payload.get("service_groups") or []),
       len(payload.get("entity_groups") or []),
       len(payload.get("port_set_list") or []),
-      len(payload.get("port_set_get") or {}))
+      len(payload.get("port_set_get") or {}),
+      len(payload.get("policy_get") or {}),
+      len(payload.get("service_group_get") or {}))
+  if errors.get("policies") or errors.get("service_groups"):
+    LOG.error(
+        "PROCESS required CLI/v4 JSON failed: %s",
+        ", ".join(
+            k for k in ("policies", "service_groups") if k in errors))
+    return 2
+  if not (payload.get("policies") or []):
+    LOG.error("PROCESS need policy_get.json from flow_cli policy.get")
+    return 2
+  if not (payload.get("service_groups") or []):
+    LOG.error("PROCESS need service_group_get.json from v4 ServiceGroupGet")
+    return 2
   if errors:
     LOG.warning("Process errors: %s", ", ".join(sorted(errors)))
     return 2 if fail_on_error else 0

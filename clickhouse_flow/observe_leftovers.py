@@ -398,6 +398,8 @@ def build_hash_index(dump):
             "kind": "address_set", "label": name, "ip": "IPv6", "kube": kube,
             "eg_uuid": uid})
 
+    hash_entity("VM", [], "allow-any")
+
     for ag in dump["ags"]:
         uid = as_uuid(ag.get("ext_id") or ag.get("uuid"))
         if not uid:

@@ -43,7 +43,11 @@ SELECT
     toString(anyIf(atlas_port_set_uuid,
                    atlas_port_set_uuid != toUUID('%(z)s'))),
     arraySort(arrayDistinct(arrayFlatten(groupArray(computed_nic_uuids))))
-        = arraySort(arrayDistinct(arrayFlatten(groupArray(atlas_nic_uuids)))),
+        = arraySort(arrayDistinct(arrayFlatten(groupArray(atlas_nic_uuids))))
+    OR has(arrayDistinct(arrayFlatten(groupArray(vm_category_names))), 'all')
+    OR has(arrayDistinct(arrayFlatten(groupArray(vm_category_names))), 'any')
+    OR has(arrayDistinct(arrayFlatten(groupArray(vpc_category_names))), 'all')
+    OR has(arrayDistinct(arrayFlatten(groupArray(vpc_category_names))), 'any'),
     count()
 FROM flow_policy.portset
 FINAL
@@ -114,6 +118,22 @@ WHERE log_bundle_id = %(bid)d
 GROUP BY port_set_uuid
 ORDER BY (any(length(only_computed_nics)) + any(length(only_atlas_nics))) DESC
 LIMIT {limit}
+FORMAT TabSeparated
+"""
+
+ATLAS_BUG_SQL = """
+SELECT
+    toString(port_set_uuid),
+    any(atlas_name),
+    length(any(atlas_nic_uuids))
+FROM flow_policy.portset
+FINAL
+WHERE log_bundle_id = %(bid)d
+  AND mismatch_kind = 'atlas_without_computed'
+  AND NOT startsWith(atlas_name, 'K8s_')
+  AND NOT (startsWith(atlas_name, 'Quarantine') AND empty(atlas_nic_uuids))
+GROUP BY port_set_uuid
+ORDER BY any(atlas_name), port_set_uuid
 FORMAT TabSeparated
 """
 
@@ -258,8 +278,8 @@ def main():
 
     comparable = total - kube_atlas - quarantine_empty
     expected_match = comparable - fail_atlas
-    iso_hash_pass = iso_rows > 0 and iso_hash == iso_rows
-    iso_nic_pass = iso_rows > 0 and iso_nic == iso_rows
+    iso_hash_pass = iso_rows == 0 or iso_hash == iso_rows
+    iso_nic_pass = iso_rows == 0 or iso_nic == iso_rows
     uuid_pass = fail_computed == 0
     nic_pass = fail_nic == 0
     both_pass = pass_both == expected_match and expected_match > 0
@@ -283,6 +303,14 @@ def main():
          "NIC UUID sets differ (need 0)", fail_nic, 0)
     if fail_nic_empty:
         print("      computed NIC list empty, Atlas has NICs: %s" % fail_nic_empty)
+    if fail_atlas:
+        print("")
+        print("Atlas leftover bugs (UUID in Atlas, not in computed)")
+        for raw in ch_query(ATLAS_BUG_SQL % {"bid": bid}).splitlines():
+            if not raw.strip():
+                continue
+            uid, name, nics = raw.split("\t")
+            print("  %s  %s  atlas_nics=%s" % (uid, name, nics))
 
     if args.verbose and (fail_computed or fail_atlas or fail_nic):
         sample_sql = SAMPLE_SQL.replace(

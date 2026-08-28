@@ -5,8 +5,22 @@
 # PC collect only. Copy this file to the PC. System python3. No Flow venv.
 #   python3 flow_pc_dump.py --output_dir /home/nutanix/upgrade/flow_pc_dump
 #
-# Collects idfcli, atlas_cli, AHV Gateway OVS, CMSP OVN. No convert.
-# Convert locally: python3 flow_pc_process.py --dump_dir ...
+# Collects idfcli, atlas_cli, flow_cli/kratos_cli policy.list+get,
+# v4 service groups (ServiceGroupGet, not v3 intentgw), AHV Gateway OVS,
+# and CMSP OVN. Flow proto field map is skipped by default (unused).
+# No convert. Convert locally: python3 flow_pc_process.py --dump_dir ...
+#
+# Policy details (rules): CMSP runs flow_cli on the PCVM via bash.
+# SMSP kubectl-execs the kratos pod (ntnx-flow) with bash, then
+# kratos_cli if present else flow_cli (same CLI; this image names
+# it flow_cli). Convert requires policy_get.json.
+#
+# Service groups: do not use v3 POST /api/nutanix/v3/service_groups/list
+# (intentgw; next-gen/EPM/SMSP blocks it). Same unauth RPC as policy.list
+# (RpcRequestContext.should_authorize=False) but ServiceGroupGet — the
+# v4 GET /api/microseg/v4.3/config/service-groups/{extId} backend.
+# Empty uuid list returns all groups with decoded ports. Writes
+# service_group_list.json / service_group_get.json in v4 field names.
 #
 # Host OVS/OVN/virsh is collected from PC via AHV Gateway (mTLS :7030),
 # never SSH to AHV. Per PE hypervisor, the dump loops until these exist:
@@ -19,8 +33,10 @@
 # Where files land:
 #   AHV Gateway: <output_dir>/ahv_gateway/<hypervisor_ip>/
 #   CMSP OVN:    <output_dir>/cmsp_ovn/{anc-ovn,anc-ovn-ic-db,anc-policydb}/
-# On CMSP, OVN Northbound/Southbound live in kubectl pods on the PC
-# (anc-ovn-0 / container anc-ovn), not on AHV. Collect with:
+#   Flow proto:  <output_dir>/flow_proto/fields.json  (this build's field numbers)
+# OVN Northbound/Southbound live in kubectl pods (anc-ovn-0 / container
+# anc-ovn), not on AHV. CMSP: default PC kubectl. SMSP: mspctl cluster
+# kubeconfig flow (pods are in the flow cluster, often ntnx-flow). Collect:
 #   sudo kubectl exec anc-ovn-0 -c anc-ovn -- \
 #     ovsdb-client dump unix:/var/run/ovn/ovnnb_db.sock
 #   sudo kubectl exec anc-ovn-0 -c anc-ovn -- \
@@ -29,9 +45,11 @@
 #
 
 import argparse
+import ast
 import codecs
 import json
 import logging
+import marshal
 import os
 import re
 import ssl
@@ -271,22 +289,51 @@ def _write_json_file(path, value):
   parent = os.path.dirname(path)
   if parent:
     os.makedirs(parent, exist_ok=True)
-  with open(path, "w") as handle:
+  tmp = "%s.tmp.%s" % (path, os.getpid())
+  with open(tmp, "w") as handle:
     json.dump(value, handle, separators=(",", ":"), default=_json_default)
+    handle.flush()
+    try:
+      os.fsync(handle.fileno())
+    except Exception:
+      pass
+  os.replace(tmp, path)
   size = os.path.getsize(path)
   LOG.info("Wrote %s (%s bytes)", path, size)
   return path, size
 
 
-def fetch_unique_uuids():
-  LOG.info("DUMP start vlan/global unique uuids")
+FLOW_VLAN_UNIQUE_ZK = "/appliance/logical/flow/vlan_unique_uuid"
+FLOW_GLOBAL_UNIQUE_ZK = "/appliance/logical/flow/global_unique_uuid"
+_UNIQUE_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+SMSP_ATLAS_ZK_PYTHON = "/home/nutanix/.venvs/bin/bin/python3"
+SMSP_ATLAS_ZK_CODE = (
+    "from zeus.zookeeper_session import ZookeeperSession\n"
+    "zk = ZookeeperSession()\n"
+    "for key, path in (("
+    "'vlan_unique_uuid', '%s'), ("
+    "'global_unique_uuid', '%s')):\n"
+    "  val = zk.get(path)\n"
+    "  if isinstance(val, (bytes, bytearray)):\n"
+    "    val = val.decode('utf-8', 'replace')\n"
+    "  print('%%s=%%s' %% (key, val))\n"
+    % (FLOW_VLAN_UNIQUE_ZK, FLOW_GLOBAL_UNIQUE_ZK))
+
+
+def _uuid_from_text(text):
+  match = _UNIQUE_UUID_RE.search(text or "")
+  return match.group(0) if match else ""
+
+
+def _fetch_unique_uuids_pc_zk():
   zkcats = (
       "/home/nutanix/cluster/bin/zkcat",
       "/usr/local/nutanix/cluster/bin/zkcat",
   )
   paths = {
-      "vlan_unique_uuid": "/appliance/logical/flow/vlan_unique_uuid",
-      "global_unique_uuid": "/appliance/logical/flow/global_unique_uuid",
+      "vlan_unique_uuid": FLOW_VLAN_UNIQUE_ZK,
+      "global_unique_uuid": FLOW_GLOBAL_UNIQUE_ZK,
   }
   out = {}
   for key, zk_path in paths.items():
@@ -301,19 +348,58 @@ def fetch_unique_uuids():
             [zkcat, zk_path], capture_output=True, text=True, check=False,
             timeout=20)
       except Exception as err:
-        LOG.error("DUMP %s failed: %s", key, err)
+        LOG.error("DUMP PC zk %s failed: %s", key, err)
         continue
       text = (proc.stdout or "").strip()
       err_text = (proc.stderr or "").strip()
       if "no node" in ("%s %s" % (text, err_text)).lower():
         continue
       if proc.returncode == 0 and text:
-        value = text.splitlines()[-1].strip()
+        value = _uuid_from_text(text.splitlines()[-1].strip()) or ""
         break
     if not found_bin:
-      LOG.warning("zkcat missing; skip %s", key)
+      LOG.warning("zkcat missing; skip PC zk %s", key)
     out[key] = value
-    LOG.info("DUMP %s=%s", key, value or "<empty>")
+    LOG.info("DUMP PC zk %s=%s", key, value or "<empty>")
+  return out
+
+
+def fetch_unique_uuids(output_dir=None):
+  """vlan/global unique UUIDs used to hash Atlas port-sets.
+
+  CMSP: PC zkcat /appliance/logical/flow/{vlan,global}_unique_uuid
+  SMSP: same ZK paths inside the flow Atlas pod (MicrosegHelper.get_flow_unique_uuid),
+        not PC zkcat. PC values are kept as pc_zk_* for compare.
+  """
+  LOG.info("DUMP start vlan/global unique uuids")
+  pc = _fetch_unique_uuids_pc_zk()
+  out = {
+      "vlan_unique_uuid": pc.get("vlan_unique_uuid") or "",
+      "global_unique_uuid": pc.get("global_unique_uuid") or "",
+      "source": "pc_zkcat",
+      "pc_zk_vlan_unique_uuid": pc.get("vlan_unique_uuid") or "",
+      "pc_zk_global_unique_uuid": pc.get("global_unique_uuid") or "",
+  }
+  info = detect_msp_platform()
+  if info.get("platform") == "smsp":
+    smsp = _fetch_unique_uuids_smsp_atlas_zk(output_dir)
+    vlan = smsp.get("vlan_unique_uuid") or ""
+    glob = smsp.get("global_unique_uuid") or ""
+    if vlan and glob:
+      out["vlan_unique_uuid"] = vlan
+      out["global_unique_uuid"] = glob
+      out["source"] = smsp.get("source") or "smsp_atlas_zk"
+    else:
+      LOG.warning(
+          "SMSP Atlas ZK unique UUIDs missing (%s); keeping PC zkcat",
+          smsp.get("error") or "empty")
+      if smsp.get("error"):
+        out["smsp_error"] = smsp["error"]
+  LOG.info(
+      "DUMP unique uuids source=%s vlan=%s global=%s",
+      out.get("source"),
+      out.get("vlan_unique_uuid") or "<empty>",
+      out.get("global_unique_uuid") or "<empty>")
   return out
 
 def _atlas_cli_bin():
@@ -379,9 +465,13 @@ def _mspctl_cluster_list():
 def _mspctl_flow_cluster():
   out, err, _rc = _run_profile_cmd("mspctl cluster get flow --verbose")
   parsed = _safe_json_loads(out)
-  if isinstance(parsed, dict) and parsed.get("ClusterUUID"):
+  if isinstance(parsed, dict) and _cluster_uuid(parsed):
     return parsed
   text = "%s\n%s" % (out, err)
+  match = re.search(
+      r"ClusterUUID['\"]?\s*[:=]\s*['\"]?([0-9a-fA-F-]{36})", text, re.I)
+  if match:
+    return {"ClusterUUID": match.group(1)}
   if re.search(r"msp cluster not found|getClusterStatusV2NotFound|\b404\b",
                text, re.I):
     return {"_not_found": True, "_raw": text[:300]}
@@ -464,15 +554,21 @@ def detect_msp_platform():
       for item in clusters if isinstance(item, dict)]
   LOG.info("mspctl clusters: %s", names or "<none>")
   flow = _flow_cluster_from_list(clusters)
-  smsp_uuid = _cluster_uuid(flow)
-  if not smsp_uuid and isinstance(flow_get, dict):
+  # AtlasCliHelper / FnsPortSetValidator: mspctl cluster get flow --verbose
+  # ClusterUUID, then atlas_cli -u ws://smsp-<uuid>.ntnx-ikat.svc:2060/atlas_cli
+  smsp_uuid = ""
+  if isinstance(flow_get, dict) and not flow_get.get("_not_found"):
     smsp_uuid = _cluster_uuid(flow_get)
+  if not smsp_uuid:
+    smsp_uuid = _cluster_uuid(flow)
 
   if smsp_uuid:
     info["platform"] = "smsp"
     info["smsp_cluster_uuid"] = smsp_uuid
     info["detection_method"] = (
-        "mspctl_cluster_list_flow" if flow else "mspctl_cluster_get_flow")
+        "mspctl_cluster_get_flow" if (
+            isinstance(flow_get, dict) and _cluster_uuid(flow_get))
+        else "mspctl_cluster_list_flow")
     LOG.info(
         "Detected SMSP via %s uuid=%s", info["detection_method"], smsp_uuid)
     return info
@@ -723,6 +819,639 @@ def dump_atlas_port_sets(output_dir, workers=32, timeout_secs=1800):
       rec["list_count"], rec["get_count"], rec["platform"])
   return rec
 
+
+def _flow_cli_bin():
+  for path in (
+      "/home/nutanix/flow/bin/flow_cli",
+      "/usr/local/nutanix/bin/flow_cli",
+      "/home/nutanix/bin/flow_cli"):
+    if os.path.exists(path) and os.access(path, os.X_OK):
+      return path
+  return "flow_cli"
+
+
+def _policy_cli_join(cli_name, args):
+  parts = [cli_name, "-o", "json"] + [str(item) for item in args]
+  return " ".join(parts)
+
+
+def _policy_list_rows(parsed, text=""):
+  if isinstance(parsed, list):
+    return parsed
+  if isinstance(parsed, dict):
+    data = parsed.get("data")
+    if isinstance(data, list):
+      return data
+    if isinstance(data, dict):
+      rows = []
+      for key, value in data.items():
+        if isinstance(value, dict):
+          row = dict(value)
+          row.setdefault("uuid", key)
+          rows.append(row)
+        else:
+          rows.append({"uuid": key, "value": value})
+      return rows
+    for key in ("entities", "items", "value", "results"):
+      if isinstance(parsed.get(key), list):
+        return parsed[key]
+  rows = []
+  for line in (text or "").splitlines()[1:]:
+    stripped = line.strip()
+    if not stripped:
+      continue
+    uid = _uuid_str(stripped.split()[0] if stripped.split() else "")
+    if uid:
+      rows.append({"uuid": uid})
+  return rows
+
+
+def _policy_uuid(item):
+  if isinstance(item, str):
+    return _uuid_str(item)
+  if not isinstance(item, dict):
+    return None
+  return _uuid_str(
+      item.get("uuid") or item.get("ext_id") or item.get("UUID") or
+      item.get("id"))
+
+
+def _policy_get_record(parsed, pol_uuid):
+  if not isinstance(parsed, dict):
+    return parsed if parsed is not None else {}
+  data = parsed.get("data", parsed)
+  if isinstance(data, dict):
+    nsp = data.get("network_security_policy")
+    if isinstance(nsp, dict):
+      nsp = dict(nsp)
+      nsp.setdefault("uuid", pol_uuid)
+      return nsp
+    if pol_uuid in data and isinstance(data[pol_uuid], dict):
+      inner = data[pol_uuid]
+      if isinstance(inner.get("network_security_policy"), dict):
+        rec = dict(inner["network_security_policy"])
+        rec.setdefault("uuid", pol_uuid)
+        return rec
+      rec = dict(inner)
+      rec.setdefault("uuid", pol_uuid)
+      return rec
+    if data.get("uuid") == pol_uuid or data.get("ext_id") == pol_uuid:
+      return data
+    if "rules_list" in data or "policy_type" in data:
+      rec = dict(data)
+      rec.setdefault("uuid", pol_uuid)
+      return rec
+  if isinstance(data, list) and data and isinstance(data[0], dict):
+    rec = dict(data[0])
+    rec.setdefault("uuid", pol_uuid)
+    return rec
+  return parsed
+
+
+def _run_bash_cli(inner, timeout_secs, log_cmd=True):
+  cmd = ["bash", "-lc", inner]
+  if log_cmd:
+    LOG.info("DUMP flow_cli: bash -lc %s", inner)
+  try:
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True, check=False,
+        timeout=timeout_secs, stdin=subprocess.DEVNULL)
+  except subprocess.TimeoutExpired:
+    raise RuntimeError("flow_cli timed out after %ss: %s" % (
+        timeout_secs, inner))
+  parsed = _safe_json_loads(proc.stdout or "")
+  if parsed is None:
+    err = (proc.stderr or proc.stdout or "").strip()[:500]
+    raise RuntimeError(
+        "flow_cli failed rc=%s: %s" % (
+            proc.returncode, err or "no JSON output"))
+  return parsed, proc.stdout or "", proc.returncode, cmd
+
+
+def _run_kratos_cli(kubeconfig, namespace, pod, inner, timeout_secs,
+                    log_cmd=True):
+  argv = _kubectl_argv([
+      "exec", "-n", namespace, pod, "--", "bash", "-lc", inner,
+  ], kubeconfig=kubeconfig)
+  if log_cmd:
+    LOG.info("DUMP kratos: kubectl exec %s/%s -- bash -lc %s",
+             namespace, pod, inner)
+  rc, stdout, stderr = _run_cmd_argv(argv, timeout_secs)
+  parsed = _safe_json_loads(stdout or "")
+  if parsed is None:
+    err = (stderr or stdout or "").strip()[:500]
+    raise RuntimeError(
+        "kratos cli failed rc=%s: %s" % (rc, err or "no JSON output"))
+  return parsed, stdout or "", rc, argv
+
+
+def _discover_kratos_cli(kubeconfig, namespace, pod):
+  inner = (
+      "command -v kratos_cli || command -v flow_cli || "
+      "ls /home/nutanix/flow/bin/kratos_cli /home/nutanix/flow/bin/flow_cli "
+      "2>/dev/null | head -1")
+  argv = _kubectl_argv([
+      "exec", "-n", namespace, pod, "--", "bash", "-lc", inner,
+  ], kubeconfig=kubeconfig)
+  rc, stdout, stderr = _run_cmd_argv(argv, 30)
+  text = (stdout or "").strip().splitlines()
+  for line in text:
+    candidate = line.strip()
+    if candidate.endswith("kratos_cli") or candidate.endswith("flow_cli"):
+      return candidate
+  if rc != 0:
+    LOG.warning(
+        "DUMP kratos cli discover failed rc=%s: %s",
+        rc, (stderr or stdout or "")[:200])
+  return ""
+
+
+# v4 ServiceGroupGet collector. Runs in the Flow venv (same as flow_cli),
+# not as this dump's system python3. Empty uuid list = all groups.
+_FLOW_SG_COLLECT_PY = r"""
+import json
+import os
+import sys
+import tempfile
+try:
+  import gflags
+  gflags.FLAGS(sys.argv[:1], known_only=True)
+except Exception:
+  pass
+from util.sl_bufs.net.rpc_pb2 import RpcRequestContext
+from flow.flow_interface_pb2 import ServiceGroupGetArg
+from flow.client.client import FlowClient
+from util.misc.protobuf import pb2json, reformat_proto
+ctx = RpcRequestContext()
+ctx.should_authorize = False
+ret = FlowClient().ServiceGroupGet(ServiceGroupGetArg(), request_context=ctx)
+payload = pb2json(reformat_proto(ret), b64_bytes=False, convert_enum_to_str=True)
+if not isinstance(payload, dict) or not isinstance(payload.get("service_group_list"), list):
+  sys.stderr.write("ServiceGroupGet missing service_group_list\n")
+  sys.exit(2)
+text = json.dumps(payload, separators=(",", ":"))
+out = os.environ.get("FLOW_SG_OUT") or ""
+if out:
+  dirname = os.path.dirname(out) or "."
+  fd, tmp = tempfile.mkstemp(prefix=".sg.", suffix=".tmp", dir=dirname)
+  try:
+    os.write(fd, text.encode("utf-8"))
+    os.close(fd)
+    fd = None
+    os.rename(tmp, out)
+  except Exception:
+    if fd is not None:
+      os.close(fd)
+    try:
+      os.remove(tmp)
+    except Exception:
+      pass
+    raise
+else:
+  sys.stdout.write(text)
+"""
+_ZERO_UUID = "00000000-0000-0000-0000-000000000000"
+
+
+def _flow_python_bin():
+  for path in (
+      "/home/nutanix/.venvs/flow/bin/python3",
+      "/home/nutanix/.venvs/bin/bin/python3"):
+    if os.path.exists(path) and os.access(path, os.X_OK):
+      return path
+  return ""
+
+
+def _sg_port_ranges(service, *keys):
+  rows = []
+  for key in keys:
+    items = service.get(key) if isinstance(service, dict) else None
+    if not items:
+      continue
+    for item in items:
+      if not isinstance(item, dict):
+        continue
+      start = item.get("start_port", item.get("startPort", 0))
+      end = item.get("end_port", item.get("endPort", start))
+      rows.append({
+          "startPort": int(start or 0),
+          "endPort": int(end if end is not None else start or 0),
+      })
+    if rows:
+      return rows
+  return rows
+
+
+def _sg_icmp_rows(service, *keys):
+  rows = []
+  for key in keys:
+    items = service.get(key) if isinstance(service, dict) else None
+    if not items:
+      continue
+    for item in items:
+      if not isinstance(item, dict):
+        continue
+      icmp_type = item.get("icmp_type", item.get("type", 0))
+      icmp_code = item.get("icmp_code", item.get("code", 0))
+      all_allowed = bool(item.get("is_all_allowed") or item.get("isAllAllowed"))
+      row = {
+          "type": int(icmp_type or 0),
+          "code": int(icmp_code or 0),
+      }
+      if all_allowed:
+        row["isAllAllowed"] = True
+      rows.append(row)
+    if rows:
+      return rows
+  return rows
+
+
+def _sg_proto_to_v4(row):
+  """NetworkServiceGroup proto JSON -> v4 ServiceGroup fields."""
+  if not isinstance(row, dict):
+    return None
+  uid = _uuid_str(
+      row.get("uuid") or row.get("extId") or row.get("ext_id") or "")
+  if not uid:
+    return None
+  tcp, udp, icmp, icmp6 = [], [], [], []
+  for service in row.get("service_list") or []:
+    if not isinstance(service, dict):
+      continue
+    protocol = str(service.get("protocol") or "")
+    proto_u = protocol.upper().replace("K", "", 1) if protocol.lower().startswith("k") else protocol.upper()
+    if protocol in ("kALL", "kAll", "1") or proto_u == "ALL":
+      tcp.append({"startPort": 0, "endPort": 65535})
+      udp.append({"startPort": 0, "endPort": 65535})
+      icmp.append({"type": 0, "code": 0, "isAllAllowed": True})
+      icmp6.append({"type": 0, "code": 0, "isAllAllowed": True})
+      continue
+    if protocol in ("kTCP", "3") or proto_u == "TCP":
+      tcp.extend(_sg_port_ranges(
+          service, "tcp_port_range_list", "port_range_list"))
+    elif protocol in ("kUDP", "4") or proto_u == "UDP":
+      udp.extend(_sg_port_ranges(
+          service, "udp_port_range_list", "port_range_list"))
+    elif protocol in ("kICMP", "2") or proto_u == "ICMP":
+      icmp.extend(_sg_icmp_rows(service, "icmp_type_code_list"))
+    elif protocol in ("kICMPv6", "kICMPV6", "5") or proto_u in ("ICMPV6", "ICMP6"):
+      icmp6.extend(_sg_icmp_rows(
+          service, "icmp_v6_type_code_list", "icmp_type_code_list"))
+  rec = {
+      "extId": uid,
+      "name": row.get("name") or "",
+      "description": row.get("description") or "",
+      "isSystemDefined": bool(row.get("immutable") or row.get("isSystemDefined")),
+      "isSharedWithAllProjects": bool(
+          row.get("shared_with_all_projects")
+          or row.get("isSharedWithAllProjects")),
+  }
+  if tcp:
+    rec["tcpServices"] = tcp
+  if udp:
+    rec["udpServices"] = udp
+  if icmp:
+    rec["icmpServices"] = icmp
+  if icmp6:
+    rec["icmpV6Services"] = icmp6
+  project = _uuid_str(row.get("project_uuid") or row.get("projectExtId") or "")
+  if project and project != _ZERO_UUID:
+    rec["projectExtId"] = project
+  owner = _uuid_str(row.get("owner_uuid") or row.get("createdBy") or "")
+  if owner and owner != _ZERO_UUID:
+    rec["createdBy"] = owner
+  return rec
+
+
+def _sg_payload_rows(payload):
+  if isinstance(payload, dict):
+    rows = payload.get("service_group_list")
+    if isinstance(rows, list):
+      return rows
+    if payload.get("uuid") or payload.get("extId"):
+      return [payload]
+  if isinstance(payload, list):
+    return payload
+  raise RuntimeError("ServiceGroupGet JSON missing service_group_list")
+
+
+def _write_service_group_v4_files(output_dir, proto_payload):
+  rows = _sg_payload_rows(proto_payload)
+  gets, listed = {}, []
+  for item in rows:
+    rec = _sg_proto_to_v4(item)
+    if not rec:
+      continue
+    uid = rec["extId"]
+    gets[uid] = rec
+    listed.append(rec)
+  if not gets:
+    raise RuntimeError("ServiceGroupGet returned 0 service groups")
+  _write_json_file(os.path.join(output_dir, "service_group_list.json"), listed)
+  _write_json_file(os.path.join(output_dir, "service_group_get.json"), gets)
+  return listed, gets
+
+
+def _discover_kratos_python(kubeconfig, namespace, pod):
+  inner = (
+      "ls /home/nutanix/.venvs/flow/bin/python3 2>/dev/null || "
+      "command -v python3")
+  argv = _kubectl_argv([
+      "exec", "-n", namespace, pod, "--", "bash", "-lc", inner,
+  ], kubeconfig=kubeconfig)
+  rc, stdout, stderr = _run_cmd_argv(argv, 30)
+  for line in (stdout or "").strip().splitlines():
+    candidate = line.strip()
+    if candidate.endswith("python3") or candidate.endswith("python"):
+      return candidate
+  if rc != 0:
+    LOG.warning(
+        "DUMP kratos python discover failed rc=%s: %s",
+        rc, (stderr or stdout or "")[:200])
+  return ""
+
+
+def _run_sg_collect_python(python_bin, script_path, out_path, timeout_secs,
+                           env=None):
+  cmd_env = dict(os.environ)
+  if env:
+    cmd_env.update(env)
+  cmd_env["FLOW_SG_OUT"] = out_path
+  try:
+    proc = subprocess.run(
+        [python_bin, script_path], capture_output=True, text=True,
+        check=False, timeout=timeout_secs, stdin=subprocess.DEVNULL,
+        env=cmd_env)
+  except subprocess.TimeoutExpired:
+    raise RuntimeError("ServiceGroupGet timed out after %ss" % timeout_secs)
+  if proc.returncode != 0 or not os.path.isfile(out_path):
+    err = (proc.stderr or proc.stdout or "").strip()[:500]
+    raise RuntimeError("ServiceGroupGet failed rc=%s: %s" % (
+        proc.returncode, err or "no output file"))
+  with open(out_path, "r") as handle:
+    payload = json.load(handle)
+  if not isinstance(payload, (dict, list)):
+    raise RuntimeError("ServiceGroupGet returned non-JSON object")
+  return payload
+
+
+def _collect_sg_payload_smsp(kubeconfig_path, namespace, pod, python_bin,
+                             timeout_secs):
+  """kubectl exec -i python - (stdin script, stdout JSON). Never -it, no cp."""
+  argv = _kubectl_argv([
+      "exec", "-i", "-n", namespace, pod, "--", python_bin, "-",
+  ], kubeconfig=kubeconfig_path)
+  LOG.info("DUMP kratos ServiceGroupGet: kubectl exec -i %s/%s -- %s -",
+           namespace, pod, python_bin)
+  rc, stdout, stderr = _run_cmd_argv(
+      argv, timeout_secs, input_text=_FLOW_SG_COLLECT_PY.strip() + "\n")
+  if rc != 0:
+    raise RuntimeError("kratos ServiceGroupGet failed rc=%s: %s" % (
+        rc, (stderr or stdout or "")[:500] or "no output"))
+  payload = _safe_json_loads(stdout or "")
+  if payload is None:
+    raise RuntimeError("kratos ServiceGroupGet returned no JSON: %s" % (
+        (stderr or "")[:300],))
+  return payload
+
+
+def _dump_service_groups_v4(output_dir, timeout_secs, platform="",
+                            kubeconfig_path="", namespace="", pod=""):
+  """v4 ServiceGroupGet with should_authorize=False. Not v3 intentgw."""
+  errors = {}
+  rec = {
+      "ran": True,
+      "platform": platform or "cmsp",
+      "rpc": "ServiceGroupGet",
+      "api": "microseg/v4.3",
+      "transport": "",
+      "get_count": 0,
+      "errors": errors,
+  }
+  timeout_secs = max(60, min(300, int(timeout_secs or 1800)))
+  script_path = os.path.join(output_dir or "/tmp", ".flow_sg_collect.py")
+  raw_path = os.path.join(output_dir or "/tmp", ".flow_sg_get.raw.json")
+  with open(script_path, "w") as handle:
+    handle.write(_FLOW_SG_COLLECT_PY.strip() + "\n")
+  last_err = None
+  try:
+    for attempt in range(1, 4):
+      try:
+        if (platform or "").lower() == "smsp":
+          if not (kubeconfig_path and pod):
+            raise RuntimeError(
+                "SMSP kratos pod missing for v4 ServiceGroupGet")
+          ns = namespace or "ntnx-flow"
+          python_bin = _discover_kratos_python(kubeconfig_path, ns, pod)
+          if not python_bin:
+            raise RuntimeError("no python3 in kratos pod")
+          rec["transport"] = "kubectl_kratos"
+          payload = _collect_sg_payload_smsp(
+              kubeconfig_path, ns, pod, python_bin, timeout_secs)
+        else:
+          python_bin = _flow_python_bin()
+          if not python_bin:
+            raise RuntimeError("Flow venv python3 missing for ServiceGroupGet")
+          rec["transport"] = "pc"
+          payload = _run_sg_collect_python(
+              python_bin, script_path, raw_path, timeout_secs)
+        listed, gets = _write_service_group_v4_files(output_dir, payload)
+        rec["get_count"] = len(gets)
+        rec["list_count"] = len(listed)
+        last_err = None
+        break
+      except Exception as err:
+        last_err = err
+        LOG.warning(
+            "DUMP ServiceGroupGet attempt %s/3 failed: %s", attempt, err)
+    if last_err is not None:
+      errors["service_groups"] = str(last_err)
+      LOG.error("DATASET v4 ServiceGroupGet FAILED: %s", last_err)
+  finally:
+    for path in (script_path, raw_path):
+      try:
+        os.remove(path)
+      except Exception:
+        pass
+  LOG.info(
+      "DUMP v4 ServiceGroupGet list=%s get=%s platform=%s transport=%s",
+      rec.get("list_count") or 0, rec.get("get_count") or 0,
+      rec.get("platform") or "", rec.get("transport") or "")
+  return rec
+
+
+def dump_flow_policies(output_dir, workers=32, timeout_secs=1800):
+  """CMSP: bash flow_cli policy.list/get. SMSP: kubectl exec kratos -- bash.
+  Also v4 ServiceGroupGet (not v3 intentgw service_groups/list)."""
+  errors = {}
+  info = detect_msp_platform()
+  platform = info.get("platform") or "cmsp"
+  rec = {
+      "ran": True,
+      "platform": platform,
+      "cli": "",
+      "transport": "",
+      "pod": "",
+      "namespace": "",
+      "list_count": 0,
+      "get_count": 0,
+      "errors": errors,
+  }
+  list_timeout = max(60, min(300, int(timeout_secs)))
+  per_timeout = max(15, min(45, int(timeout_secs)))
+  runner = None
+  kubeconfig_path = ""
+  rows, gets = [], {}
+
+  try:
+    if platform == "smsp":
+      dest = os.path.join(output_dir or "/tmp", "policy_cli")
+      kubeconfig_path, kube_err = _write_smsp_flow_kubeconfig(dest)
+      if kubeconfig_path:
+        ns, pod, err = _kubectl_find_pod(
+            "kratos", "kratos-0", "ntnx-flow", kubeconfig=kubeconfig_path)
+        if not pod:
+          ns, pod, err = _kubectl_find_pod(
+              "kratos", "kratos-0", "", kubeconfig=kubeconfig_path)
+        rec["namespace"] = ns or "ntnx-flow"
+        rec["pod"] = pod or ""
+        cli_name = ""
+        if pod:
+          cli_name = _discover_kratos_cli(kubeconfig_path, ns, pod)
+        if pod and cli_name:
+          rec["cli"] = os.path.basename(cli_name)
+          rec["transport"] = "kubectl_kratos"
+
+          def _kratos(args, timeout, log_cmd=True, _cli=cli_name, _ns=ns,
+                      _pod=pod):
+            return _run_kratos_cli(
+                kubeconfig_path, _ns, _pod, _policy_cli_join(_cli, args),
+                timeout, log_cmd=log_cmd)
+
+          runner = _kratos
+        else:
+          LOG.warning(
+              "DUMP kratos pod/cli missing (%s); trying PC flow_cli -u",
+              err or "no kratos_cli/flow_cli in pod")
+      else:
+        LOG.warning("DUMP SMSP kubeconfig failed: %s", kube_err or "")
+      if runner is None:
+        smsp_uuid = info.get("smsp_cluster_uuid") or ""
+        if not smsp_uuid:
+          errors["policy_list"] = (
+              "SMSP kratos exec failed and no flow ClusterUUID for "
+              "flow_cli -u")
+        else:
+          rec["cli"] = "flow_cli"
+          rec["transport"] = "smsp_ws"
+          ws = "ws://smsp-%s.ntnx-ikat.svc:2051/flow_cli" % smsp_uuid
+          cli_bin = _flow_cli_bin()
+
+          def _ws(args, timeout, log_cmd=True, _bin=cli_bin, _ws=ws):
+            inner = "%s -u '%s' -o json %s" % (
+                _bin, _ws, " ".join(str(a) for a in args))
+            return _run_bash_cli(inner, timeout, log_cmd=log_cmd)
+
+          runner = _ws
+    else:
+      cli_bin = _flow_cli_bin()
+      rec["cli"] = "flow_cli"
+      rec["transport"] = "pc"
+
+      def _pc(args, timeout, log_cmd=True, _bin=cli_bin):
+        return _run_bash_cli(
+            _policy_cli_join(_bin, args), timeout, log_cmd=log_cmd)
+
+      runner = _pc
+
+    if runner is None:
+      rows, gets = [], {}
+    else:
+      try:
+        parsed, text, _rc, _cmd = runner(["policy.list"], list_timeout)
+        if isinstance(parsed, dict) and parsed.get("status") not in (
+            None, 0, "0"):
+          raise RuntimeError("policy.list status=%s" % parsed.get("status"))
+        rows = _policy_list_rows(parsed, text)
+      except Exception as err:
+        errors["policy_list"] = str(err)
+        LOG.error("DATASET policy.list FAILED: %s", err)
+        rows = []
+      uuids = []
+      seen = set()
+      for item in rows:
+        uid = _policy_uuid(item)
+        if uid and uid not in seen:
+          seen.add(uid)
+          uuids.append(uid)
+      rec["list_count"] = len(rows)
+      gets = {}
+      if uuids:
+        get_workers = max(1, min(int(workers), len(uuids)))
+        if rec.get("transport") == "kubectl_kratos":
+          get_workers = min(8, get_workers)
+        LOG.info(
+            "DUMP start policy.get count=%s workers=%s transport=%s cli=%s",
+            len(uuids), get_workers, rec.get("transport"), rec.get("cli"))
+
+        def _one(pol_uuid):
+          parsed, _text, _rc, _cmd = runner(
+              ["policy.get", pol_uuid], per_timeout, log_cmd=False)
+          if isinstance(parsed, dict) and parsed.get("status") not in (
+              None, 0, "0"):
+            raise RuntimeError("status=%s" % parsed.get("status"))
+          return _policy_get_record(parsed, pol_uuid)
+
+        failed = []
+        with ThreadPoolExecutor(max_workers=get_workers) as pool:
+          future_map = {
+              pool.submit(_one, pol_uuid): pol_uuid for pol_uuid in uuids}
+          done, pending = wait(future_map.keys(), timeout=timeout_secs)
+          for future in done:
+            pol_uuid = future_map[future]
+            try:
+              gets[pol_uuid] = future.result(timeout=1)
+            except Exception as err:
+              failed.append(pol_uuid)
+              LOG.error("DUMP policy.get %s FAILED: %s", pol_uuid, err)
+          for future in pending:
+            pol_uuid = future_map[future]
+            future.cancel()
+            failed.append(pol_uuid)
+            LOG.error(
+                "DUMP policy.get %s TIMEOUT after %ss", pol_uuid, timeout_secs)
+        if failed:
+          errors["policy_get"] = "failed %s of %s: %s" % (
+              len(failed), len(uuids), ",".join(failed[:20]))
+        LOG.info(
+            "DUMP done policy.get got=%s failed=%s", len(gets), len(failed))
+      rec["get_count"] = len(gets)
+    sg_rec = _dump_service_groups_v4(
+        output_dir, timeout_secs, platform, kubeconfig_path,
+        rec.get("namespace") or "", rec.get("pod") or "")
+    rec["sg_count"] = sg_rec.get("get_count") or 0
+    rec["sg_list_count"] = sg_rec.get("list_count") or 0
+    rec["sg_transport"] = sg_rec.get("transport") or ""
+    rec["sg_rpc"] = sg_rec.get("rpc") or ""
+    if sg_rec.get("errors"):
+      errors.update(sg_rec.get("errors") or {})
+  finally:
+    if kubeconfig_path:
+      try:
+        os.remove(kubeconfig_path)
+      except Exception:
+        pass
+
+  _write_json_file(os.path.join(output_dir, "policy_list.json"), rows)
+  _write_json_file(os.path.join(output_dir, "policy_get.json"), gets)
+  LOG.info(
+      "DUMP flow_cli policy list=%s get=%s sg=%s platform=%s transport=%s "
+      "cli=%s sg_transport=%s",
+      rec["list_count"], rec["get_count"], rec.get("sg_count") or 0,
+      rec["platform"], rec.get("transport") or "", rec.get("cli") or "",
+      rec.get("sg_transport") or "")
+  return rec
+
 # Host OVS via AHV Gateway mTLS; OVN NB/SB via kubectl on CMSP PC.
 NCLI_BIN_CANDIDATES = (
     "/usr/local/nutanix/bin/ncli",
@@ -740,26 +1469,35 @@ def _ncli_bin():
   return "ncli"
 
 
-def _run_cmd_argv(argv, timeout_secs, cwd=None, stdout_path=None, binary=False):
+def _run_cmd_argv(argv, timeout_secs, cwd=None, stdout_path=None, binary=False,
+                  input_text=None):
   if not argv:
     return -1, "", "empty argv"
   timeout_secs = max(5, int(timeout_secs))
+  run_kw = {
+      "check": False,
+      "timeout": timeout_secs,
+      "cwd": cwd,
+      "text": not binary,
+  }
+  if input_text is None:
+    run_kw["stdin"] = subprocess.DEVNULL
+  else:
+    run_kw["input"] = input_text
   try:
     if stdout_path:
       os.makedirs(os.path.dirname(stdout_path) or ".", exist_ok=True)
       mode = "wb" if binary else "w"
       with open(stdout_path, mode) as handle:
-        proc = subprocess.run(
-            argv, stdout=handle, stderr=subprocess.PIPE, check=False,
-            timeout=timeout_secs, stdin=subprocess.DEVNULL, cwd=cwd,
-            text=not binary)
+        run_kw["stdout"] = handle
+        run_kw["stderr"] = subprocess.PIPE
+        proc = subprocess.run(argv, **run_kw)
       stderr = proc.stderr or (b"" if binary else "")
       if isinstance(stderr, bytes):
         stderr = stderr.decode("utf-8", "replace")
       return proc.returncode, "", stderr
-    proc = subprocess.run(
-        argv, capture_output=True, text=True, check=False,
-        timeout=timeout_secs, stdin=subprocess.DEVNULL, cwd=cwd)
+    run_kw["capture_output"] = True
+    proc = subprocess.run(argv, **run_kw)
   except subprocess.TimeoutExpired as err:
     out = err.stdout or ""
     if isinstance(out, bytes):
@@ -1665,6 +2403,7 @@ CMSP_OVN_TARGETS = (
 )
 
 _KUBECTL_PREFIX_CACHE = []
+_KUBECTL_KUBECONFIG = ""
 
 
 def _kubectl_bin():
@@ -1690,8 +2429,112 @@ def _kubectl_prefix():
   return list(_KUBECTL_PREFIX_CACHE)
 
 
-def _kubectl_argv(extra):
-  return _kubectl_prefix() + list(extra)
+def _kubectl_argv(extra, kubeconfig=None):
+  prefix = list(_kubectl_prefix())
+  kc = _KUBECTL_KUBECONFIG if kubeconfig is None else kubeconfig
+  if kc:
+    prefix.extend(["--kubeconfig", kc])
+  return prefix + list(extra)
+
+
+def _kubeconfig_yaml_from_text(text):
+  text = text or ""
+  for marker in ("apiVersion:", "kind: Config", "clusters:"):
+    idx = text.find(marker)
+    if idx >= 0:
+      return text[idx:].strip() + "\n"
+  return ""
+
+
+def _write_smsp_flow_kubeconfig(dest_dir):
+  """SMSP OVN is in the flow cluster, not PC MSP kube."""
+  out, err, rc = _run_profile_cmd("mspctl cluster kubeconfig flow", timeout=45)
+  yaml_text = _kubeconfig_yaml_from_text(out)
+  if not yaml_text:
+    return "", (err or out or "mspctl cluster kubeconfig flow rc=%s" % rc).strip()[:400]
+  os.makedirs(dest_dir, exist_ok=True)
+  path = os.path.join(dest_dir, ".flow.kubeconfig")
+  with open(path, "w") as handle:
+    handle.write(yaml_text)
+  try:
+    os.chmod(path, 0o600)
+  except Exception:
+    pass
+  return path, ""
+
+
+def _parse_unique_uuid_kv(text):
+  out = {"vlan_unique_uuid": "", "global_unique_uuid": ""}
+  for line in (text or "").splitlines():
+    stripped = line.strip()
+    for key in ("vlan_unique_uuid", "global_unique_uuid"):
+      if key in stripped:
+        uid = _uuid_from_text(stripped)
+        if uid:
+          out[key] = uid
+  return out
+
+
+def _fetch_unique_uuids_smsp_atlas_zk(output_dir):
+  """SMSP unique UUIDs live in flow Atlas ZK, not PC zkcat.
+
+  Same path as MicrosegHelper.get_flow_unique_uuid when flow_smsp:
+  mspctl cluster kubeconfig flow, kubectl exec atlas pod, ZookeeperSession.get
+  of /appliance/logical/flow/{vlan,global}_unique_uuid.
+  """
+  global _KUBECTL_KUBECONFIG
+  result = {
+      "vlan_unique_uuid": "",
+      "global_unique_uuid": "",
+      "source": "smsp_atlas_zk",
+      "error": "",
+  }
+  dest = os.path.join(output_dir or "/tmp", "unique_uuids_smsp")
+  kubeconfig_path, kube_err = _write_smsp_flow_kubeconfig(dest)
+  if not kubeconfig_path:
+    result["error"] = kube_err or "mspctl cluster kubeconfig flow failed"
+    LOG.warning("SMSP unique UUID kubeconfig failed: %s", result["error"])
+    return result
+  prev = _KUBECTL_KUBECONFIG
+  _KUBECTL_KUBECONFIG = kubeconfig_path
+  try:
+    ns, pod, err = _kubectl_find_pod("atlas", "atlas-0", "ntnx-flow")
+    if not pod:
+      ns, pod, err = _kubectl_find_pod("atlas", "atlas-0", "")
+    if not pod:
+      result["error"] = err or "no Running atlas pod in flow kube"
+      LOG.warning("SMSP unique UUID atlas pod missing: %s", result["error"])
+      return result
+    LOG.info("DUMP SMSP unique UUIDs via kubectl exec %s/%s ZookeeperSession",
+             ns, pod)
+    argv = _kubectl_argv([
+        "exec", "-n", ns, pod, "--",
+        SMSP_ATLAS_ZK_PYTHON, "-c", SMSP_ATLAS_ZK_CODE,
+    ])
+    rc, stdout, stderr = _run_cmd_argv(argv, 60)
+    parsed = _parse_unique_uuid_kv("%s\n%s" % (stdout, stderr))
+    result["vlan_unique_uuid"] = parsed.get("vlan_unique_uuid") or ""
+    result["global_unique_uuid"] = parsed.get("global_unique_uuid") or ""
+    if not (result["vlan_unique_uuid"] and result["global_unique_uuid"]):
+      result["error"] = (
+          (stderr or stdout or "atlas ZK unique UUID parse failed")[:400])
+      LOG.warning(
+          "SMSP Atlas ZK unique UUIDs incomplete rc=%s vlan=%s global=%s err=%s",
+          rc,
+          result["vlan_unique_uuid"] or "<empty>",
+          result["global_unique_uuid"] or "<empty>",
+          result["error"][:200])
+    else:
+      LOG.info(
+          "DUMP SMSP Atlas ZK vlan=%s global=%s",
+          result["vlan_unique_uuid"], result["global_unique_uuid"])
+    return result
+  finally:
+    _KUBECTL_KUBECONFIG = prev
+    try:
+      os.remove(kubeconfig_path)
+    except Exception:
+      pass
 
 
 def _cmsp_ovn_namespace():
@@ -1720,7 +2563,7 @@ def _kubectl_dump_looks_ok(path, markers):
   return os.path.getsize(path) > 4096 and "table" in low
 
 
-def _kubectl_find_pod(app, preferred_name, namespace=""):
+def _kubectl_find_pod(app, preferred_name, namespace="", kubeconfig=None):
   """Find a Running pod. Prefer anc-ovn-0 as in the runbook."""
   ns_flag = ["-n", namespace] if namespace else ["-A"]
   argv = _kubectl_argv([
@@ -1729,7 +2572,7 @@ def _kubectl_find_pod(app, preferred_name, namespace=""):
       "jsonpath={range .items[*]}{.metadata.namespace}{\"\\t\"}"
       "{.metadata.name}{\"\\t\"}{.status.phase}{\"\\t\"}"
       "{.metadata.labels.app}{\"\\n\"}{end}",
-  ])
+  ], kubeconfig=kubeconfig)
   rc, stdout, stderr = _run_cmd_argv(argv, 45)
   if rc != 0:
     return "", "", (stderr or stdout or "kubectl get pods failed").strip()[:400]
@@ -1886,15 +2729,19 @@ def _collect_cmsp_ovn_target(target, dest_root, namespace, timeout_secs):
 
 def fetch_cmsp_ovn_nb_sb(output_dir, timeout_secs=1800):
   """Dump OVN NB/SB via: sudo kubectl exec anc-ovn-0 -c anc-ovn -- ovsdb-client dump ..."""
+  global _KUBECTL_KUBECONFIG
   dest_root = os.path.join(output_dir, "cmsp_ovn")
   os.makedirs(dest_root, exist_ok=True)
   timeout_secs = max(60, int(timeout_secs or 1800))
   namespace = _cmsp_ovn_namespace()
+  platform_info = detect_msp_platform()
+  platform = platform_info.get("platform") or "cmsp"
   payload = {
       "ran": False,
       "complete": False,
       "transport": "kubectl",
-      "platform": "cmsp",
+      "platform": platform,
+      "kubeconfig_source": "",
       "namespace": namespace,
       "pod": CMSP_OVN_POD,
       "container": CMSP_OVN_CONTAINER,
@@ -1914,8 +2761,38 @@ def fetch_cmsp_ovn_nb_sb(output_dir, timeout_secs=1800):
       _write_json_file(os.path.join(dest_root, "index.json"), payload)
       return payload
 
+  kubeconfig_path = ""
+  prev_kubeconfig = _KUBECTL_KUBECONFIG
+  if platform == "smsp":
+    kubeconfig_path, kube_err = _write_smsp_flow_kubeconfig(dest_root)
+    if kubeconfig_path:
+      _KUBECTL_KUBECONFIG = kubeconfig_path
+      payload["kubeconfig_source"] = "mspctl cluster kubeconfig flow"
+      LOG.info("OVN kubectl using SMSP flow kubeconfig")
+    else:
+      LOG.warning(
+          "SMSP detected but flow kubeconfig missing (%s); "
+          "OVN will use PC kubectl",
+          kube_err or "unknown")
+      payload["kubeconfig_source"] = "failed: %s" % (kube_err or "unknown")
+
   deadline = time.time() + timeout_secs
   backoff = 2
+  last = []
+  try:
+    return _fetch_cmsp_ovn_nb_sb_loop(
+        dest_root, namespace, timeout_secs, deadline, backoff, payload)
+  finally:
+    _KUBECTL_KUBECONFIG = prev_kubeconfig
+    if kubeconfig_path:
+      try:
+        os.remove(kubeconfig_path)
+      except Exception:
+        pass
+
+
+def _fetch_cmsp_ovn_nb_sb_loop(
+    dest_root, namespace, timeout_secs, deadline, backoff, payload):
   last = []
   while time.time() < deadline:
     last = []
@@ -1963,12 +2840,470 @@ def fetch_cmsp_ovn_nb_sb(output_dir, timeout_secs=1800):
   _write_json_file(os.path.join(dest_root, "index.json"), payload)
   return payload
 
+# ---------------------------------------------------------------------------
+# This PC's Flow protobuf schema (FileDescriptor serialized_pb from *_pb2.py).
+# Collect only. No FlowInterfaces(), no Flow venv import (avoids Zeus).
+# Convert reads flow_proto/fields.json and decodes zprotobuf by field name.
+# Google descriptor.proto field numbers are stable; Nutanix field numbers are not.
+# ---------------------------------------------------------------------------
+
+_FD_FILE_NAME = 1
+_FD_FILE_PACKAGE = 2
+_FD_FILE_MESSAGE = 4
+_FD_FILE_ENUM = 5
+_FD_MSG_NAME = 1
+_FD_MSG_FIELD = 2
+_FD_MSG_NESTED = 3
+_FD_MSG_ENUM = 4
+_FD_FIELD_NAME = 1
+_FD_FIELD_NUMBER = 3
+_FD_FIELD_LABEL = 4
+_FD_FIELD_TYPE = 5
+_FD_FIELD_TYPE_NAME = 6
+_FD_ENUM_NAME = 1
+_FD_ENUM_VALUE = 2
+_FD_ENUMVAL_NAME = 1
+_FD_ENUMVAL_NUMBER = 2
+
+FLOW_PB2_VENVS = (
+    "/home/nutanix/.venvs/flow",
+    "/home/nutanix/.venvs",
+)
+
+
+def _proto_read_varint_buf(buf, idx):
+  value = 0
+  shift = 0
+  n = len(buf or b"")
+  while idx < n:
+    byte = buf[idx] if isinstance(buf[idx], int) else ord(buf[idx])
+    idx += 1
+    value |= (byte & 0x7F) << shift
+    if byte < 0x80:
+      return value, idx
+    shift += 7
+    if shift > 63:
+      break
+  return None, idx
+
+
+def _fd_decode(buf):
+  fields = {}
+  idx = 0
+  n = len(buf or b"")
+  while idx < n:
+    key, idx = _proto_read_varint_buf(buf, idx)
+    if key is None:
+      break
+    field_n = key >> 3
+    wire = key & 7
+    if wire == 0:
+      val, idx = _proto_read_varint_buf(buf, idx)
+      if val is None:
+        break
+    elif wire == 1:
+      val = buf[idx:idx + 8]
+      idx += 8
+    elif wire == 2:
+      length, idx = _proto_read_varint_buf(buf, idx)
+      if length is None:
+        break
+      val = buf[idx:idx + length]
+      idx += length
+    elif wire == 5:
+      val = buf[idx:idx + 4]
+      idx += 4
+    else:
+      break
+    fields.setdefault(field_n, []).append((wire, val))
+  return fields
+
+
+def _fd_bytes_list(fields, number):
+  out = []
+  for wire, val in fields.get(number) or []:
+    if val and (wire == 2 or isinstance(val, (bytes, bytearray))):
+      out.append(bytes(val) if not isinstance(val, bytes) else val)
+  return out
+
+
+def _fd_first_str(fields, number):
+  items = _fd_bytes_list(fields, number)
+  if not items:
+    return ""
+  return items[0].decode("utf-8", "replace")
+
+
+def _fd_first_varint(fields, number, default=0):
+  for wire, val in fields.get(number) or []:
+    if wire == 0 and val is not None:
+      return int(val)
+  return default
+
+
+def _parse_one_py_string(text, i):
+  n = len(text)
+  while i < n and text[i] in " \t\r\n":
+    i += 1
+  if i >= n:
+    return None, i
+  prefixes = ""
+  while i < n and text[i] in "rRbBuU":
+    prefixes += text[i]
+    i += 1
+  if i >= n or text[i] not in "'\"":
+    return None, i
+  if text.startswith('"""', i) or text.startswith("'''", i):
+    quote = text[i:i + 3]
+    i += 3
+  else:
+    quote = text[i]
+    i += 1
+  start = i
+  while i < n:
+    if text.startswith(quote, i):
+      raw = text[start:i]
+      i += len(quote)
+      lit = prefixes + quote + raw + quote
+      try:
+        val = ast.literal_eval(lit)
+      except Exception:
+        try:
+          val = ast.literal_eval("b" + quote + raw + quote)
+        except Exception:
+          return None, i
+      if isinstance(val, bytes):
+        return val, i
+      if isinstance(val, str):
+        try:
+          return val.encode("latin-1"), i
+        except Exception:
+          return val.encode("utf-8", "replace"), i
+      return None, i
+    if text[i] == "\\":
+      i += 2
+      continue
+    i += 1
+  return None, i
+
+
+def _parse_concat_py_bytes(text, i):
+  chunks = []
+  n = len(text)
+  while i < n:
+    while i < n and text[i] in " \t\r\n":
+      i += 1
+    if i < n and text[i] == "\\" and i + 1 < n and text[i + 1] == "\n":
+      i += 2
+      continue
+    if i < n and text.startswith("_b(", i):
+      inner, i = _parse_one_py_string(text, i + 3)
+      if inner is None:
+        break
+      chunks.append(inner)
+      while i < n and text[i] in " \t":
+        i += 1
+      if i < n and text[i] == ")":
+        i += 1
+      continue
+    nxt, j = _parse_one_py_string(text, i)
+    if nxt is None:
+      break
+    chunks.append(nxt)
+    i = j
+  if not chunks:
+    return b"", i
+  return b"".join(chunks), i
+
+
+def _serialized_pbs_from_py(text):
+  blobs = []
+  for token in ("AddSerializedFile(", "serialized_pb=", "serialized_pb =",
+                "_serialized_=", "_serialized_ ="):
+    start = 0
+    while True:
+      idx = text.find(token, start)
+      if idx < 0:
+        break
+      blob, _end = _parse_concat_py_bytes(text, idx + len(token))
+      if blob and b".proto" in blob:
+        blobs.append(blob)
+      start = idx + len(token)
+  return blobs
+
+
+def _walk_marshal_bytes(obj, out, seen, depth=0):
+  if depth > 48 or id(obj) in seen:
+    return
+  seen.add(id(obj))
+  if isinstance(obj, bytes):
+    if b".proto" in obj and len(obj) > 32:
+      out.append(obj)
+    return
+  if isinstance(obj, (tuple, list)):
+    for item in obj:
+      _walk_marshal_bytes(item, out, seen, depth + 1)
+    return
+  consts = getattr(obj, "co_consts", None)
+  if consts is not None:
+    _walk_marshal_bytes(consts, out, seen, depth + 1)
+
+
+def _serialized_pbs_from_pyc(path):
+  """Some AOS builds ship only *_pb2.pyc (no .py). Marshal consts still hold serialized_pb."""
+  try:
+    with open(path, "rb") as handle:
+      data = handle.read()
+  except Exception:
+    return []
+  for skip in (16, 12):
+    if len(data) <= skip:
+      continue
+    try:
+      obj = marshal.loads(data[skip:])
+    except Exception:
+      continue
+    blobs = []
+    _walk_marshal_bytes(obj, blobs, set())
+    if blobs:
+      return blobs
+  return []
+
+
+def _is_pb2_source(filename):
+  return filename.endswith("_pb2.py")
+
+
+def _is_pb2_pyc(filename):
+  return filename.endswith(".pyc") and "_pb2" in filename
+
+
+def _fd_parse_enum(raw, prefix):
+  fields = _fd_decode(raw)
+  name = _fd_first_str(fields, _FD_ENUM_NAME)
+  full = ("%s.%s" % (prefix, name)) if prefix else name
+  values = {}
+  for item in _fd_bytes_list(fields, _FD_ENUM_VALUE):
+    inner = _fd_decode(item)
+    vname = _fd_first_str(inner, _FD_ENUMVAL_NAME)
+    vnum = _fd_first_varint(inner, _FD_ENUMVAL_NUMBER, 0)
+    if vname:
+      values[vname] = vnum
+  return name, full, values
+
+
+def _fd_parse_message(raw, prefix, package):
+  fields = _fd_decode(raw)
+  name = _fd_first_str(fields, _FD_MSG_NAME)
+  if not name:
+    return [], []
+  full = ".".join([p for p in (package, prefix, name) if p])
+  rec = {"name": name, "full_name": full, "fields": {}}
+  for item in _fd_bytes_list(fields, _FD_MSG_FIELD):
+    f = _fd_decode(item)
+    fname = _fd_first_str(f, _FD_FIELD_NAME)
+    if not fname:
+      continue
+    rec["fields"][fname] = {
+        "number": _fd_first_varint(f, _FD_FIELD_NUMBER, 0),
+        "label": _fd_first_varint(f, _FD_FIELD_LABEL, 0),
+        "type": _fd_first_varint(f, _FD_FIELD_TYPE, 0),
+        "type_name": _fd_first_str(f, _FD_FIELD_TYPE_NAME).lstrip("."),
+    }
+  messages = [rec]
+  enums = []
+  child_prefix = ("%s.%s" % (prefix, name)) if prefix else name
+  for item in _fd_bytes_list(fields, _FD_MSG_NESTED):
+    nested_msgs, nested_enums = _fd_parse_message(item, child_prefix, package)
+    messages.extend(nested_msgs)
+    enums.extend(nested_enums)
+  for item in _fd_bytes_list(fields, _FD_MSG_ENUM):
+    enums.append(_fd_parse_enum(item, full))
+  return messages, enums
+
+
+def _fd_parse_file(blob):
+  fields = _fd_decode(blob)
+  name = _fd_first_str(fields, _FD_FILE_NAME)
+  package = _fd_first_str(fields, _FD_FILE_PACKAGE)
+  messages = []
+  enums = []
+  for item in _fd_bytes_list(fields, _FD_FILE_MESSAGE):
+    msgs, ens = _fd_parse_message(item, "", package)
+    messages.extend(msgs)
+    enums.extend(ens)
+  for item in _fd_bytes_list(fields, _FD_FILE_ENUM):
+    enums.append(_fd_parse_enum(item, package))
+  return name, package, messages, enums
+
+
+def _flow_pb2_paths():
+  paths = []
+  seen = set()
+  roots = []
+  for venv in FLOW_PB2_VENVS:
+    if not os.path.isdir(venv):
+      continue
+    try:
+      names = os.listdir(venv)
+    except OSError:
+      names = []
+    if os.path.isdir(os.path.join(venv, "lib")):
+      roots.append(venv)
+    for name in names:
+      if "flow" in name.lower():
+        roots.append(os.path.join(venv, name))
+  walked = 0
+  for root in roots:
+    if not os.path.isdir(root):
+      continue
+    for dirpath, dirnames, filenames in os.walk(root):
+      walked += 1
+      if walked > 12000:
+        dirnames[:] = []
+        break
+      dirnames[:] = [
+          d for d in dirnames
+          if d not in (".git", "logs", "tmp", "node_modules")]
+      parent = os.path.basename(os.path.dirname(dirpath))
+      here = os.path.basename(dirpath)
+      interesting = (
+          here == "flow" or here == "__pycache__"
+          or parent in ("site-packages", "dist-packages", "flow")
+          or any(_is_pb2_source(fn) or _is_pb2_pyc(fn) for fn in filenames))
+      if not interesting and not any(
+          _is_pb2_source(fn) or _is_pb2_pyc(fn) for fn in filenames):
+        continue
+      for fn in filenames:
+        if not (_is_pb2_source(fn) or _is_pb2_pyc(fn)):
+          continue
+        path = os.path.join(dirpath, fn)
+        if path in seen:
+          continue
+        seen.add(path)
+        paths.append(path)
+  paths.sort(key=lambda p: (
+      0 if "flow_types_pb2" in os.path.basename(p) else 1, p))
+  return paths
+
+
+def _ingest_proto_blobs(path, blobs, files, messages, enums):
+  used = False
+  for blob in blobs or []:
+    try:
+      fname, package, msgs, ens = _fd_parse_file(blob)
+    except Exception:
+      continue
+    if not msgs and not ens:
+      continue
+    used = True
+    files.append({
+        "path": path,
+        "proto": fname,
+        "package": package,
+        "messages": len(msgs),
+        "enums": len(ens),
+    })
+    for msg in msgs:
+      key = msg.get("full_name") or msg.get("name")
+      if key and key not in messages:
+        messages[key] = msg
+      short = msg.get("name") or ""
+      if short and short not in messages:
+        messages[short] = msg
+    for ename, efull, values in ens:
+      if efull and efull not in enums:
+        enums[efull] = values
+      if ename and ename not in enums:
+        enums[ename] = values
+  return used
+
+
+def fetch_flow_proto_schema(output_dir):
+  """Copy this PC's Flow proto field numbers into flow_proto/fields.json."""
+  dest = os.path.join(output_dir, "flow_proto")
+  os.makedirs(dest, exist_ok=True)
+  rec = {
+      "ran": True,
+      "complete": False,
+      "method": "serialized_pb from *_pb2.py/*_pb2.pyc (no FlowInterfaces)",
+      "files": [],
+      "message_count": 0,
+      "enum_count": 0,
+      "error": "",
+  }
+  messages = {}
+  enums = {}
+  files = []
+  try:
+    pb2_paths = _flow_pb2_paths()
+  except Exception as err:
+    pb2_paths = []
+    rec["error"] = str(err)
+  for path in pb2_paths:
+    blobs = []
+    if path.endswith(".pyc"):
+      blobs = _serialized_pbs_from_pyc(path)
+    else:
+      try:
+        with open(path, "r") as handle:
+          text = handle.read()
+      except Exception as err:
+        LOG.warning("flow_proto skip %s: %s", path, err)
+        continue
+      if (
+          "NetworkSecurity" not in text
+          and "ServiceGroup" not in text
+          and "serialized_pb" not in text
+          and "AddSerializedFile" not in text):
+        continue
+      blobs = _serialized_pbs_from_py(text)
+    if not blobs:
+      continue
+    _ingest_proto_blobs(path, blobs, files, messages, enums)
+    if len(files) >= 40:
+      break
+  payload = {
+      "source": "flow_pc_dump",
+      "dumped_at": datetime.utcnow().isoformat() + "Z",
+      "files": files,
+      "messages": messages,
+      "enums": enums,
+  }
+  fields_path = os.path.join(dest, "fields.json")
+  _write_json_file(fields_path, payload)
+  rec["files"] = [row.get("path") for row in files]
+  rec["message_count"] = len(messages)
+  rec["enum_count"] = len(enums)
+  rec["fields_file"] = fields_path
+  has_rules = False
+  for msg in messages.values():
+    fields = (msg or {}).get("fields") or {}
+    if "rules_map" in fields or "application_rule" in fields:
+      has_rules = True
+      break
+  rec["complete"] = bool(messages) and has_rules
+  if not rec["complete"] and not rec["error"]:
+    rec["error"] = (
+        "no Flow *_pb2.py/*_pb2.pyc FileDescriptor with rules_map/application_rule")
+  _write_json_file(os.path.join(dest, "index.json"), rec)
+  if rec["complete"]:
+    LOG.info(
+        "DUMP flow_proto complete messages=%s enums=%s files=%s",
+        rec["message_count"], rec["enum_count"], len(files))
+  else:
+    LOG.warning("DUMP flow_proto incomplete: %s", rec.get("error") or "")
+  return rec
+
+
 def dump_pc(output_dir, workers=8, skip_idf=False, skip_ahv=False,
-            skip_cmsp=False, skip_atlas=False,
+            skip_cmsp=False, skip_atlas=False, skip_flow_proto=True,
+            skip_flow_cli=False,
             ahv_gw_timeout=1800, cmsp_ovn_timeout=1800, atlas_timeout=1800,
-            atlas_get_workers=32, idf_timeout=180,
+            atlas_get_workers=32, flow_cli_timeout=1800,
+            flow_cli_get_workers=32, idf_timeout=180,
             fail_on_error=False, log_file="", combined_path=""):
-  """PC dump only: idfcli + OVN + OVS + atlas_cli. No convert or enrich."""
+  """PC dump only: idfcli + OVN + OVS + atlas_cli + flow_cli + Flow proto map."""
   os.makedirs(output_dir, exist_ok=True)
   combined_path = combined_path or os.path.join(output_dir, "all.json")
   log_file = log_file or os.path.join(output_dir, "dump.log")
@@ -1977,31 +3312,45 @@ def dump_pc(output_dir, workers=8, skip_idf=False, skip_ahv=False,
   LOG.info("logs=%s combined=%s output_dir=%s",
            log_file, combined_path, output_dir)
   LOG.info(
-      "dump=idfcli+OVN+OVS+atlas (no convert) skip_idfcli=%s "
-      "skip_ahv_gateway=%s skip_cmsp_ovn=%s skip_atlas=%s workers=%s "
-      "ahv_gw_timeout=%ss cmsp_ovn_timeout=%ss atlas_timeout=%ss",
-      skip_idf, skip_ahv, skip_cmsp, skip_atlas, workers,
-      ahv_gw_timeout, cmsp_ovn_timeout, atlas_timeout)
+      "dump=idfcli+OVN+OVS+atlas+flow_cli+flow_proto (no convert) "
+      "skip_idfcli=%s skip_ahv_gateway=%s skip_cmsp_ovn=%s skip_atlas=%s "
+      "skip_flow_cli=%s skip_flow_proto=%s workers=%s "
+      "ahv_gw_timeout=%ss cmsp_ovn_timeout=%ss atlas_timeout=%ss "
+      "flow_cli_timeout=%ss",
+      skip_idf, skip_ahv, skip_cmsp, skip_atlas, skip_flow_cli,
+      skip_flow_proto, workers,
+      ahv_gw_timeout, cmsp_ovn_timeout, atlas_timeout, flow_cli_timeout)
 
   errors = {}
   payload = {
       "source": "flow_pc_dump",
-      "collects": ["idfcli", "ovn", "ovs", "atlas"],
+      "collects": [
+          "idfcli", "ovn", "ovs", "atlas", "flow_cli", "flow_proto"],
       "dumped_at": datetime.utcnow().isoformat() + "Z",
       "idfcli": {},
       "ahv_gateway": {},
       "cmsp_ovn": {},
       "atlas": {},
+      "flow_cli": {},
+      "flow_proto": {},
       "port_set_list": [],
       "port_set_get": {},
+      "policy_list": [],
+      "policy_get": {},
+      "service_group_list": [],
+      "service_group_get": {},
   }
 
-  LOG.info("Collecting idfcli + AHV Gateway OVS + CMSP OVN + atlas_cli")
-  with ThreadPoolExecutor(max_workers=4) as pool:
+  LOG.info(
+      "Collecting idfcli + AHV Gateway OVS + CMSP OVN + atlas_cli + "
+      "flow_cli + flow_proto")
+  with ThreadPoolExecutor(max_workers=6) as pool:
     idf_fut = None
     ahv_gw_fut = None
     cmsp_ovn_fut = None
     atlas_fut = None
+    proto_fut = None
+    flow_cli_fut = None
     if skip_idf:
       LOG.info("Skipping idfcli (--skip_idfcli)")
       payload["idfcli"] = {"ran": False, "error": "skipped (--skip_idfcli)"}
@@ -2038,6 +3387,23 @@ def dump_pc(output_dir, workers=8, skip_idf=False, skip_ahv=False,
       atlas_fut = pool.submit(
           dump_atlas_port_sets, output_dir,
           max(1, int(atlas_get_workers)), atlas_timeout)
+    if skip_flow_proto:
+      LOG.info("Skipping Flow proto schema (--skip_flow_proto)")
+      payload["flow_proto"] = {
+          "ran": False,
+          "complete": False,
+          "error": "skipped (--skip_flow_proto)",
+      }
+    else:
+      proto_fut = pool.submit(fetch_flow_proto_schema, output_dir)
+    if skip_flow_cli:
+      LOG.info("Skipping flow_cli/kratos_cli (--skip_flow_cli)")
+      payload["flow_cli"] = {
+          "ran": False, "error": "skipped (--skip_flow_cli)"}
+    else:
+      flow_cli_fut = pool.submit(
+          dump_flow_policies, output_dir,
+          max(1, int(flow_cli_get_workers)), flow_cli_timeout)
     if idf_fut is not None:
       try:
         index, idf_errors = idf_fut.result()
@@ -2092,15 +3458,49 @@ def dump_pc(output_dir, workers=8, skip_idf=False, skip_ahv=False,
       else:
         atlas_rec = payload.get("atlas") or {}
         errors.update(atlas_rec.get("errors") or {})
+    if proto_fut is not None:
+      try:
+        payload["flow_proto"] = proto_fut.result()
+      except Exception as err:
+        errors["flow_proto"] = str(err)
+        payload["flow_proto"] = {
+            "ran": False,
+            "complete": False,
+            "error": str(err),
+        }
+        LOG.error("DATASET flow_proto FAILED: %s", err)
+      else:
+        proto = payload.get("flow_proto") or {}
+        if not proto.get("complete") and proto.get("error"):
+          errors["flow_proto"] = proto["error"]
+    if flow_cli_fut is not None:
+      try:
+        payload["flow_cli"] = flow_cli_fut.result()
+      except Exception as err:
+        errors["flow_cli"] = str(err)
+        payload["flow_cli"] = {"ran": False, "error": str(err)}
+        LOG.error("DATASET flow_cli FAILED: %s", err)
+      else:
+        flow_rec = payload.get("flow_cli") or {}
+        errors.update(flow_rec.get("errors") or {})
 
-  uuids = fetch_unique_uuids()
+  uuids = fetch_unique_uuids(output_dir)
   payload["vlan_unique_uuid"] = uuids.get("vlan_unique_uuid") or ""
   payload["global_unique_uuid"] = uuids.get("global_unique_uuid") or ""
+  payload["unique_uuid_source"] = uuids.get("source") or ""
   _write_json_file(os.path.join(output_dir, "unique_uuids.json"), uuids)
   payload["port_set_list"] = _load_json_if_present(
       os.path.join(output_dir, "port_set_list.json"), [])
   payload["port_set_get"] = _normalize_port_set_get(_load_json_if_present(
       os.path.join(output_dir, "port_set_get.json"), {}))
+  payload["policy_list"] = _load_json_if_present(
+      os.path.join(output_dir, "policy_list.json"), [])
+  payload["policy_get"] = _load_json_if_present(
+      os.path.join(output_dir, "policy_get.json"), {})
+  payload["service_group_list"] = _load_json_if_present(
+      os.path.join(output_dir, "service_group_list.json"), [])
+  payload["service_group_get"] = _load_json_if_present(
+      os.path.join(output_dir, "service_group_get.json"), {})
 
   payload["dump_errors"] = errors
   _write_json_file(
@@ -2109,10 +3509,15 @@ def dump_pc(output_dir, workers=8, skip_idf=False, skip_ahv=False,
   _write_json_file(
       os.path.join(output_dir, "cmsp_ovn.json"),
       payload.get("cmsp_ovn") or {})
+  _write_json_file(
+      os.path.join(output_dir, "flow_proto.json"),
+      payload.get("flow_proto") or {})
   _write_json_file(os.path.join(output_dir, "dump_errors.json"), errors)
   _write_json_file(combined_path, payload)
 
-  LOG.info("===== DUMP SUMMARY (idfcli + OVN + OVS + atlas) =====")
+  LOG.info("===== DUMP SUMMARY (idfcli + OVN + OVS + atlas + flow_cli + flow_proto) =====")
+  LOG.info("  %-22s %s", "unique_uuid_source",
+           payload.get("unique_uuid_source") or "<empty>")
   LOG.info("  %-22s %s", "vlan_unique_uuid",
            payload.get("vlan_unique_uuid") or "<empty>")
   LOG.info("  %-22s %s", "global_unique_uuid",
@@ -2169,13 +3574,43 @@ def dump_pc(output_dir, workers=8, skip_idf=False, skip_ahv=False,
       (atlas.get("error") or "")[:80] or "<none>")
   LOG.info("  %-22s %s", "port_set_list", len(payload.get("port_set_list") or []))
   LOG.info("  %-22s %s", "port_set_get", len(payload.get("port_set_get") or {}))
+  flow_cli = payload.get("flow_cli") or {}
+  LOG.info(
+      "  %-22s ran=%s list=%s get=%s platform=%s transport=%s cli=%s error=%s",
+      "flow_cli",
+      flow_cli.get("ran"),
+      flow_cli.get("list_count"),
+      flow_cli.get("get_count"),
+      flow_cli.get("platform") or "",
+      flow_cli.get("transport") or "",
+      flow_cli.get("cli") or "",
+      (flow_cli.get("error") or "")[:80] or "<none>")
+  LOG.info("  %-22s %s", "policy_list", len(payload.get("policy_list") or []))
+  LOG.info("  %-22s %s", "policy_get", len(payload.get("policy_get") or {}))
+  LOG.info(
+      "  %-22s %s", "service_group_list",
+      len(payload.get("service_group_list") or []))
+  LOG.info(
+      "  %-22s %s", "service_group_get",
+      len(payload.get("service_group_get") or {}))
+  proto = payload.get("flow_proto") or {}
+  LOG.info(
+      "  %-22s ran=%s complete=%s messages=%s enums=%s error=%s",
+      "flow_proto",
+      proto.get("ran"),
+      proto.get("complete"),
+      proto.get("message_count"),
+      proto.get("enum_count"),
+      (proto.get("error") or "")[:80] or "<none>")
   if errors:
     LOG.warning("Failed datasets: %s", ", ".join(sorted(errors)))
     if fail_on_error:
       return 2
   LOG.info("Done. Index: %s", combined_path)
-  LOG.info("idfcli=%s/idfcli  ovs=%s/ahv_gateway  ovn=%s/cmsp_ovn  atlas=%s",
-           output_dir, output_dir, output_dir, output_dir)
+  LOG.info(
+      "idfcli=%s/idfcli  ovs=%s/ahv_gateway  ovn=%s/cmsp_ovn  "
+      "atlas=%s  flow_cli=%s  proto=%s/flow_proto",
+      output_dir, output_dir, output_dir, output_dir, output_dir, output_dir)
   LOG.info("Convert locally: python3 flow_pc_process.py --dump_dir %s",
            output_dir)
   return 0
@@ -2190,8 +3625,10 @@ def build_parser():
       prog="flow_pc_dump.py",
       formatter_class=argparse.RawDescriptionHelpFormatter,
       description=(
-          "PC dump only: idfcli, atlas_cli, AHV Gateway OVS, and CMSP OVN. "
-          "No convert or enrich. Run on PCVM with system python3."),
+          "PC dump only: idfcli, atlas_cli, flow_cli/kratos_cli policy "
+          "list+get, v4 ServiceGroupGet, AHV Gateway OVS, CMSP OVN, and "
+          "this build's Flow protobuf field map. No convert or enrich. "
+          "Run on PCVM with system python3."),
       epilog="""
 On PC (collect only, system python3):
 
@@ -2201,8 +3638,21 @@ Writes under --output_dir:
   idfcli/<entity_type>.json and .txt
   ahv_gateway/   (OVS via AHV Gateway mTLS :7030)
   cmsp_ovn/      (OVN NB/SB via kubectl ovsdb-client dump)
+  flow_proto/    (this PC's Flow *_pb2.py field numbers)
   port_set_list.json / port_set_get.json  (atlas_cli)
+  policy_list.json / policy_get.json      (flow_cli / kratos pod)
+  service_group_list.json / service_group_get.json
+      (v4 ServiceGroupGet; not v3 /service_groups/list)
   unique_uuids.json dump.log all.json dump_errors.json
+
+Policy CLI (always via bash; dump never uses -it):
+  CMSP:  bash -lc 'flow_cli -o json policy.list|get <uuid>'
+  SMSP:  kubectl -n ntnx-flow exec <kratos-pod> -- bash -lc \\
+           'kratos_cli|flow_cli -o json policy.list|get <uuid>'
+
+Service groups (v4, not v3 intentgw):
+  FlowClient.ServiceGroupGet empty uuid list, should_authorize=False
+  Same RPC as GET /api/microseg/v4.3/config/service-groups/{extId}
 
 Convert/enrich locally (not on PC):
 
@@ -2210,7 +3660,7 @@ Convert/enrich locally (not on PC):
 """ % {"prog": "flow_pc_dump.py", "out": DEFAULT_OUTPUT})
   ap.add_argument(
       "--output_dir", default=DEFAULT_OUTPUT,
-      help="Directory for idfcli/, ahv_gateway/, cmsp_ovn/, atlas")
+      help="Directory for idfcli/, ahv_gateway/, cmsp_ovn/, flow_proto/, atlas")
   ap.add_argument("--output", default="", help="Combined JSON path")
   ap.add_argument("--log_file", default="", help="Log file path")
   ap.add_argument("--workers", type=int, default=16)
@@ -2220,6 +3670,13 @@ Convert/enrich locally (not on PC):
   ap.add_argument("--skip_ahv_gateway", action="store_true")
   ap.add_argument("--skip_cmsp_ovn", action="store_true")
   ap.add_argument("--skip_atlas", action="store_true")
+  ap.add_argument(
+      "--skip_flow_proto", action="store_true", default=True,
+      help="Skip Flow proto field map (default: on; zprotobuf unused)")
+  ap.add_argument(
+      "--collect_flow_proto", action="store_false", dest="skip_flow_proto",
+      help="Copy this PC's *_pb2.py field map (unused after zprotobuf removal)")
+  ap.add_argument("--skip_flow_cli", action="store_true")
   ap.add_argument("--ahv_gateway_timeout_secs", type=int, default=1800)
   ap.add_argument("--ahv_gateway_class_timeout_secs", type=int, default=300)
   ap.add_argument("--ahv_gateway_workers", type=int, default=8)
@@ -2230,6 +3687,8 @@ Convert/enrich locally (not on PC):
   ap.add_argument("--cmsp_ovn_namespace", default="")
   ap.add_argument("--atlas_timeout_secs", type=int, default=1800)
   ap.add_argument("--atlas_get_workers", type=int, default=32)
+  ap.add_argument("--flow_cli_timeout_secs", type=int, default=1800)
+  ap.add_argument("--flow_cli_get_workers", type=int, default=32)
   return ap
 
 
@@ -2249,10 +3708,14 @@ def main(argv=None):
       skip_ahv=bool(args.skip_ahv_gateway),
       skip_cmsp=bool(args.skip_cmsp_ovn),
       skip_atlas=bool(args.skip_atlas),
+      skip_flow_proto=bool(args.skip_flow_proto),
+      skip_flow_cli=bool(args.skip_flow_cli),
       ahv_gw_timeout=max(60, int(args.ahv_gateway_timeout_secs)),
       cmsp_ovn_timeout=max(60, int(args.cmsp_ovn_timeout_secs)),
       atlas_timeout=max(60, int(args.atlas_timeout_secs)),
       atlas_get_workers=max(1, int(args.atlas_get_workers)),
+      flow_cli_timeout=max(60, int(args.flow_cli_timeout_secs)),
+      flow_cli_get_workers=max(1, int(args.flow_cli_get_workers)),
       idf_timeout=max(60, int(args.dataset_timeout_secs)),
       fail_on_error=bool(args.fail_on_error),
       log_file=args.log_file or "",
