@@ -5,7 +5,7 @@
 | Where | Script | What it does | How to invoke |
 |---|---|---|---|
 | **PCVM** | `flow_pc_dump.py` | Collect only (raw stdout/tarballs): idfcli, atlas_cli, flow_cli/kratos policy.list+get, AHV Gateway OVS, CMSP OVN | system `python3` on the PC (no Flow venv) |
-| **PCVM** | `vm_host_collect.py` | Dump one JSON: VM, IP, NIC, host, cluster | `python3 vm_host_collect.py` → `/tmp/vms.json` |
+| **PCVM** | `vm_host_collect.py` | Dump one JSON: VM, IP, NIC, host, cluster, project, vm_cat, subnet_cat, vpc_cat, VPC | `python3 vm_host_collect.py` → `/tmp/vms.json` |
 | **This workstation** | `flow_pc_process.py` | Convert/enrich the dump, optional ClickHouse ingest | `python3 flow_pc_process.py --dump_dir …` |
 | **This workstation** | `vm_host_inventory.py` | Same inventory from processed dump JSON | `python3 vm_host_inventory.py --dump_dir …` |
 | **This workstation** (not run by hand) | `flow_pc_map.py` | Maps `idfcli/` (and `policy_get.json`) into `policies.json` / AG / SG / EG / VMs | imported by `flow_pc_process.py` |
