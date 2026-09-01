@@ -1,94 +1,100 @@
 ---
 name: network-sar-debugging
 description: >-
-  Full host/CVM network+pressure RCA from diamond/logbay only. ALWAYS start with
-  bond/LAG member discovery (no hardcoded ethN). Detect fabric RX flood on all
-  bond members from sar/host_nic_stats, correlate with ping LOST_PKT/unreachable.
-  Do NOT invent switch trunk/VLAN/stop-source remediations — those are not in logs.
+  Product Network SAR RCA from ClickHouse nu_metrics_sysstats (ingested SAR /
+  ping LOST_PKT / host_nic / ethtool / bond). Detect EXTERNAL_RX_FLOOD on all
+  bond members and correlate with ping loss. Offline diamond fallback via
+  analyze_sar_network.py. Never invent trunk/VLAN remediations.
 skill_type: atomic
 component: networking
 sub_component: network_sar_debugging
 keywords:
   - sar
-  - iostat
-  - bond
-  - lag
+  - clickhouse
+  - nu_metrics_sysstats
   - rx flood
   - ping
-  - tso
-  - gro
-  - dmesg
-  - crc
+  - bond
+  - host_nic
+  - ethtool
   - network-debugging
   - dnd
 symptoms:
   - "Intermittent CVM/host connectivity or peer timeouts"
   - "Ping LOST_PKT/unreachable during traffic surge"
   - "Cassandra timeouts correlating with host RX pps spikes"
-  - "Need SAR/iostat/CRC/bond root-cause for DND or packet loss"
 severity: P0-P2
 roles_allowed: [engineer, sre]
 mcp_capabilities_required:
+  - panacea_run_query
   - logs.search
 last_verified: 2026-09-01
 ---
 
-# Network SAR Debugging (diamond/logbay only)
+# Network SAR Debugging (product = ClickHouse)
+
+## Where ingestion lives
+
+Parsers in **panacea-ingestion-pipeline** write into `panacea.nu_metrics_sysstats`:
+
+- Repo: `nutanix-core/panacea-ingestion-pipeline`
+- Path: `services/ingestion_pipeline/parsers/ntnx_metric_parser/parsers/`
+  - `sar_parser.py` — all non-guest ifaces + error/drop tables
+  - `ping_all_parser.py` — `ping_all_lost_pkt` / `ping_all_unreachable`
+  - `host_nic_stats_parser.py` — soft drops / CRC
+  - `ethtool_bond_parsers.py` — `ethtool --statistics`, `ovs-appctl bond/show`
+- PR: https://github.com/nutanix-core/panacea-ingestion-pipeline/pull/408
+
+Without that ingest (or metrics-disabled lightweight bundles), CH returns empty →
+`EVIDENCE_INSUFFICIENT`.
 
 ## Hard rules
 
-1. **Evidence scope = diamond/logbay bundle only** (`cvm_logs/sysstats`, `ahv/*/commands`).
-   If the flood window is in the collected `sar.INFO*` / `ping_*.INFO*` / `host_nic_stats`,
-   discover it. If not collected, emit `EVIDENCE_INSUFFICIENT` — do not invent live paste RCA.
-2. **Never hardcode NIC names.** Discover members from **bond/LAG**.
-3. **Always** emit: `BOND_LAG`, `EXTERNAL_RX_FLOOD`, `PING_FLOOD_CORRELATION`,
-   `OFFLOAD_TSO_GRO`, `RING`, `DMESG_NIC`, L1/CRC, SAR, latency, ping.
-4. Missing source → `EVIDENCE_INSUFFICIENT` for that class — do not omit the key.
-5. **CRC=0 is a finding.** Soft `rx_dropped` ≠ CRC. Standby-member drops alone ≠ active-path loss.
-6. **Do not** call active-backup standby “NIC down” when link is up and member is enabled.
-7. When ping fails overlap SAR RX flood windows → primary root = **`EXTERNAL_RX_FLOOD`**
-   (storage may be a co-contributor).
-8. **Disconnected from flood RCA (do not emit):**
-   - Switch trunk “allow only Nutanix VLANs”
-   - Stop-source / SPAN capture playbooks
-   - PC/OVN recovery sequencing as if proven by these logs  
-   Those may be engineering follow-ups, but **they are not present in diamond logs** and
-   must not appear as skill `action_plan` or as part of `root_cause_sentence`.
+1. **Product path = ClickHouse first** via `scripts/check_sar_debugging.py` →
+   `run(db_client, context)` on `nu_metrics_sysstats` (+ anomaly).
+2. **Never hardcode NIC names.** Use `bond_member_*` / `component_instance`.
+3. Always emit classes: flood, ping↔flood, L1 CRC/drops, bond roles.
+4. **CRC=0 is a finding.** Soft `rx_dropped` ≠ CRC.
+5. Do **not** invent switch trunk/VLAN/stop-source remediations (not in metrics).
 
-## Mandatory classes
+## Ingested metrics used
 
-| Class | Diamond sources | What |
-|---|---|---|
-| **Bond / LAG** | `ahv/*/commands/ovs-appctl_bond_show.stdout` | mode, active, member roles |
-| **External RX flood** | `cvm_logs/sysstats/sar.INFO*` (all ifaces) | High `rxpck/s`; standby high RX + ~0 TX |
-| **Ping↔flood** | `ping_*.INFO*` + flood windows | LOST_PKT/unreachable within ~2 min of flood |
-| **Soft drops** | `host_nic_stats.INFO*`, `ethtool_-S_*.stdout` | Rising soft `rx_dropped` (not CRC) |
-| **Offload / rings / dmesg** | ahv ethtool + `dmesg_-T.stdout` | TSO/GSO/GRO/LRO, rings, link flaps |
-| **SSD latency** | `iostat.INFO*` | Secondary if flood correlates |
-| **Path** | `ping_*.INFO*` | unreachable / LOST_PKT |
+| Metric | Class |
+|---|---|
+| `sar_rx_packets_per_sec` / `sar_tx_packets_per_sec` | EXTERNAL_RX_FLOOD |
+| `sar_rx_drops_per_sec` / `sar_rx_errors_per_sec` | DROPS / errors |
+| `ping_all_lost_pkt` / `ping_all_unreachable` | PATH + correlation |
+| `host_nic_rx_dropped` / `host_nic_rx_crc_errors` | L1 soft drop / CRC |
+| `ethtool_rx_dropped` / `ethtool_rx_crc_errors` | L1 snapshot |
+| `bond_member_active` / `bond_member_enabled` | BOND_LAG roles |
 
-## Procedure (ReAct — bond → flood → ping from bundle)
+## Product procedure
 
-1. Discover PE bundle root under diamond.
-2. Parse bond/LAG → dynamic members + roles.
-3. Per member: ethtool link/`-S`/`-k`/`-g`, dmesg flaps.
-4. Scan **every** non-lo SAR iface for RX flood (≥100k rxpck/s; strong ≥500k or multi-iface / standby RX≈0 TX).
-5. Parse timestamped ping fails; correlate within ~120s of flood walls.
-6. Classify: ping↔flood → `EXTERNAL_RX_FLOOD`; else bond-down / soft drops / storage as appropriate.
-7. Emit JSON: classes + evidence walls/rates + `root_cause_sentence` **describing log facts only**.
-   No trunk/VLAN/stop-source `action_plan`.
-
-## Script
+1. Call `{capability: panacea_run_query}` / skill script `check_sar_debugging.run`
+   with `bundle_id` (+ optional `cvm_ip` / time window).
+2. Detect flood: `sar_rx_packets_per_sec` ≥ 100k (strong ≥ 500k); standby =
+   high RX + ~0 TX or `bond_member_active=0` + enabled.
+3. Correlate ping fail timestamps within ~120s of flood buckets →
+   `PING_LOSS_CORRELATES_WITH_RX_FLOOD`.
+4. Status: `EXTERNAL_RX_FLOOD_CORRELATED` | `EXTERNAL_RX_FLOOD_FOUND` |
+   `PATH_LOSS_WITHOUT_FLOOD` | `L1_CRC_FOUND` | `NO_SAR_FLOOD_ISSUE` |
+   `EVIDENCE_INSUFFICIENT`.
 
 ```bash
-python3 scripts/analyze_sar_network.py \
-  --bundle-root /path/to/NTNX-Log-...-PE-<cvm> \
-  --dnd-time '<optional DND wall>'
+# Product (orchestrator injects db_client)
+python -c "from check_sar_debugging import run; print(run(db, ctx))"
 ```
 
-Fixture (synthetic diamond-shaped sar+ping): `fixtures/rx_flood_ping_case/`.
+## Offline fallback (diamond files only)
+
+When CH has no rows (lightweight / pre-ingest):
+
+```bash
+python3 scripts/analyze_sar_network.py --bundle-root /path/to/NTNX-Log-...-PE-<cvm>
+```
 
 ## See also
 
-- [network-nic-mtu-ncc](../network-nic-mtu-ncc/SKILL.md)
+- Ingest PR: https://github.com/nutanix-core/panacea-ingestion-pipeline/pull/408
 - [network-rca-orchestrator](../network-rca-orchestrator/SKILL.md)
+- [network-ping-tcp-baseline](../network-ping-tcp-baseline/SKILL.md)

@@ -49,7 +49,13 @@ Before synthesis, every chain must emit status for:
 1. **DND window**
 2. **Path** (ping/TCP)
 3. **L1 / CRC / link / drops** (ethtool + host_nic_stats — CRC=0 is a finding)
-4. **SAR traffic** (rates, rxdrop, rxerr)
+4. **SAR + iostat + L1 one-pass** — [network-sar-debugging](../network-sar-debugging/SKILL.md)
+   **Product:** `scripts/check_sar_debugging.py` → `run(db_client, context)` on
+   `nu_metrics_sysstats` (ingest PR https://github.com/nutanix-core/panacea-ingestion-pipeline/pull/408).
+   Detect **EXTERNAL_RX_FLOOD** + ping LOST_PKT correlation from CH.
+   Offline fallback only: `analyze_sar_network.py --bundle-root …`.
+   Do **not** emit trunk/VLAN/stop-source plans.
+
 5. **Host pressure** (iostat iowait / disk await)
 6. Expert branches as triggered (firewall, Cassandra, OVS, upgrade, storage-io)
 
@@ -61,14 +67,12 @@ Missing source → `EVIDENCE_INSUFFICIENT` for that class. Do **not** omit.
 2. **Ping/TCP** — [network-ping-tcp-baseline](../network-ping-tcp-baseline/SKILL.md)
 3. **NIC + L1 CRC** — [network-nic-mtu-ncc](../network-nic-mtu-ncc/SKILL.md)
 4. **SAR + iostat + L1 one-pass** — [network-sar-debugging](../network-sar-debugging/SKILL.md)
-   ```bash
-   python3 .../network-sar-debugging/scripts/analyze_sar_network.py \
-     --bundle-root /path/to/NTNX-Log-...-PE-<cvm>
-   ```
-   Must detect **EXTERNAL_RX_FLOOD** (all bond members, not hardcoded NICs) and
-   **PING_FLOOD_CORRELATION** from diamond/logbay only. Prefer flood over storage
-   as the network root cause when ping↔flood correlates. **Do not** emit switch
-   trunk/VLAN/stop-source `action_plan` — that is not in the logs.
+   **Product:** `scripts/check_sar_debugging.py` → `run(db_client, context)` on
+   `nu_metrics_sysstats` (requires ingest PR
+   https://github.com/nutanix-core/panacea-ingestion-pipeline/pull/408).
+   Detect **EXTERNAL_RX_FLOOD** + **PING_FLOOD_CORRELATION** from CH metrics.
+   Offline fallback only: `analyze_sar_network.py --bundle-root …`.
+   Do **not** emit trunk/VLAN/stop-source plans — not in metrics/logs.
 5. **Host pressure / storage** — [network-host-pressure](../network-host-pressure/SKILL.md),
    [network-storage-io](../network-storage-io/SKILL.md) if storage class positive
    (co-contributor when flood also correlates — do not hide the flood).
@@ -78,9 +82,9 @@ Missing source → `EVIDENCE_INSUFFICIENT` for that class. Do **not** omit.
 ## Common Pitfalls
 
 - Closing on SAR drops without stating **CRC**
-- Treating missing CH coverage as no issue (use diamond/logbay)
-- Storage RCA without L1 class (or L1 without storage when DND + iowait)
-- Inventing trunk/VLAN/stop-source remediations not present in diamond logs
+- Treating missing CH coverage as no issue (use diamond/logbay **or** wait for ingest)
+- Running only file analyzer in product when CH metrics exist
+- Inventing trunk/VLAN/stop-source remediations not present in diamond/CH
 - Calling active-backup standby “NIC down” when link is up and member enabled
 
 ## See also
