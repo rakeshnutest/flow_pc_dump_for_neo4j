@@ -1,144 +1,94 @@
 ---
 name: network-sar-debugging
 description: >-
-  Full host/CVM network+pressure RCA from logbay: SAR, iostat, ethtool CRC,
-  host_nic_stats, ifconfig, and ping. MUST emit every counter class (CRC,
-  errors, drops, collisions, link, disk/iowait) — never skip L1 checks.
+  Full host/CVM network+pressure RCA from diamond/logbay only. ALWAYS start with
+  bond/LAG member discovery (no hardcoded ethN). Detect fabric RX flood on all
+  bond members from sar/host_nic_stats, correlate with ping LOST_PKT/unreachable.
+  Do NOT invent switch trunk/VLAN/stop-source remediations — those are not in logs.
 skill_type: atomic
 component: networking
 sub_component: network_sar_debugging
 keywords:
   - sar
   - iostat
-  - sysstats
-  - rxdrop
+  - bond
+  - lag
+  - rx flood
+  - ping
+  - tso
+  - gro
+  - dmesg
   - crc
-  - ethtool
-  - host_nic_stats
   - network-debugging
   - dnd
 symptoms:
   - "Intermittent CVM/host connectivity or peer timeouts"
-  - "Need SAR/iostat/CRC root-cause for DND or packet loss"
-  - "sar_stats_threshold_check or host NIC drop signals"
+  - "Ping LOST_PKT/unreachable during traffic surge"
+  - "Cassandra timeouts correlating with host RX pps spikes"
+  - "Need SAR/iostat/CRC/bond root-cause for DND or packet loss"
 severity: P0-P2
 roles_allowed: [engineer, sre]
 mcp_capabilities_required:
   - logs.search
 last_verified: 2026-09-01
-based_on: >-
-  https://explainx.ai/skills/aj-geddes/useful-ai-prompts/network-debugging
-  (aj-geddes/useful-ai-prompts network-debugging — remapped from browser
-  DevTools waterfall to SAR / ethtool / iostat timelines)
 ---
 
-# Network SAR Debugging (complete)
+# Network SAR Debugging (diamond/logbay only)
 
-Adapted from [explainx.ai network-debugging](https://explainx.ai/skills/aj-geddes/useful-ai-prompts/network-debugging).
-Remapped from browser Network tab to **Nutanix logbay** evidence.
+## Hard rules
 
-## Hard rule — never skip these classes
+1. **Evidence scope = diamond/logbay bundle only** (`cvm_logs/sysstats`, `ahv/*/commands`).
+   If the flood window is in the collected `sar.INFO*` / `ping_*.INFO*` / `host_nic_stats`,
+   discover it. If not collected, emit `EVIDENCE_INSUFFICIENT` — do not invent live paste RCA.
+2. **Never hardcode NIC names.** Discover members from **bond/LAG**.
+3. **Always** emit: `BOND_LAG`, `EXTERNAL_RX_FLOOD`, `PING_FLOOD_CORRELATION`,
+   `OFFLOAD_TSO_GRO`, `RING`, `DMESG_NIC`, L1/CRC, SAR, latency, ping.
+4. Missing source → `EVIDENCE_INSUFFICIENT` for that class — do not omit the key.
+5. **CRC=0 is a finding.** Soft `rx_dropped` ≠ CRC. Standby-member drops alone ≠ active-path loss.
+6. **Do not** call active-backup standby “NIC down” when link is up and member is enabled.
+7. When ping fails overlap SAR RX flood windows → primary root = **`EXTERNAL_RX_FLOOD`**
+   (storage may be a co-contributor).
+8. **Disconnected from flood RCA (do not emit):**
+   - Switch trunk “allow only Nutanix VLANs”
+   - Stop-source / SPAN capture playbooks
+   - PC/OVN recovery sequencing as if proven by these logs  
+   Those may be engineering follow-ups, but **they are not present in diamond logs** and
+   must not appear as skill `action_plan` or as part of `root_cause_sentence`.
 
-Every run MUST report a status for **each** of the following. If a source
-file is missing, set that class to `EVIDENCE_INSUFFICIENT` with the path
-searched — do **not** omit the key.
+## Mandatory classes
 
-| Class | Sources (logbay) | Key counters |
+| Class | Diamond sources | What |
 |---|---|---|
-| **L1 / CRC** | `ahv/*/commands/ethtool_--statistics_*.stdout`, `host_nic_stats.INFO.*`, `ifconfig_-a.stdout` | `rx_crc_errors`, `rx_length_errors`, `rx_frame_errors`, `collisions`, `tx_carrier` / carrier, overruns |
-| **NIC errors** | same + SAR err block | `rx_errors`, `tx_errors`, SAR `rxerr/s` `txerr/s` |
-| **Drops** | ethtool / host_nic_stats / SAR / ifconfig | `rx_dropped`, `tx_dropped`, SAR `rxdrop/s` `txdrop/s` |
-| **Link** | `ethtool_eth*.stdout`, dmesg | Speed, duplex, `Link detected` |
-| **Traffic** | `sar.INFO.*` IFACE | `rxpck/s`, `txpck/s`, `rxkB/s`, `txkB/s`, avg pkt size |
-| **Path** | `ping_all.INFO.*`, `ping_remotes.INFO.*` | unreachable, LOST_PKT (esp. 1472B) |
-| **Host pressure** | `iostat.INFO.*` | `%iowait`, disk `%util`, `r_await`, `w_await` |
+| **Bond / LAG** | `ahv/*/commands/ovs-appctl_bond_show.stdout` | mode, active, member roles |
+| **External RX flood** | `cvm_logs/sysstats/sar.INFO*` (all ifaces) | High `rxpck/s`; standby high RX + ~0 TX |
+| **Ping↔flood** | `ping_*.INFO*` + flood windows | LOST_PKT/unreachable within ~2 min of flood |
+| **Soft drops** | `host_nic_stats.INFO*`, `ethtool_-S_*.stdout` | Rising soft `rx_dropped` (not CRC) |
+| **Offload / rings / dmesg** | ahv ethtool + `dmesg_-T.stdout` | TSO/GSO/GRO/LRO, rings, link flaps |
+| **SSD latency** | `iostat.INFO*` | Secondary if flood correlates |
+| **Path** | `ping_*.INFO*` | unreachable / LOST_PKT |
 
-**CRC = 0 is a finding.** Report it explicitly. Do not equate `rx_dropped`
-with CRC.
+## Procedure (ReAct — bond → flood → ping from bundle)
 
-## When to Use
-
-- DND / peer-score / intermittent loss
-- NCC `sar_stats_threshold_check`, NIC flaps, SSD latency
-- Separating **CRC/L1** vs **soft drop** vs **storage pressure**
-
-## DevTools → logbay map
-
-| Browser concept | Logbay analog |
-|---|---|
-| Waterfall | `#TIMESTAMP` ordered samples |
-| Queueing | `rxdrop/s`, `rx_dropped`, softnet |
-| L1 / bad cable | **`rx_crc_errors`**, frame, carrier, collisions |
-| Initial connection | `ping_*.INFO` GW/PC/CVM |
-| Waiting (TTFB) | RPC / Thrift / Medusa timeouts |
-| Content download | SAR rates + avg pkt size |
-| Throttling | sustained drops + disk await / iowait |
-
-## Procedure (ReAct — mandatory order)
-
-1. **Discover** bundle root (`NTNX-Log-*-PE-<cvm>/`).
-2. **Act: L1/CRC** — parse ethtool `-S`, `host_nic_stats` first→last delta, ifconfig.
-3. **Observe** — CRC rising? or drops-only with CRC=0?
-4. **Act: SAR traffic+err** — eth0/eth1 rates, `rxdrop/s`, `rxerr/s`.
-5. **Act: iostat** — iowait + hot disks near DND / fault wall times.
-6. **Act: ping** — unreachable / LOST_PKT to peers vs GW/PC.
-7. **Classify** (pick primary; list contributors):
-   - `L1_CRC_OR_LINK` — CRC/frame/carrier/collisions rising or link flaps
-   - `SOFT_RX_DROPS` — large `rx_dropped` / `rxdrop/s`, CRC≈0, rxerr≈0
-   - `SOFTNET_FLOOD` — high pps + tiny pkts + soft drops
-   - `HOST_STORAGE_PRESSURE` — high await/%util/iowait near DND
-   - `PATH_EDGE` — GW/PC large-ping fail, peer CVM OK
-   - `MIXED` — state which led peer-score climb
-8. **Emit JSON** with every class present (see script schema).
-
-## Decision thresholds
-
-| Signal | Suspect |
-|---|---|
-| `rx_crc_errors` delta > 0 | `L1_CRC_OR_LINK` |
-| `rx_dropped` large, CRC delta = 0 | `SOFT_RX_DROPS` |
-| SAR `rxpck/s` > 100k + pkt size p50 < 200B | `SOFTNET_FLOOD` |
-| SAR `rxdrop/s` > 0 on >50% samples, `rxerr/s`≈0 | soft drops |
-| `%iowait` > 20 or disk await > 30ms / util > 90% | `HOST_STORAGE_PRESSURE` |
+1. Discover PE bundle root under diamond.
+2. Parse bond/LAG → dynamic members + roles.
+3. Per member: ethtool link/`-S`/`-k`/`-g`, dmesg flaps.
+4. Scan **every** non-lo SAR iface for RX flood (≥100k rxpck/s; strong ≥500k or multi-iface / standby RX≈0 TX).
+5. Parse timestamped ping fails; correlate within ~120s of flood walls.
+6. Classify: ping↔flood → `EXTERNAL_RX_FLOOD`; else bond-down / soft drops / storage as appropriate.
+7. Emit JSON: classes + evidence walls/rates + `root_cause_sentence` **describing log facts only**.
+   No trunk/VLAN/stop-source `action_plan`.
 
 ## Script
 
-Prefer bundle-root mode (runs **all** checks):
-
 ```bash
 python3 scripts/analyze_sar_network.py \
-  --bundle-root /path/to/NTNX-Log-...-PE-10.1.20.104 \
-  --iface eth0
+  --bundle-root /path/to/NTNX-Log-...-PE-<cvm> \
+  --dnd-time '<optional DND wall>'
 ```
 
-Or explicit files:
-
-```bash
-python3 scripts/analyze_sar_network.py \
-  --sar .../sar.INFO.* \
-  --iostat .../iostat.INFO.* \
-  --host-nic-stats .../host_nic_stats.INFO.* \
-  --ethtool-dir .../ahv/<host>/commands \
-  --ping .../ping_all.INFO.* \
-  --iface eth0
-```
-
-## Common Pitfalls
-
-- Reporting drops without stating **CRC=0** (or CRC>0).
-- Treating post-DND SAR start as the trigger time.
-- Blaming MTU/CRC when only soft drops + disk await exist.
-- Skipping AHV ethtool because CVM SAR `rxerr/s` was 0.
+Fixture (synthetic diamond-shaped sar+ping): `fixtures/rx_flood_ping_case/`.
 
 ## See also
 
-- [network-rca-orchestrator](../network-rca-orchestrator/SKILL.md)
 - [network-nic-mtu-ncc](../network-nic-mtu-ncc/SKILL.md)
-- [network-host-pressure](../network-host-pressure/SKILL.md)
-- [network-ping-tcp-baseline](../network-ping-tcp-baseline/SKILL.md)
-- [references/sar_waterfall_checklist.md](references/sar_waterfall_checklist.md)
-
-## Attribution
-
-Methodology adapted from
-[explainx.ai / aj-geddes useful-ai-prompts network-debugging](https://explainx.ai/skills/aj-geddes/useful-ai-prompts/network-debugging).
+- [network-rca-orchestrator](../network-rca-orchestrator/SKILL.md)

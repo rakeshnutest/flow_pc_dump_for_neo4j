@@ -26,19 +26,21 @@ last_verified: 2026-09-01
 ## Purpose
 Collect NIC/MTU/NCC evidence and **always** classify L1 vs soft drops.
 
-## Mandatory L1 checklist (never skip)
+## Mandatory L1 checklist (never skip; never hardcode NIC names)
 
-From logbay / diamond PE bundle:
+1. **Bond/LAG first** — `ovs-appctl bond/show`: discover members dynamically  
+   (no `eth1`/`eth2` assumptions). Record active / standby / disabled.
+2. For **each bond member name returned**, check:
+   - `ethtool <member>` — Speed, Duplex, Link detected  
+   - `ethtool -S` / `host_nic_stats` — CRC, errors, drops  
+   - `ethtool -k` — TSO/GSO/GRO/LRO  
+   - `dmesg -T` — NIC Link Up/Down for that member  
+3. `ifconfig_-a` / `ip addr` — NO-CARRIER, errors, drops  
+4. NCC / MTU config (see references)
 
-1. `ahv/<host>/commands/ethtool_--statistics_<iface>.stdout`
-   - `rx_crc_errors`, `rx_length_errors`, `rx_frame_errors`
-   - `rx_errors`, `tx_errors`, `rx_dropped`, `tx_dropped`, `collisions`
-2. `ahv/<host>/commands/ethtool_<iface>.stdout` — Speed, Duplex, Link detected
-3. `cvm_logs/sysstats/host_nic_stats.INFO*` — first→last **delta** for same counters
-4. `ifconfig_-a.stdout` — RX/TX errors, dropped, overruns, carrier, collisions
-5. NCC / bond / MTU config (see references)
-
-**CRC=0 with large rx_dropped → `SOFT_RX_DROPS`, not CRC fault.**
+**CRC=0 with large rx_dropped on active member → `SOFT_RX_DROPS`.**  
+**Standby member drops ≠ active-path loss.**  
+**active-backup standby is expected when enabled + link up.**
 
 ## Decision Tree
 

@@ -65,8 +65,13 @@ Missing source → `EVIDENCE_INSUFFICIENT` for that class. Do **not** omit.
    python3 .../network-sar-debugging/scripts/analyze_sar_network.py \
      --bundle-root /path/to/NTNX-Log-...-PE-<cvm>
    ```
+   Must detect **EXTERNAL_RX_FLOOD** (all bond members, not hardcoded NICs) and
+   **PING_FLOOD_CORRELATION** from diamond/logbay only. Prefer flood over storage
+   as the network root cause when ping↔flood correlates. **Do not** emit switch
+   trunk/VLAN/stop-source `action_plan` — that is not in the logs.
 5. **Host pressure / storage** — [network-host-pressure](../network-host-pressure/SKILL.md),
    [network-storage-io](../network-storage-io/SKILL.md) if storage class positive
+   (co-contributor when flood also correlates — do not hide the flood).
 6. Expert: firewall / Cassandra / OVS / upgrade as suggested by baselines
 7. Synthesize primary `root_class` + contributors; list ruled-out checks
 
@@ -75,6 +80,8 @@ Missing source → `EVIDENCE_INSUFFICIENT` for that class. Do **not** omit.
 - Closing on SAR drops without stating **CRC**
 - Treating missing CH coverage as no issue (use diamond/logbay)
 - Storage RCA without L1 class (or L1 without storage when DND + iowait)
+- Inventing trunk/VLAN/stop-source remediations not present in diamond logs
+- Calling active-backup standby “NIC down” when link is up and member enabled
 
 ## See also
 
