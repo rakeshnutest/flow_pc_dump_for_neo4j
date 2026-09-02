@@ -3,7 +3,8 @@
 # Copyright (c) 2026 Nutanix Inc. All rights reserved.
 #
 # PC collect only. Copy this file to the PC. System python3. No Flow venv.
-#   python3 flow_pc_dump.py --output_dir /home/nutanix/upgrade/flow_pc_dump
+#   python3 flow_pc_dump.py
+#   python3 flow_pc_dump.py --leader_only --output_dir /home/nutanix/upgrade/flow_pc_dump
 #
 # Write command stdout and AHV/OVS tarball members as-is. No flatten, no
 # unwrap, no proto-to-v4. Convert locally:
@@ -19,6 +20,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -29,7 +32,17 @@ from datetime import datetime
 from urllib.request import Request, urlopen
 
 LOG = logging.getLogger("flow_pc_dump")
-DEFAULT_OUTPUT = "/home/nutanix/upgrade/flow_pc_dump"
+DUMP_SOURCE = "flow_pc_dump"
+DUMP_MARKER = ".flow_pc_dump"
+DEFAULT_OUTPUT_BASE = "/home/nutanix/upgrade/flow_pc_dump"
+FLOW_LEADER_ZK_ROOTS = (
+    "/appliance/logical/leaders",
+    "/appliance/logical/pyleaders",
+    "/appliance/logical/goleaders",
+)
+JAVA_LEADER_RE = re.compile(
+    r"Handle:\s*(\d{1,3}(?:\.\d{1,3}){3}):\d+.*Currently leader \(Y/N\):\s*Yes",
+    re.I)
 AHV_PORT = 7030
 AHV_CERT_DIRS = (
     "/home/certs/ClusterHealthService",
@@ -191,6 +204,182 @@ def _write_text(path, text):
     handle.write(text or "")
   LOG.info("Wrote %s (%s bytes)", path, os.path.getsize(path))
   return path
+
+
+def default_output_dir():
+  return "%s_%d" % (DEFAULT_OUTPUT_BASE, int(time.time()))
+
+
+def _zk_tool(name):
+  for path in (
+      "/home/nutanix/cluster/bin/%s" % name,
+      "/usr/local/nutanix/cluster/bin/%s" % name,
+      name):
+    if path and os.path.exists(path) and os.access(path, os.X_OK):
+      return path
+  return ""
+
+
+def _zkls(path):
+  tool = _zk_tool("zkls")
+  if not tool:
+    return []
+  rc, out, _err = _run([tool, path], 30)
+  if rc != 0:
+    return []
+  return [item for item in (out or "").split() if item]
+
+
+def _zkcat(path):
+  tool = _zk_tool("zkcat")
+  if not tool:
+    return ""
+  rc, out, _err = _run([tool, path], 20)
+  if rc != 0:
+    return ""
+  return (out or "").strip()
+
+
+def _is_flow_leader_service(name):
+  name = (name or "").strip()
+  if not name:
+    return False
+  lower = name.lower()
+  if lower.startswith("flow:") or lower == "flow_master":
+    return True
+  if "microseg" in lower or "microsegmentation" in lower:
+    return True
+  return False
+
+
+def _ip_from_leader_text(text):
+  text = (text or "").strip()
+  if not text:
+    return ""
+  match = JAVA_LEADER_RE.search(text)
+  if match:
+    return match.group(1)
+  if IPV4_RE.match(text):
+    return text
+  parsed = _json_loads(text)
+  if isinstance(parsed, dict):
+    ip = str(parsed.get("ip") or "").strip()
+    if IPV4_RE.match(ip):
+      return ip
+  match = re.search(
+      r"(\d{1,3}(?:\.\d{1,3}){3}):\d+.*Currently leader \(Y/N\):\s*Yes",
+      text, re.I)
+  if match:
+    return match.group(1)
+  return ""
+
+
+def _collect_flow_leader_ips():
+  ips, seen = [], set()
+  for root in FLOW_LEADER_ZK_ROOTS:
+    for service in _zkls(root):
+      if not _is_flow_leader_service(service):
+        continue
+      service_path = "%s/%s" % (root, service)
+      children = _zkls(service_path)
+      if not children:
+        data = _zkcat(service_path)
+        ip = _ip_from_leader_text(data)
+        if ip and ip not in seen:
+          seen.add(ip)
+          ips.append(ip)
+        continue
+      for child in children:
+        ip = _ip_from_leader_text(_zkcat("%s/%s" % (service_path, child)))
+        if ip and ip not in seen:
+          seen.add(ip)
+          ips.append(ip)
+  return ips
+
+
+def _local_svm_ip():
+  host = (socket.gethostname() or "").lower()
+  match = re.search(r"(\d+-\d+-\d+-\d+)", host)
+  if match:
+    ip = match.group(1).replace("-", ".")
+    if IPV4_RE.match(ip):
+      return ip
+  svmips = _zk_tool("svmips")
+  if svmips:
+    rc, out, _err = _run([svmips, "-d"], 20)
+    if rc == 0:
+      for line in (out or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and IPV4_RE.match(parts[0]):
+          return parts[0]
+  return ""
+
+
+def flow_dump_leader_status():
+  local_ip = _local_svm_ip()
+  if not local_ip:
+    return "error", "could not determine local SVM IP"
+  leader_ips = _collect_flow_leader_ips()
+  if not leader_ips:
+    return "error", "could not determine flow leader from Zookeeper"
+  if local_ip in leader_ips:
+    return "run", ""
+  return "skip", "not leader (flow leaders=%s local=%s)" % (
+      ",".join(leader_ips), local_ip)
+
+
+def is_recognized_dump_dir(path):
+  marker_path = os.path.join(path, DUMP_MARKER)
+  if os.path.isfile(marker_path):
+    try:
+      with open(marker_path) as handle:
+        data = json.load(handle)
+      if isinstance(data, dict) and data.get("source") == DUMP_SOURCE:
+        return True
+    except Exception:
+      pass
+  all_path = os.path.join(path, "all.json")
+  if os.path.isfile(all_path):
+    try:
+      with open(all_path) as handle:
+        data = json.load(handle)
+      if isinstance(data, dict) and data.get("source") == DUMP_SOURCE:
+        return True
+    except Exception:
+      pass
+  return False
+
+
+def prepare_output_dir(path):
+  if not path or path in (".", "/", ""):
+    raise ValueError("unsafe output_dir: %s" % path)
+  if not os.path.exists(path):
+    os.makedirs(path, exist_ok=True)
+    return
+  if not os.path.isdir(path):
+    raise RuntimeError("output_dir exists but is not a directory: %s" % path)
+  try:
+    entries = os.listdir(path)
+  except OSError as err:
+    raise RuntimeError("cannot read output_dir %s: %s" % (path, err))
+  if not entries:
+    return
+  if is_recognized_dump_dir(path):
+    shutil.rmtree(path)
+    os.makedirs(path, exist_ok=True)
+    LOG.info("Removed prior flow_pc_dump output at %s", path)
+    return
+  raise RuntimeError(
+      "output_dir %s exists and does not look like a flow_pc_dump output; "
+      "refusing to delete" % path)
+
+
+def write_dump_marker(output_dir):
+  _write_json(os.path.join(output_dir, DUMP_MARKER), {
+      "source": DUMP_SOURCE,
+      "schema": 1,
+      "created_at": datetime.utcnow().isoformat() + "Z",
+  })
 
 
 def _list_rows(parsed):
@@ -986,6 +1175,33 @@ OVN_TARGETS = (
         "commands": (), "required": (),
     },
 )
+CMSP_OVN_SMART_RETRY_LIMIT = 2
+
+
+def _ovn_results_complete(results):
+  if not results:
+    return False
+  for rec in results:
+    if rec.get("pod_not_found"):
+      return False
+    if rec.get("missing"):
+      return False
+    if rec.get("error") and not rec.get("pod"):
+      return False
+  return True
+
+
+def _ovn_next_action(results, cmsp_ovn_wait, attempt,
+                     retry_limit=CMSP_OVN_SMART_RETRY_LIMIT):
+  if _ovn_results_complete(results):
+    return "done"
+  if cmsp_ovn_wait:
+    return "retry"
+  if any(rec.get("pod_not_found") for rec in results):
+    return "break"
+  if attempt >= retry_limit:
+    return "break"
+  return "retry"
 
 
 def _kubectl_cp(ns, pod, container, remote, dest, timeout, kubeconfig=""):
@@ -1026,9 +1242,11 @@ def _ovn_target(target, dest_root, namespace, timeout, kubeconfig=""):
   rec["namespace"] = ns or namespace
   rec["pod"] = pod or (target.get("pod") or "")
   if not rec["pod"]:
+    rec["pod_not_found"] = True
     rec["error"] = err or "pod not found"
     rec["missing"] = list(target.get("required") or [])
     return rec
+  rec["pod_not_found"] = False
   dump_timeout = max(60, min(600, int(timeout)))
   got = {}
   for name, argv in target.get("dumps") or ():
@@ -1053,7 +1271,7 @@ def _ovn_target(target, dest_root, namespace, timeout, kubeconfig=""):
   return rec
 
 
-def dump_ovn(output_dir, timeout, info, namespace=""):
+def dump_ovn(output_dir, timeout, info, namespace="", cmsp_ovn_wait=False):
   dest = os.path.join(output_dir, "cmsp_ovn")
   os.makedirs(dest, exist_ok=True)
   payload = {
@@ -1070,6 +1288,7 @@ def dump_ovn(output_dir, timeout, info, namespace=""):
   deadline = time.time() + max(60, int(timeout))
   backoff = 2
   last = []
+  smart_attempt = 0
   try:
     while time.time() < deadline:
       last = [
@@ -1078,9 +1297,20 @@ def dump_ovn(output_dir, timeout, info, namespace=""):
           for t in OVN_TARGETS]
       payload["ran"] = True
       payload["pods"] = last
-      if last and not any(rec.get("missing") for rec in last):
+      action = _ovn_next_action(last, cmsp_ovn_wait, smart_attempt)
+      if action == "done":
         payload["error"] = ""
         break
+      if action == "break":
+        if not cmsp_ovn_wait and any(rec.get("pod_not_found") for rec in last):
+          LOG.info(
+              "DUMP cmsp_ovn fail-fast: OVN pod not found, skipping retries")
+        elif not cmsp_ovn_wait:
+          LOG.info(
+              "DUMP cmsp_ovn fail-fast: retries exhausted after %s attempts",
+              smart_attempt + 1)
+        break
+      smart_attempt += 1
       sleep_for = min(backoff, max(0, int(deadline - time.time())))
       if sleep_for <= 0:
         break
@@ -1114,15 +1344,17 @@ def dump_pc(output_dir, workers=16, skip_idf=False, skip_ahv=False,
             atlas_get_workers=32, flow_cli_timeout=1800,
             flow_cli_get_workers=32, idf_timeout=180, ahv_workers=8,
             ahv_class_timeout=300, cmsp_ovn_namespace="",
+            cmsp_ovn_wait=False,
             fail_on_error=False, log_file="", combined_path=""):
   os.makedirs(output_dir, exist_ok=True)
+  write_dump_marker(output_dir)
   combined_path = combined_path or os.path.join(output_dir, "all.json")
   log_file = log_file or os.path.join(output_dir, "dump.log")
   _setup_logging(log_file)
   info = detect_platform()
   errors = {}
   index = {
-      "source": "flow_pc_dump",
+      "source": DUMP_SOURCE,
       "dumped_at": datetime.utcnow().isoformat() + "Z",
       "platform": info.get("platform") or "",
       "smsp_cluster_uuid": info.get("smsp_cluster_uuid") or "",
@@ -1138,7 +1370,8 @@ def dump_pc(output_dir, workers=16, skip_idf=False, skip_ahv=False,
           dump_ahv, output_dir, ahv_workers, ahv_class_timeout)
     if not skip_cmsp:
       futs["cmsp_ovn"] = pool.submit(
-          dump_ovn, output_dir, cmsp_ovn_timeout, info, cmsp_ovn_namespace)
+          dump_ovn, output_dir, cmsp_ovn_timeout, info, cmsp_ovn_namespace,
+          cmsp_ovn_wait)
     if not skip_atlas:
       futs["atlas"] = pool.submit(
           dump_atlas, output_dir, atlas_get_workers, atlas_timeout, info)
@@ -1183,7 +1416,9 @@ def build_parser():
       description=(
           "PC collect only. Writes command stdout and AHV/OVS files as-is. "
           "Convert locally with flow_pc_process.py."))
-  ap.add_argument("--output_dir", default=DEFAULT_OUTPUT)
+  ap.add_argument("--output_dir", default="")
+  ap.add_argument("--leader_only", action="store_true",
+                  help="Run only on the Flow leader PCVM; non-leaders exit 0")
   ap.add_argument("--output", default="")
   ap.add_argument("--log_file", default="")
   ap.add_argument("--workers", type=int, default=16)
@@ -1205,6 +1440,9 @@ def build_parser():
       "--ahv_gateway_cert_dir", default="/home/certs/ClusterHealthService")
   ap.add_argument("--cmsp_ovn_timeout_secs", type=int, default=1800)
   ap.add_argument("--cmsp_ovn_namespace", default="")
+  ap.add_argument(
+      "--cmsp_ovn_wait", action="store_true",
+      help="Retry cmsp_ovn collection until timeout (default: smart fail-fast)")
   ap.add_argument("--atlas_timeout_secs", type=int, default=1800)
   ap.add_argument("--atlas_get_workers", type=int, default=32)
   ap.add_argument("--flow_cli_timeout_secs", type=int, default=1800)
@@ -1215,13 +1453,28 @@ def build_parser():
 def main(argv=None):
   argv = list(sys.argv if argv is None else argv)
   args, _unknown = build_parser().parse_known_args(argv[1:])
+  _setup_logging()
+  if args.leader_only:
+    status, reason = flow_dump_leader_status()
+    if status == "skip":
+      LOG.info("skipped: %s", reason)
+      return 0
+    if status == "error":
+      LOG.error("leader_only: %s", reason)
+      return 1
+  output_dir = args.output_dir or default_output_dir()
+  try:
+    prepare_output_dir(output_dir)
+  except Exception as err:
+    LOG.error("output_dir: %s", err)
+    return 1
   global AHV_PORT, AHV_CERT_DIRS
   AHV_PORT = int(args.ahv_gateway_port)
   if args.ahv_gateway_cert_dir:
     AHV_CERT_DIRS = (args.ahv_gateway_cert_dir,) + tuple(
         d for d in AHV_CERT_DIRS if d != args.ahv_gateway_cert_dir)
   return dump_pc(
-      args.output_dir or DEFAULT_OUTPUT,
+      output_dir,
       workers=max(1, int(args.workers)),
       skip_idf=bool(args.skip_idfcli),
       skip_ahv=bool(args.skip_ahv_gateway),
@@ -1238,6 +1491,7 @@ def main(argv=None):
       ahv_workers=max(1, int(args.ahv_gateway_workers)),
       ahv_class_timeout=max(30, int(args.ahv_gateway_class_timeout_secs)),
       cmsp_ovn_namespace=args.cmsp_ovn_namespace or "",
+      cmsp_ovn_wait=bool(args.cmsp_ovn_wait),
       fail_on_error=bool(args.fail_on_error),
       log_file=args.log_file or "",
       combined_path=args.output or "")
@@ -1245,3 +1499,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
   sys.exit(main(sys.argv))
+
