@@ -16,6 +16,7 @@
 # SMSP OVN/kratos/atlas ZK: mspctl cluster kubeconfig flow.
 
 import argparse
+import ipaddress
 import json
 import logging
 import os
@@ -40,9 +41,16 @@ FLOW_LEADER_ZK_ROOTS = (
     "/appliance/logical/pyleaders",
     "/appliance/logical/goleaders",
 )
+# IPv4 Handle: a.b.c.d:port or IPv6 Handle: [addr]:port
 JAVA_LEADER_RE = re.compile(
-    r"Handle:\s*(\d{1,3}(?:\.\d{1,3}){3}):\d+.*Currently leader \(Y/N\):\s*Yes",
-    re.I)
+    r"Handle:\s*"
+    r"(?:"
+    r"\[([0-9a-fA-F:.%]+)\]:\d+"
+    r"|"
+    r"(\d{1,3}(?:\.\d{1,3}){3}):\d+"
+    r")"
+    r".*Currently leader \(Y/N\):\s*Yes",
+    re.I | re.DOTALL)
 AHV_PORT = 7030
 AHV_CERT_DIRS = (
     "/home/certs/ClusterHealthService",
@@ -67,7 +75,60 @@ VLAN_ZK = "/appliance/logical/flow/vlan_unique_uuid"
 GLOBAL_ZK = "/appliance/logical/flow/global_unique_uuid"
 UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+# Kept for callers/tests; prefer _is_valid_ip / _normalize_ip for dual-stack.
 IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+
+
+def _parse_ip(text):
+  text = (text or "").strip().strip("[]")
+  if not text:
+    return None
+  try:
+    return ipaddress.ip_address(text)
+  except ValueError:
+    return None
+
+
+def _normalize_ip(text):
+  """Canonical IP string; IPv4-mapped IPv6 becomes dotted IPv4."""
+  obj = _parse_ip(text)
+  if obj is None:
+    return ""
+  if isinstance(obj, ipaddress.IPv6Address) and obj.ipv4_mapped is not None:
+    return str(obj.ipv4_mapped)
+  return str(obj)
+
+
+def _is_valid_ip(text):
+  return bool(_normalize_ip(text))
+
+
+def _is_usable_ip(text):
+  """Valid cluster/management IP (skip link-local / loopback / unspecified)."""
+  obj = _parse_ip(text)
+  if obj is None:
+    return False
+  if obj.is_unspecified or obj.is_loopback or obj.is_link_local:
+    return False
+  return True
+
+
+def _ip_for_url(host):
+  """Host for https://... — bracket IPv6 literals."""
+  obj = _parse_ip(host)
+  if obj is None:
+    return (host or "").strip()
+  if isinstance(obj, ipaddress.IPv6Address):
+    return "[%s]" % obj.compressed
+  return str(obj)
+
+
+def _ip_for_path(host):
+  """Filesystem-safe host segment (IPv6 colons -> underscores)."""
+  nip = _normalize_ip(host) or (host or "").strip()
+  return nip.replace(":", "_").replace("%", "_")
+
+
 # ServiceGroupGet in the Flow venv (same RPC as v4 GET service-groups).
 SG_PY = r"""
 import json, os, sys, tempfile
@@ -245,87 +306,185 @@ def _is_flow_leader_service(name):
   if not name:
     return False
   lower = name.lower()
-  if lower.startswith("flow:") or lower == "flow_master":
+  if lower == "flow" or lower.startswith("flow") or lower == "flow_master":
     return True
   if "microseg" in lower or "microsegmentation" in lower:
     return True
   return False
 
 
-def _ip_from_leader_text(text):
+def _zk_root_kind(root):
+  if root.endswith("/goleaders"):
+    return "goleader"
+  if root.endswith("/pyleaders"):
+    return "pyleader"
+  return "leader"
+
+
+def _sort_zk_children(root, children):
+  if not children:
+    return children
+  if root.endswith("/goleaders"):
+    pairs = [child.rsplit("-", 1) for child in children]
+    pairs = sorted(pairs, key=lambda item: item[-1])
+    return ["-".join(tokens) for tokens in pairs]
+  return sorted(children)
+
+
+def _ip_from_leader_zk(kind, text):
   text = (text or "").strip()
   if not text:
     return ""
-  match = JAVA_LEADER_RE.search(text)
-  if match:
-    return match.group(1)
-  if IPV4_RE.match(text):
-    return text
-  parsed = _json_loads(text)
-  if isinstance(parsed, dict):
-    ip = str(parsed.get("ip") or "").strip()
-    if IPV4_RE.match(ip):
-      return ip
-  match = re.search(
-      r"(\d{1,3}(?:\.\d{1,3}){3}):\d+.*Currently leader \(Y/N\):\s*Yes",
-      text, re.I)
-  if match:
-    return match.group(1)
+  if kind == "leader":
+    match = JAVA_LEADER_RE.search(text)
+    if not match:
+      return ""
+    raw = match.group(1) or match.group(2) or ""
+    return _normalize_ip(raw)
+  if kind == "pyleader":
+    return _normalize_ip(text) if _is_usable_ip(text) else ""
+  if kind == "goleader":
+    parsed = _json_loads(text)
+    if not isinstance(parsed, dict):
+      return ""
+    for flag in ("is_leader", "leader", "isLeader"):
+      val = parsed.get(flag)
+      if val in (True, "true", "True", 1, "1", "yes", "Yes"):
+        ip = str(parsed.get("ip") or "").strip()
+        if _is_usable_ip(ip):
+          return _normalize_ip(ip)
+    return ""
   return ""
+
+
+def _cluster_svm_ips():
+  tool = _zk_tool("svmips")
+  if not tool:
+    return []
+  rc, out, _err = _run([tool], 20)
+  if rc != 0:
+    return []
+  ips, seen = [], set()
+  for token in (out or "").strip().split():
+    if not _is_usable_ip(token):
+      continue
+    nip = _normalize_ip(token)
+    if nip and nip not in seen:
+      seen.add(nip)
+      ips.append(nip)
+  return ips
+
+
+def _local_interface_ips():
+  ips, seen = [], set()
+
+  def _add(raw):
+    if not _is_usable_ip(raw):
+      return
+    nip = _normalize_ip(raw)
+    if nip and nip not in seen:
+      seen.add(nip)
+      ips.append(nip)
+
+  rc, out, _err = _run(
+      ["ip", "-4", "-o", "addr", "show", "dev", "eth0"], 10)
+  if rc == 0:
+    for line in (out or "").splitlines():
+      match = re.search(r"\binet (\d{1,3}(?:\.\d{1,3}){3})/", line)
+      if match:
+        _add(match.group(1))
+  rc, out, _err = _run(
+      ["ip", "-6", "-o", "addr", "show", "dev", "eth0"], 10)
+  if rc == 0:
+    for line in (out or "").splitlines():
+      match = re.search(r"\binet6 ([0-9a-fA-F:]+)/", line)
+      if match:
+        _add(match.group(1))
+  rc, out, _err = _run(["hostname", "-I"], 10)
+  if rc == 0:
+    for token in (out or "").strip().split():
+      _add(token)
+  return ips
+
+
+def _ip_from_hostname():
+  host = (socket.gethostname() or "").lower()
+  match = re.search(r"(\d+-\d+-\d+-\d+)", host)
+  if not match:
+    return ""
+  ip = match.group(1).replace("-", ".")
+  return _normalize_ip(ip) if _is_usable_ip(ip) else ""
 
 
 def _collect_flow_leader_ips():
   ips, seen = [], set()
+  matched_services = []
   for root in FLOW_LEADER_ZK_ROOTS:
+    kind = _zk_root_kind(root)
     for service in _zkls(root):
       if not _is_flow_leader_service(service):
         continue
+      matched_services.append("%s/%s" % (root, service))
       service_path = "%s/%s" % (root, service)
-      children = _zkls(service_path)
+      children = _sort_zk_children(root, _zkls(service_path))
+      ip = ""
       if not children:
-        data = _zkcat(service_path)
-        ip = _ip_from_leader_text(data)
-        if ip and ip not in seen:
-          seen.add(ip)
-          ips.append(ip)
-        continue
-      for child in children:
-        ip = _ip_from_leader_text(_zkcat("%s/%s" % (service_path, child)))
-        if ip and ip not in seen:
-          seen.add(ip)
-          ips.append(ip)
+        ip = _ip_from_leader_zk(kind, _zkcat(service_path))
+      else:
+        for child in children:
+          ip = _ip_from_leader_zk(
+              kind, _zkcat("%s/%s" % (service_path, child)))
+          if ip:
+            break
+      if ip and ip not in seen:
+        seen.add(ip)
+        ips.append(ip)
+  if not ips and matched_services:
+    LOG.warning(
+        "DUMP leader_only: flow services in ZK but no leader IP parsed: %s",
+        ",".join(matched_services))
   return ips
 
 
+def _local_svm_ips():
+  """Local PCVM management IPs that belong to this SVM (IPv4 and/or IPv6)."""
+  cluster_ips = _cluster_svm_ips()
+  cluster_set = set(cluster_ips)
+  found, seen = [], set()
+
+  def _add(ip):
+    nip = _normalize_ip(ip)
+    if not nip or nip in seen:
+      return
+    if cluster_set and nip not in cluster_set:
+      return
+    seen.add(nip)
+    found.append(nip)
+
+  hostname_ip = _ip_from_hostname()
+  if hostname_ip and (not cluster_set or hostname_ip in cluster_set):
+    _add(hostname_ip)
+  for ip in _local_interface_ips():
+    _add(ip)
+  return found
+
+
 def _local_svm_ip():
-  host = (socket.gethostname() or "").lower()
-  match = re.search(r"(\d+-\d+-\d+-\d+)", host)
-  if match:
-    ip = match.group(1).replace("-", ".")
-    if IPV4_RE.match(ip):
-      return ip
-  svmips = _zk_tool("svmips")
-  if svmips:
-    rc, out, _err = _run([svmips, "-d"], 20)
-    if rc == 0:
-      for line in (out or "").splitlines():
-        parts = line.split()
-        if len(parts) >= 2 and IPV4_RE.match(parts[0]):
-          return parts[0]
-  return ""
+  ips = _local_svm_ips()
+  return ips[0] if ips else ""
 
 
 def flow_dump_leader_status():
-  local_ip = _local_svm_ip()
-  if not local_ip:
+  local_ips = _local_svm_ips()
+  if not local_ips:
     return "error", "could not determine local SVM IP"
   leader_ips = _collect_flow_leader_ips()
   if not leader_ips:
     return "error", "could not determine flow leader from Zookeeper"
-  if local_ip in leader_ips:
+  if set(local_ips) & set(leader_ips):
     return "run", ""
   return "skip", "not leader (flow leaders=%s local=%s)" % (
-      ",".join(leader_ips), local_ip)
+      ",".join(leader_ips), ",".join(local_ips))
 
 
 def is_recognized_dump_dir(path):
@@ -506,7 +665,7 @@ def _kubectl_bin():
 
 def _kubectl_prefix(kubeconfig=""):
   kubectl = _kubectl_bin()
-  for prefix in (["sudo", "-n", kubectl], ["sudo", kubectl], [kubectl]):
+  for prefix in (["sudo", "-n", kubectl], [kubectl]):
     rc, _out, _err = _run(prefix + ["get", "ns"], 20)
     if rc == 0:
       break
@@ -706,7 +865,7 @@ def _flow_python():
 def dump_service_groups(output_dir, timeout, info, kubeconfig="", ns="", pod=""):
   errors = {}
   rec = {"ran": True, "rpc": "ServiceGroupGet", "transport": "", "errors": errors}
-  timeout = max(60, min(300, int(timeout or 1800)))
+  timeout = max(60, min(1800, int(timeout or 1800)))
   payload = None
   last_err = None
   for attempt in range(1, 4):
@@ -980,7 +1139,8 @@ def _ahv_open(host, path, crt, key, timeout, accept="application/octet-stream"):
   ctx = ssl._create_unverified_context()
   ctx.load_cert_chain(crt, key)
   url = "https://%s:%s/api%s" % (
-      host, AHV_PORT, path if path.startswith("/") else "/" + path)
+      _ip_for_url(host), AHV_PORT,
+      path if path.startswith("/") else "/" + path)
   req = Request(url, headers={"Accept": accept, "Accept-Encoding": "identity"})
   return urlopen(req, context=ctx, timeout=timeout)
 
@@ -1003,13 +1163,17 @@ def _hypervisor_ips():
   rc, out, err = _run([ncli, "host", "list"], 60)
   if rc != 0:
     _prc, out, err = _bash("ncli host list", 60)
-  ips = []
+  ips, seen = [], set()
   for match in re.finditer(
       r"Hypervisor(?: IP)?(?: Address)?\s*:\s*(\S+)",
       "%s\n%s" % (out, err), re.I):
     ip_addr = match.group(1).strip().strip("[],;\"'")
-    if IPV4_RE.match(ip_addr) and ip_addr not in ips:
-      ips.append(ip_addr)
+    if not _is_usable_ip(ip_addr):
+      continue
+    nip = _normalize_ip(ip_addr)
+    if nip and nip not in seen:
+      seen.add(nip)
+      ips.append(nip)
   return ips
 
 
@@ -1057,19 +1221,27 @@ def _ahv_extract(host, cls, dest_dir, crt, key, timeout):
   return saved
 
 
-def _ahv_one(ip_addr, dest_root, crt, key, class_timeout):
-  host_dir = os.path.join(dest_root, ip_addr)
+def _ahv_one(ip_addr, dest_root, crt, key, class_timeout, deadline=0):
+  host_dir = os.path.join(dest_root, _ip_for_path(ip_addr))
   os.makedirs(host_dir, exist_ok=True)
   rec = {"ip": ip_addr, "classes": [], "files": 0, "error": ""}
+  if deadline and time.time() >= deadline:
+    rec["error"] = "AHV gateway overall timeout exceeded"
+    return rec
   try:
     classes = _ahv_classes(ip_addr, crt, key, 30)
     rec["classes"] = classes
     n = 0
     errs = []
     for cls in classes:
+      if deadline and time.time() >= deadline:
+        errs.append("%s:overall timeout" % cls)
+        break
+      remaining = (deadline - time.time()) if deadline else class_timeout
+      per_class = min(class_timeout, max(30, int(remaining)))
       try:
         saved = _ahv_extract(
-            ip_addr, cls, host_dir, crt, key, class_timeout)
+            ip_addr, cls, host_dir, crt, key, per_class)
         n += len(saved)
       except Exception as err:
         errs.append("%s:%s" % (cls, err))
@@ -1081,12 +1253,13 @@ def _ahv_one(ip_addr, dest_root, crt, key, class_timeout):
   return rec
 
 
-def dump_ahv(output_dir, workers, class_timeout):
+def dump_ahv(output_dir, workers, class_timeout, gw_timeout=1800):
   dest = os.path.join(output_dir, "ahv_gateway")
   os.makedirs(dest, exist_ok=True)
+  deadline = time.time() + max(60, int(gw_timeout))
   payload = {
       "ran": False, "transport": "ahv_gateway_mtls", "ssh_to_ahv": False,
-      "port": AHV_PORT, "hosts": [], "error": ""}
+      "port": AHV_PORT, "hosts": [], "error": "", "gw_timeout_secs": gw_timeout}
   crt, key, cert_dir = _ahv_certs()
   payload["cert_dir"] = cert_dir
   if not crt:
@@ -1102,9 +1275,23 @@ def dump_ahv(output_dir, workers, class_timeout):
   recs = []
   with ThreadPoolExecutor(max_workers=max(1, min(workers, len(ips)))) as pool:
     futs = [
-        pool.submit(_ahv_one, ip_addr, dest, crt, key, class_timeout)
+        pool.submit(
+            _ahv_one, ip_addr, dest, crt, key, class_timeout, deadline)
         for ip_addr in ips]
-    recs = [fut.result() for fut in futs]
+    wait_timeout = max(0, deadline - time.time())
+    done, pending = wait(futs, timeout=wait_timeout)
+    for fut in done:
+      try:
+        recs.append(fut.result(timeout=1))
+      except Exception as err:
+        recs.append({"ip": "", "error": str(err), "files": 0, "classes": []})
+    for fut in pending:
+      fut.cancel()
+      recs.append({
+          "ip": "", "error": "AHV gateway overall timeout exceeded",
+          "files": 0, "classes": []})
+  if pending and not payload.get("error"):
+    payload["error"] = "AHV gateway overall timeout exceeded"
   payload["hosts"] = recs
   payload["hosts_total"] = len(recs)
   payload["hosts_ok"] = sum(1 for rec in recs if rec.get("files"))
@@ -1175,13 +1362,19 @@ OVN_TARGETS = (
         "commands": (), "required": (),
     },
 )
-CMSP_OVN_SMART_RETRY_LIMIT = 2
+CMSP_OVN_SMART_RETRY_LIMIT = 1
+
+
+def _ovn_required(rec):
+  return bool(rec.get("required_target"))
 
 
 def _ovn_results_complete(results):
   if not results:
     return False
   for rec in results:
+    if not _ovn_required(rec):
+      continue
     if rec.get("pod_not_found"):
       return False
     if rec.get("missing"):
@@ -1197,11 +1390,31 @@ def _ovn_next_action(results, cmsp_ovn_wait, attempt,
     return "done"
   if cmsp_ovn_wait:
     return "retry"
-  if any(rec.get("pod_not_found") for rec in results):
+  if any(rec.get("pod_not_found") for rec in results if _ovn_required(rec)):
     return "break"
   if attempt >= retry_limit:
     return "break"
   return "retry"
+
+
+def _ovn_write_payload(output_dir, payload):
+  dest = os.path.join(output_dir, "cmsp_ovn")
+  _write_json(os.path.join(dest, "index.json"), payload)
+  _write_json(os.path.join(output_dir, "cmsp_ovn.json"), payload)
+  if payload.get("platform") == "smsp":
+    _write_json(os.path.join(output_dir, "smsp_ovn.json"), payload)
+
+
+def _ensure_dump_file_readable(path):
+  """kubectl cp via sudo leaves root-owned mode 640 files; Logbay reads as nutanix."""
+  if not path or not os.path.isfile(path):
+    return
+  try:
+    os.chmod(path, 0o644)
+    return
+  except OSError:
+    pass
+  _run(["sudo", "-n", "chmod", "644", path], 10)
 
 
 def _kubectl_cp(ns, pod, container, remote, dest, timeout, kubeconfig=""):
@@ -1212,11 +1425,15 @@ def _kubectl_cp(ns, pod, container, remote, dest, timeout, kubeconfig=""):
   extra.extend(["%s:%s" % (pod, remote), dest, "-c", container])
   rc, _out, err = _kubectl(extra, timeout, kubeconfig=kubeconfig)
   if rc == 0 and os.path.isfile(dest) and os.path.getsize(dest) > 0:
+    _ensure_dump_file_readable(dest)
     return True
   rc, _out, err = _kubectl(
       ["cp", "%s/%s:%s" % (ns or "default", pod, remote), dest, "-c", container],
       timeout, kubeconfig=kubeconfig)
-  return rc == 0 and os.path.isfile(dest) and os.path.getsize(dest) > 0
+  if rc == 0 and os.path.isfile(dest) and os.path.getsize(dest) > 0:
+    _ensure_dump_file_readable(dest)
+    return True
+  return False
 
 
 def _kubectl_exec_file(ns, pod, container, remote_argv, dest, timeout,
@@ -1227,13 +1444,17 @@ def _kubectl_exec_file(ns, pod, container, remote_argv, dest, timeout,
   extra.extend([pod, "-c", container, "--"] + list(remote_argv))
   rc, _out, err = _kubectl(
       extra, timeout, kubeconfig=kubeconfig, stdout_path=dest)
-  return rc == 0 and os.path.isfile(dest) and os.path.getsize(dest) > 0
+  ok = rc == 0 and os.path.isfile(dest) and os.path.getsize(dest) > 0
+  if ok:
+    _ensure_dump_file_readable(dest)
+  return ok
 
 
 def _ovn_target(target, dest_root, namespace, timeout, kubeconfig=""):
   rec = {
       "key": target["key"], "pod": "", "namespace": namespace,
-      "error": "", "missing": []}
+      "error": "", "missing": [],
+      "required_target": bool(target.get("required"))}
   dest_dir = os.path.join(dest_root, target["key"])
   cmd_dir = os.path.join(dest_dir, "commands")
   os.makedirs(cmd_dir, exist_ok=True)
@@ -1274,17 +1495,26 @@ def _ovn_target(target, dest_root, namespace, timeout, kubeconfig=""):
 def dump_ovn(output_dir, timeout, info, namespace="", cmsp_ovn_wait=False):
   dest = os.path.join(output_dir, "cmsp_ovn")
   os.makedirs(dest, exist_ok=True)
+  platform = info.get("platform") or "cmsp"
+  ovn_label = "smsp_ovn" if platform == "smsp" else "cmsp_ovn"
   payload = {
       "ran": False, "transport": "kubectl",
-      "platform": info.get("platform") or "cmsp",
+      "platform": platform,
       "ssh_to_ahv": False, "pods": [], "error": ""}
   kubeconfig = ""
-  if payload["platform"] == "smsp":
+  if platform == "smsp":
     kubeconfig, kube_err = _flow_kubeconfig(dest)
     if kubeconfig:
       payload["kubeconfig_source"] = "mspctl cluster kubeconfig flow"
     else:
       payload["kubeconfig_source"] = "failed: %s" % (kube_err or "")
+      payload["ran"] = True
+      payload["error"] = kube_err or "mspctl cluster kubeconfig flow failed"
+      LOG.info(
+          "DUMP %s fail-fast: flow kubeconfig failed: %s",
+          ovn_label, payload["error"])
+      _ovn_write_payload(output_dir, payload)
+      return payload
   deadline = time.time() + max(60, int(timeout))
   backoff = 2
   last = []
@@ -1302,13 +1532,15 @@ def dump_ovn(output_dir, timeout, info, namespace="", cmsp_ovn_wait=False):
         payload["error"] = ""
         break
       if action == "break":
-        if not cmsp_ovn_wait and any(rec.get("pod_not_found") for rec in last):
+        if not cmsp_ovn_wait and any(
+            rec.get("pod_not_found") for rec in last if _ovn_required(rec)):
           LOG.info(
-              "DUMP cmsp_ovn fail-fast: OVN pod not found, skipping retries")
+              "DUMP %s fail-fast: required OVN pod not found, skipping retries",
+              ovn_label)
         elif not cmsp_ovn_wait:
           LOG.info(
-              "DUMP cmsp_ovn fail-fast: retries exhausted after %s attempts",
-              smart_attempt + 1)
+              "DUMP %s fail-fast: retries exhausted after %s attempts",
+              ovn_label, smart_attempt + 1)
         break
       smart_attempt += 1
       sleep_for = min(backoff, max(0, int(deadline - time.time())))
@@ -1321,6 +1553,8 @@ def dump_ovn(output_dir, timeout, info, namespace="", cmsp_ovn_wait=False):
       payload["ran"] = True
     missing = []
     for rec in last:
+      if not _ovn_required(rec):
+        continue
       missing.extend(
           "%s:%s" % (rec.get("key"), n) for n in rec.get("missing") or [])
     if missing:
@@ -1331,8 +1565,7 @@ def dump_ovn(output_dir, timeout, info, namespace="", cmsp_ovn_wait=False):
         os.remove(kubeconfig)
       except Exception:
         pass
-  _write_json(os.path.join(dest, "index.json"), payload)
-  _write_json(os.path.join(output_dir, "cmsp_ovn.json"), payload)
+  _ovn_write_payload(output_dir, payload)
   return payload
 
 
@@ -1347,10 +1580,10 @@ def dump_pc(output_dir, workers=16, skip_idf=False, skip_ahv=False,
             cmsp_ovn_wait=False,
             fail_on_error=False, log_file="", combined_path=""):
   os.makedirs(output_dir, exist_ok=True)
-  write_dump_marker(output_dir)
   combined_path = combined_path or os.path.join(output_dir, "all.json")
   log_file = log_file or os.path.join(output_dir, "dump.log")
   _setup_logging(log_file)
+  write_dump_marker(output_dir)
   info = detect_platform()
   errors = {}
   index = {
@@ -1367,7 +1600,7 @@ def dump_pc(output_dir, workers=16, skip_idf=False, skip_ahv=False,
           dump_idfcli, output_dir, min(8, workers), idf_timeout)
     if not skip_ahv:
       futs["ahv_gateway"] = pool.submit(
-          dump_ahv, output_dir, ahv_workers, ahv_class_timeout)
+          dump_ahv, output_dir, ahv_workers, ahv_class_timeout, ahv_gw_timeout)
     if not skip_cmsp:
       futs["cmsp_ovn"] = pool.submit(
           dump_ovn, output_dir, cmsp_ovn_timeout, info, cmsp_ovn_namespace,
@@ -1388,6 +1621,8 @@ def dump_pc(output_dir, workers=16, skip_idf=False, skip_ahv=False,
           errors.update(index[name].get("errors") or {})
           if index[name].get("error"):
             errors[name] = index[name]["error"]
+          if name == "cmsp_ovn" and index[name].get("platform") == "smsp":
+            index["smsp_ovn"] = index[name]
       except Exception as err:
         errors[name] = str(err)
         index[name] = {"ran": False, "error": str(err)}
@@ -1429,9 +1664,6 @@ def build_parser():
   ap.add_argument("--skip_cmsp_ovn", action="store_true")
   ap.add_argument("--skip_atlas", action="store_true")
   ap.add_argument("--skip_flow_cli", action="store_true")
-  ap.add_argument("--skip_flow_proto", action="store_true", default=True)
-  ap.add_argument(
-      "--collect_flow_proto", action="store_false", dest="skip_flow_proto")
   ap.add_argument("--ahv_gateway_timeout_secs", type=int, default=1800)
   ap.add_argument("--ahv_gateway_class_timeout_secs", type=int, default=300)
   ap.add_argument("--ahv_gateway_workers", type=int, default=8)
@@ -1452,7 +1684,7 @@ def build_parser():
 
 def main(argv=None):
   argv = list(sys.argv if argv is None else argv)
-  args, _unknown = build_parser().parse_known_args(argv[1:])
+  args = build_parser().parse_args(argv[1:])
   _setup_logging()
   if args.leader_only:
     status, reason = flow_dump_leader_status()
@@ -1499,4 +1731,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
   sys.exit(main(sys.argv))
-
