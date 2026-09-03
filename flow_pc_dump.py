@@ -533,6 +533,41 @@ def prepare_output_dir(path):
       "refusing to delete" % path)
 
 
+def write_leader_skip_output(path, reason):
+  """Wipe a prior dump (if recognized) and leave a skip stub for Logbay collect.
+
+  Non-leaders exit before prepare_output_dir; without this, Logbay's file item
+  would archive a stale dump from an earlier run on that PCVM.
+  """
+  if not path or path in (".", "/", ""):
+    raise ValueError("unsafe output_dir: %s" % path)
+  if os.path.exists(path):
+    if not os.path.isdir(path):
+      raise RuntimeError("output_dir exists but is not a directory: %s" % path)
+    try:
+      entries = os.listdir(path)
+    except OSError as err:
+      raise RuntimeError("cannot read output_dir %s: %s" % (path, err))
+    if entries and not is_recognized_dump_dir(path):
+      raise RuntimeError(
+          "output_dir %s exists and does not look like a flow_pc_dump output; "
+          "refusing to delete" % path)
+    if entries:
+      shutil.rmtree(path)
+      LOG.info(
+          "Removed prior flow_pc_dump output at %s (leader_only skip)", path)
+  os.makedirs(path, exist_ok=True)
+  payload = {
+      "source": DUMP_SOURCE,
+      "skipped": True,
+      "skip_reason": reason or "not leader",
+      "dumped_at": datetime.utcnow().isoformat() + "Z",
+  }
+  _write_json(os.path.join(path, "all.json"), payload)
+  _write_json(os.path.join(path, "dump_errors.json"), {})
+  write_dump_marker(path)
+
+
 def write_dump_marker(output_dir):
   _write_json(os.path.join(output_dir, DUMP_MARKER), {
       "source": DUMP_SOURCE,
@@ -1690,6 +1725,12 @@ def main(argv=None):
     status, reason = flow_dump_leader_status()
     if status == "skip":
       LOG.info("skipped: %s", reason)
+      out = (args.output_dir or "").strip()
+      if out:
+        try:
+          write_leader_skip_output(out, reason)
+        except Exception as err:
+          LOG.warning("leader_only skip cleanup failed: %s", err)
       return 0
     if status == "error":
       LOG.error("leader_only: %s", reason)
