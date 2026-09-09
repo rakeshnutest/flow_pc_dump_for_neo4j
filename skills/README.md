@@ -14,3 +14,8 @@ Emits JSON with mandatory classes: L1/CRC, drops, link, SAR traffic,
 host pressure (iostat), ping. Missing sources → `EVIDENCE_INSUFFICIENT`.
 
 Start with `network-rca-orchestrator/SKILL.md` for the full chain.
+
+## Related tools
+
+Host SAR burst scanners and IPFIX/NetBIOS UDP traffic simulators live under
+`tools/sar_burst_analysis/` (see that directory’s README).
