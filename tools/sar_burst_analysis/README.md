@@ -9,6 +9,7 @@ synthetic UDP flow bursts to stress IPFIX / conntrack (new 5-tuple per packet).
 |------|---------|
 | `scan_sar_packet_bursts.sh` | List interface samples with rx/tx ≥ threshold (default 50k pkts/s) |
 | `analyze_sar_bursts.sh` | Top burst peaks + CPU `%sys` / `%soft` during ramp hour |
+| `analyze_udp_conntrack_pattern.sh` | AHV OVS conntrack dump: protocol mix, top UDP ports, NetBIOS 137 zones, diurnal estimate |
 | `simulate_ipfix_flow_burst.py` | High-CPS UDP to one dest; new socket/sport each packet |
 | `simulate_netbios_multidst.py` | NetBIOS-ish UDP cycling multiple dests (default UDP/137) |
 
@@ -30,7 +31,26 @@ PKT_THRESHOLD=50000 TOP_BURST_FLOOR=10000 RAMP_HOUR_PREFIX=08: bash analyze_sar_
 ```bash
 allssh "bash -s" < scan_sar_packet_bursts.sh
 allssh "bash -s" < analyze_sar_bursts.sh
+allssh "bash -s" < analyze_udp_conntrack_pattern.sh
 ```
+
+## AHV OVS conntrack UDP pattern analyzer
+
+Run **as root on AHV** (needs `ovs-appctl dpctl/dump-conntrack`). Locally:
+
+```bash
+bash analyze_udp_conntrack_pattern.sh
+```
+
+Or from a CVM across hosts:
+
+```bash
+allssh "bash -s" < analyze_udp_conntrack_pattern.sh
+```
+
+Stdout is **tee'd** to `/tmp/conntrack_analysis_<host>_<ts>.txt` on each host.
+
+Report sections: (1) table capacity & UDP timeout, (2) protocol distribution, (3) top UDP ports, (4) NetBIOS UDP 137 tuples/`zone=` (matches `sport=137` or `dport=137`), (5) estimated 24-hour diurnal UDP ranges. **Section 5 ranges are estimates scaled from the current UDP snapshot**, not measured historical samples.
 
 ## Correlate with AHV IPFIX exporter-cmd
 
