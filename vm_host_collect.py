@@ -6,7 +6,9 @@ Does **not** need flow_pc_dump.py, flow_pc_process.py, or flow_pc_map.py.
 
 Each JSON row is one NIC, with:
   vm, ip, nic, host, cluster,
-  vm_category, subnet_category, vpc_category,
+  vm_category / vm_category_uuid,
+  subnet_category / subnet_category_uuid,
+  vpc_category / vpc_category_uuid,
   vpc / vpc_uuid / vpc_type
 
   python3 vm_host_collect.py
@@ -417,17 +419,23 @@ def category_label(cat):
 
 
 def format_cats(cat_ids, extra_names, cat_by_id):
-  names, seen = [], set()
+  """Return (name_csv, uuid_csv) in the same order."""
+  names, uuids, seen = [], [], set()
   for cid in cat_ids or []:
+    if not cid or cid in seen:
+      continue
+    seen.add(cid)
     label = category_label(cat_by_id.get(cid) or {}) or cid
-    if label and label not in seen:
-      seen.add(label)
-      names.append(label)
+    names.append(label)
+    uuids.append(cid)
   for extra in extra_names or []:
-    if extra and extra not in seen:
-      seen.add(extra)
-      names.append(extra)
-  return ",".join(names)
+    if not extra or extra in seen or extra in names:
+      continue
+    # name-only fallback: keep CSV slots aligned with an empty UUID
+    seen.add(extra)
+    names.append(extra)
+    uuids.append("")
+  return ",".join(names), ",".join(uuids)
 
 
 def apply_caps(caps):
@@ -687,6 +695,12 @@ def inventory_rows(vms, nics, hosts, clusters, subnets, vpcs, categories, caps):
           "VLAN" if vpc_uuid == ALL_VLAN_VPC_UUID else (subnet_type or ""))
       sub_cap = cap_stores["subnet"].get(subnet_uuid) or {}
       vpc_cap = cap_stores["vpc"].get(vpc_uuid) or {}
+      vm_cat_names, vm_cat_uuids = format_cats(
+          vm_cap.get("ids"), vm_cap.get("names"), cat_by_id)
+      sub_cat_names, sub_cat_uuids = format_cats(
+          sub_cap.get("ids"), sub_cap.get("names"), cat_by_id)
+      vpc_cat_names, vpc_cat_uuids = format_cats(
+          vpc_cap.get("ids"), vpc_cap.get("names"), cat_by_id)
       rows.append({
           "vm": vm.get("name") or "",
           "vm_uuid": vm_uuid,
@@ -701,18 +715,15 @@ def inventory_rows(vms, nics, hosts, clusters, subnets, vpcs, categories, caps):
           "host_ip": host_rec.get("host_ip") or "",
           "cluster": cluster_name,
           "cluster_uuid": cluster_uuid,
-          "vm_category": format_cats(
-              vm_cap.get("ids"), vm_cap.get("names"), cat_by_id),
-          "subnet_category": format_cats(
-              sub_cap.get("ids"), sub_cap.get("names"), cat_by_id),
-          "vpc_category": format_cats(
-              vpc_cap.get("ids"), vpc_cap.get("names"), cat_by_id),
-          "vm_cat": format_cats(
-              vm_cap.get("ids"), vm_cap.get("names"), cat_by_id),
-          "subnet_cat": format_cats(
-              sub_cap.get("ids"), sub_cap.get("names"), cat_by_id),
-          "vpc_cat": format_cats(
-              vpc_cap.get("ids"), vpc_cap.get("names"), cat_by_id),
+          "vm_category": vm_cat_names,
+          "vm_category_uuid": vm_cat_uuids,
+          "subnet_category": sub_cat_names,
+          "subnet_category_uuid": sub_cat_uuids,
+          "vpc_category": vpc_cat_names,
+          "vpc_category_uuid": vpc_cat_uuids,
+          "vm_cat": vm_cat_names,
+          "subnet_cat": sub_cat_names,
+          "vpc_cat": vpc_cat_names,
           "vpc": vpc_name,
           "vpc_uuid": vpc_uuid,
           "vpc_type": vpc_type,
