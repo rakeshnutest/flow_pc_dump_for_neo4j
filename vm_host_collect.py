@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""PC collect: dump one JSON file (VM, IP, NIC, host, cluster).
+"""Standalone PC collect: VM / NIC / host / cluster + categories + VPC.
 
-System python3 on the PC. idfcli only.
+Runs on the PC with system python3. Uses idfcli only.
+Does **not** need flow_pc_dump.py, flow_pc_process.py, or flow_pc_map.py.
+
+Each JSON row is one NIC, with:
+  vm, ip, nic, host, cluster,
+  vm_category, subnet_category, vpc_category,
+  vpc / vpc_uuid / vpc_type
 
   python3 vm_host_collect.py
+  python3 vm_host_collect.py --out /tmp/vms.json
 """
 from __future__ import print_function
 
@@ -16,12 +23,16 @@ import subprocess
 import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+
 IDF_BINS = (
     "/home/docker/msp_controller/bootstrap/msp_tools/cmsp-scripts/idfcli",
     "/home/nutanix/bin/idfcli",
     "/usr/local/nutanix/bin/idfcli",
 )
 DEFAULT_OUT = "/tmp/vms.json"
+UUID_ZERO = "00000000-0000-0000-0000-000000000000"
+ALL_VLAN_VPC_UUID = "00000000-0000-0000-0000-000000000001"
+ALL_VLAN_VPC_NAME = "VLAN"
 
 
 def as_uuid(value):
@@ -201,7 +212,9 @@ def parse_idf_stdout(stdout):
   text = (stdout or b"").decode("utf-8", "replace") if isinstance(
       stdout, (bytes, bytearray)) else (stdout or "")
   if not text.strip():
-    return [], "empty stdout"
+    return [], ""
+  if text.strip().lower().startswith("notfound"):
+    return [], ""
   try:
     parsed = json.loads(text)
   except ValueError as exc:
@@ -275,6 +288,60 @@ def first_nonempty(types, binary, timeout, file_dir):
   return rows, errors
 
 
+def load_all(types, binary, timeout, file_dir):
+  errors, rows = [], []
+  for entity_type in types:
+    parsed, err = load_type(entity_type, binary, timeout, file_dir)
+    if err:
+      errors.append(err)
+    rows.extend(parsed or [])
+  return rows, errors
+
+
+def looks_uuid(text):
+  return bool(as_uuid(text))
+
+
+def prefer_human_key(old, new):
+  old = str(old or "").strip()
+  new = str(new or "").strip()
+  if new and not looks_uuid(new):
+    return new
+  if old and not looks_uuid(old):
+    return old
+  return new or old
+
+
+def category_ids_from_row(row):
+  raw = first_attr(row, "category_id_list", "category_ids", "categories", default=[])
+  ids = []
+  for item in as_list(raw):
+    if isinstance(item, dict):
+      cat_id = as_uuid(item.get("ext_id") or item.get("uuid"))
+    else:
+      cat_id = as_uuid(item)
+    if cat_id and cat_id not in ids:
+      ids.append(cat_id)
+  return ids
+
+
+def mapping_cat_names(row):
+  names = []
+  for item in as_list(first_attr(
+      row, "categories_mapping_list", "category_mapping_list", default=[])):
+    if isinstance(item, dict):
+      key = item.get("key") or item.get("name") or ""
+      value = item.get("value") or ""
+      text = ("%s:%s" % (key, value)).strip(":") if key or value else ""
+    else:
+      text = str(item).strip()
+    if not text or looks_uuid(text):
+      continue
+    if text not in names:
+      names.append(text)
+  return names
+
+
 def subnet_type_name(value, vpc_ref=None, vlan_id=None, advanced=None):
   if advanced is False:
     return "VLAN"
@@ -302,6 +369,86 @@ def as_bool(value, default=False):
   if text in ("false", "0", "no"):
     return False
   return default
+
+
+def vpc_name_from_subnet(name):
+  text = str(name or "").strip()
+  if not text:
+    return ""
+  lower = text.lower()
+  for token in ("_subnet_", "-subnet-"):
+    idx = lower.rfind(token)
+    if idx > 0:
+      return text[:idx]
+  return ""
+
+
+def vpc_display_name(vpc_ref, subnet_name=None, existing=""):
+  if vpc_ref == ALL_VLAN_VPC_UUID:
+    return ALL_VLAN_VPC_NAME
+  name = str(existing or "").strip()
+  if name and name.lower() not in ("unnamed", "(unnamed)", "none", "null"):
+    return name
+  inferred = vpc_name_from_subnet(subnet_name)
+  if inferred:
+    return inferred
+  ext = str(vpc_ref or "")
+  return ("VPC_%s" % ext[:8]) if ext else ""
+
+
+def cap_target(kind):
+  compact = str(kind or "").lower().replace(" ", "").replace("-", "_").lstrip("k")
+  if compact in ("vpc", "virtual_private_cloud") or (
+      "vpc" in compact and "subnet" not in compact and "route" not in compact):
+    return "vpc"
+  if compact in ("subnet", "virtual_network", "overlay_subnet"):
+    return "subnet"
+  if compact in ("vm", "mh_vm", "ahv_vm", "virtual_machine"):
+    return "vm"
+  return ""
+
+
+def category_label(cat):
+  key = str(cat.get("key") or "").strip()
+  value = str(cat.get("value") or "").strip()
+  if key and value:
+    return "%s:%s" % (key, value)
+  return key or value or cat.get("ext_id") or ""
+
+
+def format_cats(cat_ids, extra_names, cat_by_id):
+  names, seen = [], set()
+  for cid in cat_ids or []:
+    label = category_label(cat_by_id.get(cid) or {}) or cid
+    if label and label not in seen:
+      seen.add(label)
+      names.append(label)
+  for extra in extra_names or []:
+    if extra and extra not in seen:
+      seen.add(extra)
+      names.append(extra)
+  return ",".join(names)
+
+
+def apply_caps(caps):
+  stores = {"vm": {}, "subnet": {}, "vpc": {}}
+
+  def add(kind, eid, cats, names):
+    rec = stores[kind].setdefault(eid, {"ids": [], "names": []})
+    for cid in cats or []:
+      if cid and cid not in rec["ids"]:
+        rec["ids"].append(cid)
+    for name in names or []:
+      if name and name not in rec["names"]:
+        rec["names"].append(name)
+
+  for cap in caps or []:
+    target = cap_target(cap.get("kind"))
+    if not target:
+      continue
+    for eid in cap.get("ids") or []:
+      add(target, eid, cap.get("category_ids"), cap.get("category_names"))
+  return stores
 
 
 def map_vm(row):
@@ -366,11 +513,71 @@ def map_subnet(row):
       row, "is_advanced_networking", "advanced_networking",
       "advance_vlan", "is_advanced")
   advanced_bool = None if advanced in (None, "") else as_bool(advanced, False)
+  subnet_type = subnet_type_name(
+      first_attr(row, "subnet_type", "type"), vpc_ref, vlan_id, advanced_bool)
+  if advanced_bool is False:
+    subnet_type = "VLAN"
+    if not vpc_ref:
+      vpc_ref = ALL_VLAN_VPC_UUID
+  elif not vpc_ref and subnet_type == "VLAN":
+    vpc_ref = ALL_VLAN_VPC_UUID
   return {
       "ext_id": as_uuid(first_attr(row, "ext_id", "uuid", "id")),
       "name": str(first_attr(row, "name", "subnet_name") or ""),
-      "subnet_type": subnet_type_name(
-          first_attr(row, "subnet_type", "type"), vpc_ref, vlan_id, advanced_bool),
+      "subnet_type": subnet_type,
+      "vpc_uuid": vpc_ref or "",
+  }
+
+
+def map_vpc(row):
+  return {
+      "ext_id": as_uuid(first_attr(row, "ext_id", "uuid", "id")),
+      "name": str(first_attr(row, "name", "vpc_name") or ""),
+      "vpc_type": str(first_attr(row, "vpc_type", "type") or "REGULAR"),
+  }
+
+
+def map_category(row):
+  fq = str(first_attr(row, "fq_name") or "")
+  key = first_attr(row, "key", "category_key") or ""
+  value = first_attr(row, "value", "category_value") or ""
+  name = str(first_attr(row, "name", "user_specified_name") or "")
+  if fq and ":" in fq:
+    fq_key, fq_val = fq.split(":", 1)
+    key = prefer_human_key(key, fq_key)
+    if fq_val and not value:
+      value = fq_val
+  elif "/" in fq:
+    fq_key, fq_val = fq.split("/", 1)
+    key = prefer_human_key(key, fq_key)
+    if fq_val and not value:
+      value = fq_val
+  elif name and ":" in name:
+    nkey, nval = name.split(":", 1)
+    key = prefer_human_key(key, nkey)
+    if nval and not value:
+      value = nval
+  elif not value and name and name != key and not looks_uuid(name):
+    value = name
+  if not key and name and not looks_uuid(name) and ":" not in name:
+    key = name
+  if looks_uuid(key):
+    key = ""
+  return {
+      "ext_id": as_uuid(first_attr(row, "ext_id", "uuid", "id")),
+      "key": key,
+      "value": value,
+  }
+
+
+def map_cap(row):
+  uid = as_uuid(first_attr(row, "kind_id"))
+  return {
+      "ext_id": as_uuid(first_attr(row, "ext_id", "uuid", "id")) or uid,
+      "kind": str(first_attr(row, "kind") or "").lower(),
+      "ids": [uid] if uid else [],
+      "category_ids": category_ids_from_row(row),
+      "category_names": mapping_cat_names(row),
   }
 
 
@@ -386,10 +593,23 @@ def unique_mapped(rows, mapper):
   return out
 
 
-  return out
+def merge_categories(rows):
+  by_id = {}
+  for rec in rows or []:
+    uid = rec.get("ext_id") or ""
+    if not uid:
+      continue
+    prev = by_id.get(uid)
+    if prev is None:
+      by_id[uid] = rec
+      continue
+    prev["key"] = prefer_human_key(prev.get("key"), rec.get("key"))
+    if not prev.get("value"):
+      prev["value"] = rec.get("value") or ""
+  return list(by_id.values())
 
 
-def inventory_rows(vms, nics, hosts, clusters, subnets):
+def inventory_rows(vms, nics, hosts, clusters, subnets, vpcs, categories, caps):
   cluster_names = {}
   for rec in clusters:
     if rec.get("ext_id"):
@@ -407,6 +627,28 @@ def inventory_rows(vms, nics, hosts, clusters, subnets):
         "cluster": rec.get("cluster") or cluster_names.get(cluster_uuid, ""),
     }
   sub_by = {rec["ext_id"]: rec for rec in subnets if rec.get("ext_id")}
+  cat_by_id = {rec["ext_id"]: rec for rec in categories or [] if rec.get("ext_id")}
+  cap_stores = apply_caps(caps)
+  vpc_by = {rec["ext_id"]: rec for rec in vpcs or [] if rec.get("ext_id")}
+  for rec in subnets or []:
+    vpc_uuid = rec.get("vpc_uuid") or ""
+    if not vpc_uuid or vpc_uuid == ALL_VLAN_VPC_UUID:
+      continue
+    if vpc_uuid not in vpc_by:
+      vpc_by[vpc_uuid] = {
+          "ext_id": vpc_uuid,
+          "name": vpc_name_from_subnet(rec.get("name") or ""),
+          "vpc_type": "REGULAR",
+      }
+    elif not vpc_by[vpc_uuid].get("name"):
+      inferred = vpc_name_from_subnet(rec.get("name") or "")
+      if inferred:
+        vpc_by[vpc_uuid]["name"] = inferred
+  vpc_by.setdefault(ALL_VLAN_VPC_UUID, {
+      "ext_id": ALL_VLAN_VPC_UUID,
+      "name": ALL_VLAN_VPC_NAME,
+      "vpc_type": "VLAN",
+  })
   nics_by_vm = {}
   for nic in nics:
     vm_id = nic.get("vm") or ""
@@ -430,9 +672,21 @@ def inventory_rows(vms, nics, hosts, clusters, subnets):
           "ips": vm.get("ips") or [],
           "subnet_id": vm.get("subnet_id") or "",
       }]
+    vm_cap = cap_stores["vm"].get(vm_uuid) or {}
     for nic in vm_nics:
       subnet_uuid = nic.get("subnet_id") or ""
       dump_sub = sub_by.get(subnet_uuid) or {}
+      subnet_type = str(dump_sub.get("subnet_type") or "")
+      vpc_uuid = dump_sub.get("vpc_uuid") or ""
+      if subnet_type.upper() == "VLAN":
+        vpc_uuid = ALL_VLAN_VPC_UUID
+      vpc_rec = vpc_by.get(vpc_uuid) or {}
+      vpc_name = vpc_display_name(
+          vpc_uuid, dump_sub.get("name"), vpc_rec.get("name") or "")
+      vpc_type = vpc_rec.get("vpc_type") or (
+          "VLAN" if vpc_uuid == ALL_VLAN_VPC_UUID else (subnet_type or ""))
+      sub_cap = cap_stores["subnet"].get(subnet_uuid) or {}
+      vpc_cap = cap_stores["vpc"].get(vpc_uuid) or {}
       rows.append({
           "vm": vm.get("name") or "",
           "vm_uuid": vm_uuid,
@@ -441,12 +695,27 @@ def inventory_rows(vms, nics, hosts, clusters, subnets):
           "ip": ",".join(nic.get("ips") or []),
           "subnet": dump_sub.get("name") or "",
           "subnet_uuid": subnet_uuid,
-          "subnet_type": dump_sub.get("subnet_type") or "",
+          "subnet_type": subnet_type,
           "host": host_rec.get("host") or "",
           "host_uuid": host_uuid,
           "host_ip": host_rec.get("host_ip") or "",
           "cluster": cluster_name,
           "cluster_uuid": cluster_uuid,
+          "vm_category": format_cats(
+              vm_cap.get("ids"), vm_cap.get("names"), cat_by_id),
+          "subnet_category": format_cats(
+              sub_cap.get("ids"), sub_cap.get("names"), cat_by_id),
+          "vpc_category": format_cats(
+              vpc_cap.get("ids"), vpc_cap.get("names"), cat_by_id),
+          "vm_cat": format_cats(
+              vm_cap.get("ids"), vm_cap.get("names"), cat_by_id),
+          "subnet_cat": format_cats(
+              sub_cap.get("ids"), sub_cap.get("names"), cat_by_id),
+          "vpc_cat": format_cats(
+              vpc_cap.get("ids"), vpc_cap.get("names"), cat_by_id),
+          "vpc": vpc_name,
+          "vpc_uuid": vpc_uuid,
+          "vpc_type": vpc_type,
       })
   return rows
 
@@ -456,8 +725,9 @@ def log(msg):
 
 
 def collect(binary, timeout, file_dir, workers):
-  def _group(name, types, mapper):
-    raw, errors = first_nonempty(types, binary, timeout, file_dir)
+  def _group(name, types, mapper, merge=False):
+    loader = load_all if merge else first_nonempty
+    raw, errors = loader(types, binary, timeout, file_dir)
     for err in errors:
       log("WARN %s" % err)
     mapped = unique_mapped(raw, mapper)
@@ -475,31 +745,64 @@ def collect(binary, timeout, file_dir, workers):
         _group, "clusters", ("cluster",), map_cluster)
     fut_subnets = pool.submit(
         _group, "subnets", ("virtual_network", "subnet"), map_subnet)
+    fut_vpcs = pool.submit(
+        _group, "vpcs", ("vpc", "virtual_private_cloud"), map_vpc)
+    fut_caps = pool.submit(
+        _group, "caps",
+        ("abac_entity_capability", "volume_group_entity_capability"),
+        map_cap, True)
+
+    def _categories():
+      raw, errors = load_all(
+          ("abac_category", "category"), binary, timeout, file_dir)
+      for err in errors:
+        log("WARN %s" % err)
+      mapped = [map_category(row) for row in raw]
+      merged = merge_categories(mapped)
+      log("idfcli categories raw=%s mapped=%s" % (len(raw), len(merged)))
+      return merged
+
+    fut_cats = pool.submit(_categories)
     vms = fut_vms.result()
     nics = fut_nics.result()
     hosts = fut_hosts.result()
     clusters = fut_clusters.result()
     subnets = fut_subnets.result()
-  return inventory_rows(vms, nics, hosts, clusters, subnets)
+    vpcs = fut_vpcs.result()
+    caps = fut_caps.result()
+    categories = fut_cats.result()
+  return inventory_rows(
+      vms, nics, hosts, clusters, subnets, vpcs, categories, caps)
 
 
 def main(argv=None):
   ap = argparse.ArgumentParser(
-      description="Dump VM/IP/NIC/host/cluster JSON via idfcli.")
+      description="Dump VM/IP/NIC/host/cluster/category/VPC JSON via idfcli.")
   ap.add_argument(
       "--out", default=DEFAULT_OUT,
       help="JSON path. Default: %s" % DEFAULT_OUT)
   ap.add_argument("--idfcli", default="", help="idfcli binary path.")
+  ap.add_argument(
+      "--idfcli_dir", default="",
+      help="Read idfcli/*.json instead of running idfcli.")
   ap.add_argument("--timeout_secs", type=int, default=180)
-  ap.add_argument("--workers", type=int, default=5)
+  ap.add_argument("--workers", type=int, default=8)
   args = ap.parse_args(argv)
+  file_dir = os.path.abspath(args.idfcli_dir) if args.idfcli_dir else ""
   binary = idfcli_bin(args.idfcli)
-  if not shutil.which(binary) and not (
-      os.path.exists(binary) and os.access(binary, os.X_OK)):
-    log("idfcli not found (tried %s)" % binary)
-    return 2
-  log("idfcli %s" % binary)
-  rows = collect(binary, max(30, int(args.timeout_secs)), "", args.workers)
+  if not file_dir:
+    if not shutil.which(binary) and not (
+        os.path.exists(binary) and os.access(binary, os.X_OK)):
+      log("idfcli not found (tried %s)" % binary)
+      return 2
+    log("idfcli %s" % binary)
+  else:
+    if not os.path.isdir(file_dir):
+      log("need idfcli dir %s" % file_dir)
+      return 2
+    log("idfcli_dir %s" % file_dir)
+  rows = collect(
+      binary, max(30, int(args.timeout_secs)), file_dir, args.workers)
   if not rows:
     log("no VMs from idfcli")
     return 2
@@ -510,7 +813,12 @@ def main(argv=None):
   with open(out_path, "w") as handle:
     json.dump(rows, handle, indent=2)
     handle.write("\n")
-  log("wrote %s rows=%s" % (out_path, len(rows)))
+  with_vm_cat = sum(1 for row in rows if row.get("vm_cat"))
+  with_subnet_cat = sum(1 for row in rows if row.get("subnet_cat"))
+  with_vpc_cat = sum(1 for row in rows if row.get("vpc_cat"))
+  with_vpc = sum(1 for row in rows if row.get("vpc_uuid"))
+  log("wrote %s rows=%s with_vm_cat=%s with_subnet_cat=%s with_vpc_cat=%s with_vpc=%s" % (
+      out_path, len(rows), with_vm_cat, with_subnet_cat, with_vpc_cat, with_vpc))
   return 0
 
 
