@@ -1791,8 +1791,11 @@ def load_port_set_ip_map(dump_dir, explicit=""):
 
 def find_collect_script():
     here = os.path.dirname(os.path.abspath(__file__))
+    cwd = os.getcwd()
     for path in (
             os.path.join(here, "vm_host_collect_port_set.py"),
+            os.path.join(cwd, "vm_host_collect_port_set.py"),
+            os.path.join(DEFAULT_OUTPUT_BASE, "vm_host_collect_port_set.py"),
             os.path.join(os.path.dirname(here), "policy_port_set",
                          "vm_host_collect_port_set.py"),
             os.path.join(os.path.dirname(here), "flow_pc_dump_github",
@@ -1878,6 +1881,58 @@ def build_policy_json(policies_out, global_uuid, vlan_uuid, include_project,
     return payload, stats
 
 
+def _compact_json_array(items, col, width=120):
+    quoted = [json.dumps(str(item), ensure_ascii=False) for item in items]
+    if not quoted:
+        return "[]"
+    chunks, row, row_len = [], [], 0
+    for item in quoted:
+        extra = len(item) if not row else len(item) + 2
+        if row and col + 1 + row_len + extra > width:
+            chunks.append(", ".join(row))
+            row, row_len = [item], len(item)
+        else:
+            row.append(item)
+            row_len += extra
+    if row:
+        chunks.append(", ".join(row))
+    if len(chunks) == 1:
+        return "[" + chunks[0] + "]"
+    pad = " " * (col + 1)
+    return "[" + (",\n" + pad).join(chunks) + "]"
+
+
+def dump_policy_json(payload, handle, compact_keys=("ip_list",)):
+    """Pretty-print JSON but keep ip_list (and similar) horizontal."""
+    bags = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            out = {}
+            for key, val in node.items():
+                if key in compact_keys and isinstance(val, list):
+                    bags.append(list(val))
+                    out[key] = "__COMPACT_LIST_%d__" % (len(bags) - 1)
+                else:
+                    out[key] = walk(val)
+            return out
+        if isinstance(node, list):
+            return [walk(item) for item in node]
+        return node
+
+    text = json.dumps(walk(payload), indent=2, ensure_ascii=False)
+    for idx, items in enumerate(bags):
+        needle = '"__COMPACT_LIST_%d__"' % idx
+        pos = text.find(needle)
+        if pos < 0:
+            continue
+        col = pos - (text.rfind("\n", 0, pos) + 1)
+        text = text[:pos] + _compact_json_array(items, col) + text[pos + len(needle):]
+    handle.write(text)
+    if not text.endswith("\n"):
+        handle.write("\n")
+
+
 def run_build(dump_dir, global_uuid, vlan_uuid, include_project, json_path,
               policy_path="", proto_out="", in_place=False, ps_ip_map=None):
     policies, proto_lines = load_policies(dump_dir, policy_path)
@@ -1914,8 +1969,7 @@ def run_build(dump_dir, global_uuid, vlan_uuid, include_project, json_path,
     os.makedirs(dest_dir, exist_ok=True)
     tmp_path = json_path + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
-        handle.write("\n")
+        dump_policy_json(payload, handle)
     os.replace(tmp_path, json_path)
     proto_path = ""
     if proto_lines is not None:
@@ -2049,6 +2103,12 @@ def self_test():
     catalog = (payload.get("port_sets") or {}).get(expect) or {}
     if catalog.get("ip_list") != ["142.58.233.98", "10.28.2.149"]:
         raise SystemExit("policy.json port_sets catalog missing ips: %s" % catalog)
+    with open(json_path, encoding="utf-8") as handle:
+        raw = handle.read()
+    if '"ip_list": [\n' in raw:
+        raise SystemExit("ip_list should be horizontal, got vertical")
+    if '"ip_list": ["142.58.233.98", "10.28.2.149"]' not in raw:
+        raise SystemExit("ip_list not one-line")
     if stats.get("port_sets_with_ips") != 1:
         raise SystemExit("port_sets_with_ips %s" % stats)
     proto = (
@@ -2098,7 +2158,7 @@ def parse_args():
             "Dump Flow policies (CMSP/SMSP) and write policy.json with "
             "port_set + ip_list, address_set, unmarshalled groups"))
     parser.add_argument(
-        "--from-pc", action="store_true",
+        "--from-pc", "--self-pc", action="store_true", dest="from_pc",
         help="Collect port-set IPs, dump policies, write /tmp/policy.json")
     parser.add_argument("--policy", default="",
                         help="Proto-text or policy.get JSON")
@@ -2155,9 +2215,14 @@ def resolve_uuids(args, dump_dir):
         loaded_global, loaded_vlan = load_unique_uuids(uuid_path)
         global_uuid = global_uuid or loaded_global
         vlan_uuid = vlan_uuid or loaded_vlan
+    if (not global_uuid or not vlan_uuid) and dump_dir:
+        os.makedirs(dump_dir, exist_ok=True)
+        rec = dump_unique_uuids(dump_dir, detect_platform())
+        global_uuid = global_uuid or rec.get("global_unique_uuid") or ""
+        vlan_uuid = vlan_uuid or rec.get("vlan_unique_uuid") or ""
     if not global_uuid or not vlan_uuid:
         raise SystemExit(
-            "need --global-uuid and --vlan-uuid, or unique_uuids.json from PC dump")
+            "need unique_uuids.json. On the PC run: python3 update_policy_port_sets.py --from-pc")
     return global_uuid, vlan_uuid
 
 
@@ -2175,7 +2240,11 @@ def main():
         self_test()
         return
     dump_dir = args.dump_dir or args.output_dir or ""
-    if args.from_pc:
+    from_pc = args.from_pc
+    if dump_dir and not args.policy:
+        if not os.path.isfile(os.path.join(dump_dir, "policy_get.json")):
+            from_pc = True
+    if from_pc:
         dump_dir = args.output_dir or args.dump_dir or DEFAULT_OUTPUT_BASE
         os.makedirs(dump_dir, exist_ok=True)
         run_collect(dump_dir, workers=args.workers, timeout=args.timeout)
@@ -2183,7 +2252,7 @@ def main():
         LOG.info("dump done platform=%s errors=%s",
                  rec.get("platform"), rec.get("errors") or {})
     if not dump_dir and not args.policy:
-        raise SystemExit("need --from-pc, --dump_dir, or --policy")
+        raise SystemExit("on the PC run: python3 update_policy_port_sets.py --from-pc")
     if args.policy and not dump_dir:
         dump_dir = os.path.dirname(os.path.abspath(args.policy)) or "."
     global_uuid, vlan_uuid = resolve_uuids(args, dump_dir)
