@@ -104,7 +104,28 @@ Identity is **port-set UUID**. Names are display. A FAIL with four Atlas
 leftover empty-NIC UUIDs (`App_680_No_VMs` / `App_681_No_VMs`) is the
 known leftover set, not a dump failure.
 
-### 7. Optional: leftover observations
+### 7. Annotate proto `policy_list.json` with port-set UUIDs
+
+Standalone. Stdlib only. No nutest, no neo4j, no ClickHouse.
+
+Uses the same APPLICATION uuid5 as `FnsPortSetValidator._generate_port_set_id`.
+Scope UUIDs come from dump `unique_uuids.json` (zkcat
+`/appliance/logical/flow/global_unique_uuid` and `vlan_unique_uuid`).
+
+```bash
+python3 clickhouse_flow/update_policy_port_sets.py --self-test
+python3 clickhouse_flow/update_policy_port_sets.py --dump_dir "$DUMP"
+# or:
+python3 clickhouse_flow/update_policy_port_sets.py \
+  --policy /path/to/policy_list.json \
+  --global-uuid <global_unique_uuid> \
+  --vlan-uuid <vlan_unique_uuid>
+```
+
+Writes `port_set_uuid` onto each `endpoint` / `secured_group` in the rule.
+Output: `<policy>.port_sets.pbtxt` and `<policy>.port_sets.json`.
+
+### 8. Optional: leftover observations
 
 ```bash
 cd "$REPO"
