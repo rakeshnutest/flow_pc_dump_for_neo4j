@@ -72,6 +72,10 @@ Self-contained. Stdlib + `clickhouse-client`. No nutest, no neo4j.
 ```text
 python3 ingest.py --dump_dir /path/to/dump --log_bundle_id 123
 python3 compare.py --log_bundle_id 123
+python3 ../policy_port_set/update_policy_port_sets.py --self-test
+python3 ../policy_port_set/update_policy_port_sets.py --from-pc
+# /tmp/policy.json has port_set then ip_list for every hashed component
+python3 ../policy_port_set/update_policy_port_sets.py --dump_dir /path/to/dump
 # re-ingest the same dump: DROP PARTITION 123 only, other bundles stay
 python3 ingest.py --dump_dir /path/to/dump --log_bundle_id 123
 # first migration from unpartitioned tables:
