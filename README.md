@@ -104,37 +104,45 @@ Identity is **port-set UUID**. Names are display. A FAIL with four Atlas
 leftover empty-NIC UUIDs (`App_680_No_VMs` / `App_681_No_VMs`) is the
 known leftover set, not a dump failure.
 
-### 7. `policy.json` with port_set, address_set, address_group, service_group
+### 7. `policy.json` with port_set + ip_list, address_set, groups
 
-Standalone. Stdlib only. No nutest, no neo4j, no ClickHouse. Copy
-`clickhouse_flow/update_policy_port_sets.py` **and** `flow_pc_dump.py` to the
-PC. CMSP uses local `flow_cli` / zkcat / Flow venv `ServiceGroupGet`. SMSP
-uses kratos kubectl or `ws://smsp-<uuid>.ntnx-ikat.svc:2051/flow_cli` and
-atlas ZK unique UUIDs (same as `flow_pc_dump.py`).
+One folder: `policy_port_set/`. Copy that folder to the PC. Stdlib only.
+No nutest, no neo4j, no ClickHouse, no `flow_pc_dump.py`. Default output
+is `/tmp`. `--from-pc` collects port-set→IP, dumps policies, and writes
+`/tmp/policy.json` on its own (unique UUIDs, AG, SG, every member IP).
 
 On the PC:
 
 ```bash
-python3 update_policy_port_sets.py --from-pc
-# default output: /home/nutanix/upgrade/policy_dump/policy.json
+python3 policy_port_set/update_policy_port_sets.py --from-pc
+# /tmp/vms_port_set.json
+# /tmp/port_set_ips.json
+# /tmp/policy.json
+```
+
+Or run collect first, then dump (same `/tmp` files):
+
+```bash
+python3 policy_port_set/vm_host_collect_port_set.py
+python3 policy_port_set/update_policy_port_sets.py --from-pc
 ```
 
 From an existing dump (workstation):
 
 ```bash
-python3 clickhouse_flow/update_policy_port_sets.py --self-test
-python3 clickhouse_flow/update_policy_port_sets.py --dump_dir "$DUMP"
+python3 policy_port_set/update_policy_port_sets.py --self-test
+python3 policy_port_set/update_policy_port_sets.py --dump_dir "$DUMP"
 ```
 
 `policy.json` unmarshalls every rule component:
 
-- `port_set_uuid` — EG / VM / SUBNET / VPC category (`uuid5` APPLICATION)
+- `port_set` then `ip_list` — EG / VM / SUBNET / VPC category (`uuid5` APPLICATION) and every NIC IP in that port-set
 - `address_set` / `address_set_uuid` — address_group (`uuid5(ag, "IPv4"|"IPv6")`)
 - `address_group.addresses` — all CIDRs, ranges, FQDNs
 - `services[].service_group` — TCP/UDP/ICMP port details
+- top-level `port_sets` — full port_set → ip_list map
 
-vlan/global unique UUIDs come from PC `unique_uuids.json` unless you pass
-`--global-uuid` / `--vlan-uuid`.
+vlan/global unique UUIDs come from PC `unique_uuids.json`.
 
 ### 8. Optional: leftover observations
 
