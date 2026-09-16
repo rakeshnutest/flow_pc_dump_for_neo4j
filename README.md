@@ -104,26 +104,37 @@ Identity is **port-set UUID**. Names are display. A FAIL with four Atlas
 leftover empty-NIC UUIDs (`App_680_No_VMs` / `App_681_No_VMs`) is the
 known leftover set, not a dump failure.
 
-### 7. Annotate proto `policy_list.json` with port-set UUIDs
+### 7. `policy.json` with port_set, address_set, address_group, service_group
 
-Standalone. Stdlib only. No nutest, no neo4j, no ClickHouse.
+Standalone. Stdlib only. No nutest, no neo4j, no ClickHouse. Copy
+`clickhouse_flow/update_policy_port_sets.py` **and** `flow_pc_dump.py` to the
+PC. CMSP uses local `flow_cli` / zkcat / Flow venv `ServiceGroupGet`. SMSP
+uses kratos kubectl or `ws://smsp-<uuid>.ntnx-ikat.svc:2051/flow_cli` and
+atlas ZK unique UUIDs (same as `flow_pc_dump.py`).
 
-Uses the same APPLICATION uuid5 as `FnsPortSetValidator._generate_port_set_id`.
-Scope UUIDs come from dump `unique_uuids.json` (zkcat
-`/appliance/logical/flow/global_unique_uuid` and `vlan_unique_uuid`).
+On the PC:
+
+```bash
+python3 update_policy_port_sets.py --from-pc
+# default output: /home/nutanix/upgrade/policy_dump/policy.json
+```
+
+From an existing dump (workstation):
 
 ```bash
 python3 clickhouse_flow/update_policy_port_sets.py --self-test
 python3 clickhouse_flow/update_policy_port_sets.py --dump_dir "$DUMP"
-# or:
-python3 clickhouse_flow/update_policy_port_sets.py \
-  --policy /path/to/policy_list.json \
-  --global-uuid <global_unique_uuid> \
-  --vlan-uuid <vlan_unique_uuid>
 ```
 
-Writes `port_set_uuid` onto each `endpoint` / `secured_group` in the rule.
-Output: `<policy>.port_sets.pbtxt` and `<policy>.port_sets.json`.
+`policy.json` unmarshalls every rule component:
+
+- `port_set_uuid` — EG / VM / SUBNET / VPC category (`uuid5` APPLICATION)
+- `address_set` / `address_set_uuid` — address_group (`uuid5(ag, "IPv4"|"IPv6")`)
+- `address_group.addresses` — all CIDRs, ranges, FQDNs
+- `services[].service_group` — TCP/UDP/ICMP port details
+
+vlan/global unique UUIDs come from PC `unique_uuids.json` unless you pass
+`--global-uuid` / `--vlan-uuid`.
 
 ### 8. Optional: leftover observations
 

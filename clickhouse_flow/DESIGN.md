@@ -74,6 +74,8 @@ python3 ingest.py --dump_dir /path/to/dump --log_bundle_id 123
 python3 compare.py --log_bundle_id 123
 python3 update_policy_port_sets.py --self-test
 python3 update_policy_port_sets.py --dump_dir /path/to/dump
+# on the PC (copy with flow_pc_dump.py): writes policy.json
+python3 update_policy_port_sets.py --from-pc
 # re-ingest the same dump: DROP PARTITION 123 only, other bundles stay
 python3 ingest.py --dump_dir /path/to/dump --log_bundle_id 123
 # first migration from unpartitioned tables:
