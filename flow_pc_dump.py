@@ -3,7 +3,8 @@
 # Copyright (c) 2026 Nutanix Inc. All rights reserved.
 #
 # PC collect only. Copy this file to the PC. System python3. No Flow venv.
-#   python3 flow_pc_dump.py --output_dir /home/nutanix/upgrade/flow_pc_dump
+#   python3 flow_pc_dump.py
+#   python3 flow_pc_dump.py --leader_only --output_dir /home/nutanix/upgrade/flow_pc_dump
 #
 # Write command stdout and AHV/OVS tarball members as-is. No flatten, no
 # unwrap, no proto-to-v4. Convert locally:
@@ -19,6 +20,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -29,7 +32,17 @@ from datetime import datetime
 from urllib.request import Request, urlopen
 
 LOG = logging.getLogger("flow_pc_dump")
-DEFAULT_OUTPUT = "/home/nutanix/upgrade/flow_pc_dump"
+DUMP_SOURCE = "flow_pc_dump"
+DUMP_MARKER = ".flow_pc_dump"
+DEFAULT_OUTPUT_BASE = "/home/nutanix/upgrade/flow_pc_dump"
+FLOW_LEADER_ZK_ROOTS = (
+    "/appliance/logical/leaders",
+    "/appliance/logical/pyleaders",
+    "/appliance/logical/goleaders",
+)
+JAVA_LEADER_RE = re.compile(
+    r"Handle:\s*(\d{1,3}(?:\.\d{1,3}){3}):\d+.*Currently leader \(Y/N\):\s*Yes",
+    re.I)
 AHV_PORT = 7030
 AHV_CERT_DIRS = (
     "/home/certs/ClusterHealthService",
@@ -50,6 +63,16 @@ IDF_TYPES = (
     "entity_group", "network_entity_group",
     "network_security_policy", "security_policy",
 )
+# PC registers network_* / virtual_network. Alias files are filled from these.
+IDF_COPY_ALIASES = (
+    ("virtual_network", ("subnet",)),
+    ("network_address_group", ("address_group",)),
+    ("network_service_group", ("service_group",)),
+    ("network_entity_group", ("entity_group",)),
+    ("network_security_policy", ("security_policy",)),
+)
+ALL_VLAN_VPC_UUID = "00000000-0000-0000-0000-000000000001"
+ALL_VLAN_VPC_NAME = "VLAN"
 VLAN_ZK = "/appliance/logical/flow/vlan_unique_uuid"
 GLOBAL_ZK = "/appliance/logical/flow/global_unique_uuid"
 UUID_RE = re.compile(
@@ -193,6 +216,182 @@ def _write_text(path, text):
   return path
 
 
+def default_output_dir():
+  return "%s_%d" % (DEFAULT_OUTPUT_BASE, int(time.time()))
+
+
+def _zk_tool(name):
+  for path in (
+      "/home/nutanix/cluster/bin/%s" % name,
+      "/usr/local/nutanix/cluster/bin/%s" % name,
+      name):
+    if path and os.path.exists(path) and os.access(path, os.X_OK):
+      return path
+  return ""
+
+
+def _zkls(path):
+  tool = _zk_tool("zkls")
+  if not tool:
+    return []
+  rc, out, _err = _run([tool, path], 30)
+  if rc != 0:
+    return []
+  return [item for item in (out or "").split() if item]
+
+
+def _zkcat(path):
+  tool = _zk_tool("zkcat")
+  if not tool:
+    return ""
+  rc, out, _err = _run([tool, path], 20)
+  if rc != 0:
+    return ""
+  return (out or "").strip()
+
+
+def _is_flow_leader_service(name):
+  name = (name or "").strip()
+  if not name:
+    return False
+  lower = name.lower()
+  if lower.startswith("flow:") or lower == "flow_master":
+    return True
+  if "microseg" in lower or "microsegmentation" in lower:
+    return True
+  return False
+
+
+def _ip_from_leader_text(text):
+  text = (text or "").strip()
+  if not text:
+    return ""
+  match = JAVA_LEADER_RE.search(text)
+  if match:
+    return match.group(1)
+  if IPV4_RE.match(text):
+    return text
+  parsed = _json_loads(text)
+  if isinstance(parsed, dict):
+    ip = str(parsed.get("ip") or "").strip()
+    if IPV4_RE.match(ip):
+      return ip
+  match = re.search(
+      r"(\d{1,3}(?:\.\d{1,3}){3}):\d+.*Currently leader \(Y/N\):\s*Yes",
+      text, re.I)
+  if match:
+    return match.group(1)
+  return ""
+
+
+def _collect_flow_leader_ips():
+  ips, seen = [], set()
+  for root in FLOW_LEADER_ZK_ROOTS:
+    for service in _zkls(root):
+      if not _is_flow_leader_service(service):
+        continue
+      service_path = "%s/%s" % (root, service)
+      children = _zkls(service_path)
+      if not children:
+        data = _zkcat(service_path)
+        ip = _ip_from_leader_text(data)
+        if ip and ip not in seen:
+          seen.add(ip)
+          ips.append(ip)
+        continue
+      for child in children:
+        ip = _ip_from_leader_text(_zkcat("%s/%s" % (service_path, child)))
+        if ip and ip not in seen:
+          seen.add(ip)
+          ips.append(ip)
+  return ips
+
+
+def _local_svm_ip():
+  host = (socket.gethostname() or "").lower()
+  match = re.search(r"(\d+-\d+-\d+-\d+)", host)
+  if match:
+    ip = match.group(1).replace("-", ".")
+    if IPV4_RE.match(ip):
+      return ip
+  svmips = _zk_tool("svmips")
+  if svmips:
+    rc, out, _err = _run([svmips, "-d"], 20)
+    if rc == 0:
+      for line in (out or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and IPV4_RE.match(parts[0]):
+          return parts[0]
+  return ""
+
+
+def flow_dump_leader_status():
+  local_ip = _local_svm_ip()
+  if not local_ip:
+    return "error", "could not determine local SVM IP"
+  leader_ips = _collect_flow_leader_ips()
+  if not leader_ips:
+    return "error", "could not determine flow leader from Zookeeper"
+  if local_ip in leader_ips:
+    return "run", ""
+  return "skip", "not leader (flow leaders=%s local=%s)" % (
+      ",".join(leader_ips), local_ip)
+
+
+def is_recognized_dump_dir(path):
+  marker_path = os.path.join(path, DUMP_MARKER)
+  if os.path.isfile(marker_path):
+    try:
+      with open(marker_path) as handle:
+        data = json.load(handle)
+      if isinstance(data, dict) and data.get("source") == DUMP_SOURCE:
+        return True
+    except Exception:
+      pass
+  all_path = os.path.join(path, "all.json")
+  if os.path.isfile(all_path):
+    try:
+      with open(all_path) as handle:
+        data = json.load(handle)
+      if isinstance(data, dict) and data.get("source") == DUMP_SOURCE:
+        return True
+    except Exception:
+      pass
+  return False
+
+
+def prepare_output_dir(path):
+  if not path or path in (".", "/", ""):
+    raise ValueError("unsafe output_dir: %s" % path)
+  if not os.path.exists(path):
+    os.makedirs(path, exist_ok=True)
+    return
+  if not os.path.isdir(path):
+    raise RuntimeError("output_dir exists but is not a directory: %s" % path)
+  try:
+    entries = os.listdir(path)
+  except OSError as err:
+    raise RuntimeError("cannot read output_dir %s: %s" % (path, err))
+  if not entries:
+    return
+  if is_recognized_dump_dir(path):
+    shutil.rmtree(path)
+    os.makedirs(path, exist_ok=True)
+    LOG.info("Removed prior flow_pc_dump output at %s", path)
+    return
+  raise RuntimeError(
+      "output_dir %s exists and does not look like a flow_pc_dump output; "
+      "refusing to delete" % path)
+
+
+def write_dump_marker(output_dir):
+  _write_json(os.path.join(output_dir, DUMP_MARKER), {
+      "source": DUMP_SOURCE,
+      "schema": 1,
+      "created_at": datetime.utcnow().isoformat() + "Z",
+  })
+
+
 def _list_rows(parsed):
   if isinstance(parsed, list):
     return parsed
@@ -237,6 +436,280 @@ def _uuids_from_rows(rows):
 
 
 # --- idfcli ---
+# PC IDF names vs aliases. Same fallbacks as vm_host_collect.first_nonempty:
+#   vm, mh_vm, ahv_vm
+#   node, host, ahv_host
+#   virtual_network, subnet
+#   vpc, virtual_private_cloud
+# Insights returns stdout "NotFound: 18" / "0@<type> is not found.: 18" when a
+# name is not registered. vm_host_collect.parse_idf_stdout treats that as empty
+# and continues. dump_idfcli used to record those as dump_errors.
+
+
+def _idf_bytes_to_text(raw):
+  if isinstance(raw, (bytes, bytearray)):
+    return (raw or b"").decode("utf-8", "replace")
+  return raw or ""
+
+
+def _idf_is_missing_type(stdout, stderr):
+  """True when this entity type is not registered on this PC (NotFound: 18)."""
+  text = _idf_bytes_to_text(stdout).strip()
+  if text.lower().startswith("notfound"):
+    return True
+  err = _idf_bytes_to_text(stderr)
+  if "is not found" in err:
+    return True
+  return False
+
+
+def _idf_file_empty(path):
+  if not path or not os.path.isfile(path):
+    return True
+  try:
+    size = os.path.getsize(path)
+  except OSError:
+    return True
+  if size <= 4:
+    return True
+  try:
+    with open(path, "rb") as handle:
+      raw = handle.read(32).strip().lower()
+  except OSError:
+    return True
+  return raw.startswith(b"notfound") or raw in (b"[]", b"{}", b"null")
+
+
+def _idf_unwrap_value(value):
+  if isinstance(value, list):
+    return [_idf_unwrap_value(item) for item in value]
+  if not isinstance(value, dict):
+    return value
+  if "str_value" in value:
+    return value.get("str_value")
+  if "bool_value" in value:
+    return bool(value.get("bool_value"))
+  for key in ("int64_value", "uint64_value", "int32_value"):
+    if key in value:
+      return value.get(key)
+  if "str_list" in value:
+    inner = value.get("str_list")
+    items = inner.get("value_list") if isinstance(inner, dict) else inner
+    return list(items or [])
+  return value
+
+
+def _idf_flatten_entity(ent):
+  if not isinstance(ent, dict):
+    return None
+  attrs = {}
+  guid = ent.get("entity_guid") or {}
+  if isinstance(guid, dict):
+    uid = str(guid.get("entity_id") or "").strip()
+    match = UUID_RE.search(uid)
+    if match:
+      attrs["ext_id"] = match.group(0)
+  adm = ent.get("attribute_data_map")
+  items = []
+  if isinstance(adm, list):
+    items = adm
+  elif isinstance(adm, dict):
+    if adm.get("name"):
+      items = [adm]
+    else:
+      items = [{"name": key, "value": val} for key, val in adm.items()]
+  if not items:
+    row = dict(ent)
+    row.pop("attribute_data_map", None)
+    row.pop("__zprotobuf__", None)
+    if attrs.get("ext_id"):
+      row.setdefault("ext_id", attrs["ext_id"])
+    return row
+  for item in items:
+    if not isinstance(item, dict):
+      continue
+    name = item.get("name") or ""
+    if not name or name == "__zprotobuf__":
+      continue
+    if "value" in item:
+      attrs[name] = _idf_unwrap_value(item.get("value"))
+    else:
+      attrs[name] = _idf_unwrap_value(
+          {key: val for key, val in item.items() if key != "name"})
+  return attrs or None
+
+
+def _idf_load_rows(path):
+  if _idf_file_empty(path):
+    return []
+  try:
+    with open(path, "r") as handle:
+      parsed = json.load(handle)
+  except Exception:
+    return []
+  ents = []
+  if isinstance(parsed, list):
+    ents = parsed
+  elif isinstance(parsed, dict):
+    raw = parsed.get("entity")
+    if raw is None:
+      raw = parsed.get("entities")
+    if raw is None:
+      raw = parsed.get("data")
+    if isinstance(raw, list):
+      ents = raw
+    elif isinstance(raw, dict) and raw:
+      ents = [raw]
+    elif parsed.get("attribute_data_map") or parsed.get("entity_guid"):
+      ents = [parsed]
+  rows = []
+  for ent in ents:
+    if not isinstance(ent, dict):
+      continue
+    if ent.get("attribute_data_map") or ent.get("entity_guid"):
+      flat = _idf_flatten_entity(ent)
+      if flat:
+        rows.append(flat)
+      continue
+    row = dict(ent)
+    row.pop("__zprotobuf__", None)
+    rows.append(row)
+  return rows
+
+
+def _idf_uuid(value):
+  if isinstance(value, dict):
+    value = value.get("ext_id") or value.get("uuid") or value.get("entity_id")
+  text = str(value or "").strip()
+  match = UUID_RE.search(text)
+  return match.group(0) if match else ""
+
+
+def _vpc_name_from_subnet(name):
+  text = str(name or "").strip()
+  if not text:
+    return ""
+  lower = text.lower()
+  for token in ("_subnet_", "-subnet-"):
+    idx = lower.rfind(token)
+    if idx > 0:
+      return text[:idx]
+  return ""
+
+
+def _vpc_display_name(vpc_ref, subnet_name=None, existing=""):
+  vlan_uuid = globals().get("ALL_VLAN_VPC_UUID") or (
+      "00000000-0000-0000-0000-000000000001")
+  vlan_name = globals().get("ALL_VLAN_VPC_NAME") or "VLAN"
+  if vpc_ref == vlan_uuid:
+    return vlan_name
+  name = str(existing or "").strip()
+  if name and name.lower() not in ("unnamed", "(unnamed)", "none", "null"):
+    return name
+  inferred = _vpc_name_from_subnet(subnet_name)
+  if inferred:
+    return inferred
+  return ("VPC_%s" % vpc_ref[:8]) if vpc_ref else ""
+
+
+def _idf_synthetic_vpc_payload(rows):
+  ents = []
+  for rec in rows:
+    uid = rec.get("ext_id") or ""
+    if not uid:
+      continue
+    name = rec.get("name") or ""
+    vpc_type = rec.get("vpc_type") or "REGULAR"
+    ents.append({
+        "entity_guid": {"entity_id": uid, "entity_type_name": "vpc"},
+        "attribute_data_map": [
+            {"name": "name", "value": {"str_value": name}},
+            {"name": "uuid", "value": {"str_value": uid}},
+            {"name": "ext_id", "value": {"str_value": uid}},
+            {"name": "vpc_type", "value": {"str_value": vpc_type}},
+        ],
+    })
+  return {"entity": ents}
+
+
+def _idf_vpcs_from_subnets(subnet_rows):
+  vlan_uuid = globals().get("ALL_VLAN_VPC_UUID") or (
+      "00000000-0000-0000-0000-000000000001")
+  vlan_name = globals().get("ALL_VLAN_VPC_NAME") or "VLAN"
+  by_id = {}
+  for row in subnet_rows or []:
+    vpc_ref = _idf_uuid(
+        row.get("overlay_network_uuid") or row.get("vpc_uuid") or
+        row.get("vpc_reference"))
+    if not vpc_ref or vpc_ref == vlan_uuid:
+      continue
+    rec = by_id.get(vpc_ref)
+    if rec is None:
+      rec = {
+          "ext_id": vpc_ref,
+          "name": "",
+          "vpc_type": "REGULAR",
+      }
+      by_id[vpc_ref] = rec
+    if not rec.get("name"):
+      rec["name"] = _vpc_display_name(
+          vpc_ref, row.get("name") or row.get("subnet_name"), "")
+  rows = list(by_id.values())
+  rows.append({
+      "ext_id": vlan_uuid,
+      "name": vlan_name,
+      "vpc_type": "VLAN",
+  })
+  return rows
+
+
+def _idf_copy_aliases(dest, index):
+  groups = globals().get("IDF_COPY_ALIASES") or (
+      ("virtual_network", ("subnet",)),
+      ("network_address_group", ("address_group",)),
+      ("network_service_group", ("service_group",)),
+      ("network_entity_group", ("entity_group",)),
+      ("network_security_policy", ("security_policy",)),
+  )
+  for src_type, aliases in groups:
+    src = os.path.join(dest, "%s.json" % src_type)
+    if _idf_file_empty(src):
+      continue
+    for alias in aliases:
+      path = os.path.join(dest, "%s.json" % alias)
+      if not _idf_file_empty(path):
+        continue
+      shutil.copy2(src, path)
+      nbytes = os.path.getsize(path)
+      index.setdefault("entity_types", {})[alias] = {
+          "bytes": nbytes, "error": "", "file": "%s.json" % alias,
+          "alias_of": src_type}
+      LOG.info(
+          "DUMP idfcli %s filled from %s bytes=%s", alias, src_type, nbytes)
+
+
+def _idf_write_vpcs(dest, index):
+  vlan_uuid = globals().get("ALL_VLAN_VPC_UUID") or (
+      "00000000-0000-0000-0000-000000000001")
+  src = os.path.join(dest, "virtual_network.json")
+  if _idf_file_empty(src):
+    src = os.path.join(dest, "subnet.json")
+  rows = _idf_vpcs_from_subnets(_idf_load_rows(src))
+  overlay = [rec for rec in rows if rec.get("ext_id") != vlan_uuid]
+  if not overlay:
+    LOG.info("DUMP idfcli vpc: no overlay_network_uuid on subnets")
+    return
+  payload = _idf_synthetic_vpc_payload(rows)
+  for name in ("vpc", "virtual_private_cloud"):
+    path = os.path.join(dest, "%s.json" % name)
+    _write_json(path, payload)
+    index.setdefault("entity_types", {})[name] = {
+        "bytes": os.path.getsize(path), "error": "",
+        "file": "%s.json" % name, "source": "virtual_network.overlay_network_uuid",
+        "count": len(overlay)}
+  LOG.info(
+      "DUMP idfcli vpc from overlay_network_uuid count=%s", len(overlay))
+
 
 def dump_idfcli(output_dir, workers, timeout):
   dest = os.path.join(output_dir, "idfcli")
@@ -252,6 +725,7 @@ def dump_idfcli(output_dir, workers, timeout):
   def _one(entity_type):
     path = os.path.join(dest, "%s.json" % entity_type)
     err, stdout = "", b""
+    missing = False
     for argv in (
         [binary, "get", "entity", "-e", entity_type, "--all", "-o", "json"],
         [binary, "get", "entitytype", "-e", entity_type, "-o", "json"]):
@@ -262,12 +736,20 @@ def dump_idfcli(output_dir, workers, timeout):
         err = "%s: %s" % (entity_type, exc)
         continue
       stdout = proc.stdout or b""
+      if _idf_is_missing_type(stdout, proc.stderr):
+        missing = True
+        err = ""
+        continue
       if proc.returncode == 0 and stdout.strip():
         err = ""
+        missing = False
         break
       err = "%s: rc=%s %s" % (
           entity_type, proc.returncode,
-          (proc.stderr or b"").decode("utf-8", "replace")[:200])
+          _idf_bytes_to_text(proc.stderr)[-400:])
+    if missing and not err:
+      stdout = b"[]\n"
+      LOG.info("DUMP idfcli %s not registered (NotFound: 18)", entity_type)
     with open(path, "wb") as handle:
       handle.write(stdout)
     LOG.info("DUMP idfcli %s bytes=%s", entity_type, len(stdout))
@@ -280,6 +762,13 @@ def dump_idfcli(output_dir, workers, timeout):
           "bytes": nbytes, "error": err or "", "file": "%s.json" % entity_type}
       if err:
         errors["idfcli:%s" % entity_type] = err
+  _idf_copy_aliases(dest, index)
+  _idf_write_vpcs(dest, index)
+  for key in list(errors):
+    name = key.split(":", 1)[-1]
+    rec = (index.get("entity_types") or {}).get(name) or {}
+    if rec.get("alias_of") or rec.get("source"):
+      errors.pop(key, None)
   _write_json(os.path.join(dest, "index.json"), index)
   return index, errors
 
@@ -568,7 +1057,7 @@ def dump_service_groups(output_dir, timeout, info, kubeconfig="", ns="", pod="")
         try:
           os.remove(raw)
         except Exception:
-          pass
+            pass
       last_err = None
       break
     except Exception as err:
@@ -986,6 +1475,49 @@ OVN_TARGETS = (
         "commands": (), "required": (),
     },
 )
+# Default: fail-fast for CMSP and SMSP OVN. Required pods missing → stop
+# immediately. Transient dump misses get one quick retry. Use --cmsp_ovn_wait
+# (or --ovn_wait) to retry until the timeout instead.
+OVN_SMART_RETRY_LIMIT = 1
+
+
+def _ovn_is_required(rec):
+  return bool(rec.get("required"))
+
+
+def _ovn_results_complete(results):
+  """Complete when every required target succeeded. Optional pods may be absent."""
+  if not results:
+    return False
+  for rec in results:
+    if rec.get("pod_not_found"):
+      if _ovn_is_required(rec):
+        return False
+      continue
+    if rec.get("missing"):
+      return False
+    if rec.get("error") and not rec.get("pod") and _ovn_is_required(rec):
+      return False
+  return True
+
+
+def _ovn_required_pod_missing(results):
+  return any(
+      rec.get("pod_not_found") and _ovn_is_required(rec) for rec in results or [])
+
+
+def _ovn_next_action(results, ovn_wait, attempt,
+                     retry_limit=OVN_SMART_RETRY_LIMIT):
+  if _ovn_results_complete(results):
+    return "done"
+  if ovn_wait:
+    return "retry"
+  # Fail-fast (CMSP + SMSP): required anc-ovn pod gone → do not burn timeout.
+  if _ovn_required_pod_missing(results):
+    return "break"
+  if attempt >= retry_limit:
+    return "break"
+  return "retry"
 
 
 def _kubectl_cp(ns, pod, container, remote, dest, timeout, kubeconfig=""):
@@ -1015,9 +1547,10 @@ def _kubectl_exec_file(ns, pod, container, remote_argv, dest, timeout,
 
 
 def _ovn_target(target, dest_root, namespace, timeout, kubeconfig=""):
+  required = list(target.get("required") or [])
   rec = {
       "key": target["key"], "pod": "", "namespace": namespace,
-      "error": "", "missing": []}
+      "error": "", "missing": [], "required": required}
   dest_dir = os.path.join(dest_root, target["key"])
   cmd_dir = os.path.join(dest_dir, "commands")
   os.makedirs(cmd_dir, exist_ok=True)
@@ -1026,9 +1559,11 @@ def _ovn_target(target, dest_root, namespace, timeout, kubeconfig=""):
   rec["namespace"] = ns or namespace
   rec["pod"] = pod or (target.get("pod") or "")
   if not rec["pod"]:
+    rec["pod_not_found"] = True
     rec["error"] = err or "pod not found"
-    rec["missing"] = list(target.get("required") or [])
+    rec["missing"] = list(required)
     return rec
+  rec["pod_not_found"] = False
   dump_timeout = max(60, min(600, int(timeout)))
   got = {}
   for name, argv in target.get("dumps") or ():
@@ -1046,30 +1581,44 @@ def _ovn_target(target, dest_root, namespace, timeout, kubeconfig=""):
     _kubectl_exec_file(
         rec["namespace"], rec["pod"], target["container"], argv,
         os.path.join(cmd_dir, name + ".txt"), per, kubeconfig)
-  rec["missing"] = [
-      name for name in target.get("required") or () if not got.get(name)]
+  rec["missing"] = [name for name in required if not got.get(name)]
   if rec["missing"]:
     rec["error"] = "missing: %s" % ",".join(rec["missing"])
   return rec
 
 
-def dump_ovn(output_dir, timeout, info, namespace=""):
+def dump_ovn(output_dir, timeout, info, namespace="", ovn_wait=False):
+  """Collect OVN for CMSP or SMSP. Default is fail-fast (no long retry loop)."""
+  platform = info.get("platform") or "cmsp"
+  # Keep cmsp_ovn/ path for convert compatibility; label/logs use platform name.
+  label = "smsp_ovn" if platform == "smsp" else "cmsp_ovn"
   dest = os.path.join(output_dir, "cmsp_ovn")
   os.makedirs(dest, exist_ok=True)
   payload = {
-      "ran": False, "transport": "kubectl",
-      "platform": info.get("platform") or "cmsp",
+      "ran": False, "transport": "kubectl", "platform": platform,
+      "label": label, "fail_fast": not bool(ovn_wait),
       "ssh_to_ahv": False, "pods": [], "error": ""}
   kubeconfig = ""
-  if payload["platform"] == "smsp":
+  if platform == "smsp":
     kubeconfig, kube_err = _flow_kubeconfig(dest)
     if kubeconfig:
       payload["kubeconfig_source"] = "mspctl cluster kubeconfig flow"
     else:
+      # SMSP without flow kubeconfig cannot reach OVN pods — fail fast.
       payload["kubeconfig_source"] = "failed: %s" % (kube_err or "")
+      payload["error"] = "%s: flow kubeconfig failed" % label
+      payload["ran"] = False
+      LOG.warning(
+          "DUMP %s fail-fast: flow kubeconfig failed (%s)",
+          label, (kube_err or "")[:200])
+      _write_json(os.path.join(dest, "index.json"), payload)
+      _write_json(os.path.join(output_dir, "cmsp_ovn.json"), payload)
+      _write_json(os.path.join(output_dir, "smsp_ovn.json"), payload)
+      return payload
   deadline = time.time() + max(60, int(timeout))
   backoff = 2
   last = []
+  smart_attempt = 0
   try:
     while time.time() < deadline:
       last = [
@@ -1078,9 +1627,21 @@ def dump_ovn(output_dir, timeout, info, namespace=""):
           for t in OVN_TARGETS]
       payload["ran"] = True
       payload["pods"] = last
-      if last and not any(rec.get("missing") for rec in last):
+      action = _ovn_next_action(last, ovn_wait, smart_attempt)
+      if action == "done":
         payload["error"] = ""
         break
+      if action == "break":
+        if not ovn_wait and _ovn_required_pod_missing(last):
+          LOG.info(
+              "DUMP %s fail-fast: required OVN pod not found, skipping retries",
+              label)
+        elif not ovn_wait:
+          LOG.info(
+              "DUMP %s fail-fast: retries exhausted after %s attempts",
+              label, smart_attempt + 1)
+        break
+      smart_attempt += 1
       sleep_for = min(backoff, max(0, int(deadline - time.time())))
       if sleep_for <= 0:
         break
@@ -1095,6 +1656,11 @@ def dump_ovn(output_dir, timeout, info, namespace=""):
           "%s:%s" % (rec.get("key"), n) for n in rec.get("missing") or [])
     if missing:
       payload["error"] = "missing: %s" % ",".join(missing)
+    elif _ovn_required_pod_missing(last):
+      keys = [
+          rec.get("key") for rec in last
+          if rec.get("pod_not_found") and _ovn_is_required(rec)]
+      payload["error"] = "required pod not found: %s" % ",".join(keys)
   finally:
     if kubeconfig:
       try:
@@ -1103,6 +1669,8 @@ def dump_ovn(output_dir, timeout, info, namespace=""):
         pass
   _write_json(os.path.join(dest, "index.json"), payload)
   _write_json(os.path.join(output_dir, "cmsp_ovn.json"), payload)
+  if platform == "smsp":
+    _write_json(os.path.join(output_dir, "smsp_ovn.json"), payload)
   return payload
 
 
@@ -1114,15 +1682,17 @@ def dump_pc(output_dir, workers=16, skip_idf=False, skip_ahv=False,
             atlas_get_workers=32, flow_cli_timeout=1800,
             flow_cli_get_workers=32, idf_timeout=180, ahv_workers=8,
             ahv_class_timeout=300, cmsp_ovn_namespace="",
+            cmsp_ovn_wait=False,
             fail_on_error=False, log_file="", combined_path=""):
   os.makedirs(output_dir, exist_ok=True)
+  write_dump_marker(output_dir)
   combined_path = combined_path or os.path.join(output_dir, "all.json")
   log_file = log_file or os.path.join(output_dir, "dump.log")
   _setup_logging(log_file)
   info = detect_platform()
   errors = {}
   index = {
-      "source": "flow_pc_dump",
+      "source": DUMP_SOURCE,
       "dumped_at": datetime.utcnow().isoformat() + "Z",
       "platform": info.get("platform") or "",
       "smsp_cluster_uuid": info.get("smsp_cluster_uuid") or "",
@@ -1137,8 +1707,10 @@ def dump_pc(output_dir, workers=16, skip_idf=False, skip_ahv=False,
       futs["ahv_gateway"] = pool.submit(
           dump_ahv, output_dir, ahv_workers, ahv_class_timeout)
     if not skip_cmsp:
+      # Same collector for CMSP and SMSP; default is fail-fast for both.
       futs["cmsp_ovn"] = pool.submit(
-          dump_ovn, output_dir, cmsp_ovn_timeout, info, cmsp_ovn_namespace)
+          dump_ovn, output_dir, cmsp_ovn_timeout, info, cmsp_ovn_namespace,
+          cmsp_ovn_wait)
     if not skip_atlas:
       futs["atlas"] = pool.submit(
           dump_atlas, output_dir, atlas_get_workers, atlas_timeout, info)
@@ -1155,6 +1727,13 @@ def dump_pc(output_dir, workers=16, skip_idf=False, skip_ahv=False,
           errors.update(index[name].get("errors") or {})
           if index[name].get("error"):
             errors[name] = index[name]["error"]
+          # Mirror SMSP OVN under smsp_ovn as well as cmsp_ovn.
+          if name == "cmsp_ovn" and (
+              index[name].get("platform") == "smsp" or
+              index[name].get("label") == "smsp_ovn"):
+            index["smsp_ovn"] = index[name]
+            if index[name].get("error"):
+              errors["smsp_ovn"] = index[name]["error"]
       except Exception as err:
         errors[name] = str(err)
         index[name] = {"ran": False, "error": str(err)}
@@ -1183,7 +1762,9 @@ def build_parser():
       description=(
           "PC collect only. Writes command stdout and AHV/OVS files as-is. "
           "Convert locally with flow_pc_process.py."))
-  ap.add_argument("--output_dir", default=DEFAULT_OUTPUT)
+  ap.add_argument("--output_dir", default="")
+  ap.add_argument("--leader_only", action="store_true",
+                  help="Run only on the Flow leader PCVM; non-leaders exit 0")
   ap.add_argument("--output", default="")
   ap.add_argument("--log_file", default="")
   ap.add_argument("--workers", type=int, default=16)
@@ -1205,6 +1786,11 @@ def build_parser():
       "--ahv_gateway_cert_dir", default="/home/certs/ClusterHealthService")
   ap.add_argument("--cmsp_ovn_timeout_secs", type=int, default=1800)
   ap.add_argument("--cmsp_ovn_namespace", default="")
+  ap.add_argument(
+      "--cmsp_ovn_wait", "--ovn_wait", action="store_true", dest="cmsp_ovn_wait",
+      help=(
+          "Retry CMSP/SMSP OVN until timeout. Default is fail-fast: stop when "
+          "required anc-ovn pod is missing or after one quick retry."))
   ap.add_argument("--atlas_timeout_secs", type=int, default=1800)
   ap.add_argument("--atlas_get_workers", type=int, default=32)
   ap.add_argument("--flow_cli_timeout_secs", type=int, default=1800)
@@ -1215,13 +1801,28 @@ def build_parser():
 def main(argv=None):
   argv = list(sys.argv if argv is None else argv)
   args, _unknown = build_parser().parse_known_args(argv[1:])
+  _setup_logging()
+  if args.leader_only:
+    status, reason = flow_dump_leader_status()
+    if status == "skip":
+      LOG.info("skipped: %s", reason)
+      return 0
+    if status == "error":
+      LOG.error("leader_only: %s", reason)
+      return 1
+  output_dir = args.output_dir or default_output_dir()
+  try:
+    prepare_output_dir(output_dir)
+  except Exception as err:
+    LOG.error("output_dir: %s", err)
+    return 1
   global AHV_PORT, AHV_CERT_DIRS
   AHV_PORT = int(args.ahv_gateway_port)
   if args.ahv_gateway_cert_dir:
     AHV_CERT_DIRS = (args.ahv_gateway_cert_dir,) + tuple(
         d for d in AHV_CERT_DIRS if d != args.ahv_gateway_cert_dir)
   return dump_pc(
-      args.output_dir or DEFAULT_OUTPUT,
+      output_dir,
       workers=max(1, int(args.workers)),
       skip_idf=bool(args.skip_idfcli),
       skip_ahv=bool(args.skip_ahv_gateway),
@@ -1238,6 +1839,7 @@ def main(argv=None):
       ahv_workers=max(1, int(args.ahv_gateway_workers)),
       ahv_class_timeout=max(30, int(args.ahv_gateway_class_timeout_secs)),
       cmsp_ovn_namespace=args.cmsp_ovn_namespace or "",
+      cmsp_ovn_wait=bool(args.cmsp_ovn_wait),
       fail_on_error=bool(args.fail_on_error),
       log_file=args.log_file or "",
       combined_path=args.output or "")

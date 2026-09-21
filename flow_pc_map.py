@@ -1278,7 +1278,11 @@ def _idfcli_one(entity_type, timeout=180):
       if os.path.isfile(json_path):
         try:
           with open(json_path, "r") as handle:
-            parsed = _idf_loaded_rows(json.load(handle))
+            raw = handle.read()
+          if (raw or "").strip().lower().startswith("notfound"):
+            parsed = []
+          else:
+            parsed = _idf_loaded_rows(json.loads(raw))
         except Exception as exc:
           parsed, err = [], "%s: %s" % (entity_type, exc)
           _IDF_RESULTS[entity_type] = (parsed, err)
@@ -4025,6 +4029,33 @@ def fetch_subnets(_interfaces):
 def fetch_vpcs(_interfaces):
   LOG.info("DUMP start vpcs")
   rows, errors = _idf_mapped(("vpc", "virtual_private_cloud"), _map_vpc)
+  overlay = [
+      rec for rec in rows
+      if rec.get("ext_id") and rec.get("ext_id") != ALL_VLAN_VPC_UUID]
+  if not overlay:
+    subnets, sub_errors = _idf_mapped(("virtual_network", "subnet"), _map_subnet)
+    errors.extend(sub_errors)
+    by_id = {rec.get("ext_id"): rec for rec in rows if rec.get("ext_id")}
+    for subnet in subnets:
+      vpc_ref = subnet.get("vpc_reference") or ""
+      if not vpc_ref or vpc_ref == ALL_VLAN_VPC_UUID:
+        continue
+      if vpc_ref in by_id:
+        continue
+      rec = {
+          "ext_id": vpc_ref,
+          "name": _vpc_display_name(
+              vpc_ref, subnet.get("name"), subnet.get("vpc_name")),
+          "vpc_type": "REGULAR",
+          "metadata": {"category_ids": []},
+          "externally_routable_prefixes": [],
+          "external_subnets": [],
+      }
+      by_id[vpc_ref] = rec
+      rows.append(rec)
+    LOG.info(
+        "DUMP vpcs from virtual_network.overlay_network_uuid count=%s",
+        len(by_id) - (1 if ALL_VLAN_VPC_UUID in by_id else 0))
   for err in errors:
     LOG.warning("vpcs fallback: %s", err)
   LOG.info("DUMP done vpcs count=%s", len(rows))
