@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import ssl
 import subprocess
 import sys
@@ -50,6 +51,16 @@ IDF_TYPES = (
     "entity_group", "network_entity_group",
     "network_security_policy", "security_policy",
 )
+# PC registers network_* / virtual_network. Alias files are filled from these.
+IDF_COPY_ALIASES = (
+    ("virtual_network", ("subnet",)),
+    ("network_address_group", ("address_group",)),
+    ("network_service_group", ("service_group",)),
+    ("network_entity_group", ("entity_group",)),
+    ("network_security_policy", ("security_policy",)),
+)
+ALL_VLAN_VPC_UUID = "00000000-0000-0000-0000-000000000001"
+ALL_VLAN_VPC_NAME = "VLAN"
 VLAN_ZK = "/appliance/logical/flow/vlan_unique_uuid"
 GLOBAL_ZK = "/appliance/logical/flow/global_unique_uuid"
 UUID_RE = re.compile(
@@ -237,6 +248,280 @@ def _uuids_from_rows(rows):
 
 
 # --- idfcli ---
+# PC IDF names vs aliases. Same fallbacks as vm_host_collect.first_nonempty:
+#   vm, mh_vm, ahv_vm
+#   node, host, ahv_host
+#   virtual_network, subnet
+#   vpc, virtual_private_cloud
+# Insights returns stdout "NotFound: 18" / "0@<type> is not found.: 18" when a
+# name is not registered. vm_host_collect.parse_idf_stdout treats that as empty
+# and continues. dump_idfcli used to record those as dump_errors.
+
+
+def _idf_bytes_to_text(raw):
+  if isinstance(raw, (bytes, bytearray)):
+    return (raw or b"").decode("utf-8", "replace")
+  return raw or ""
+
+
+def _idf_is_missing_type(stdout, stderr):
+  """True when this entity type is not registered on this PC (NotFound: 18)."""
+  text = _idf_bytes_to_text(stdout).strip()
+  if text.lower().startswith("notfound"):
+    return True
+  err = _idf_bytes_to_text(stderr)
+  if "is not found" in err:
+    return True
+  return False
+
+
+def _idf_file_empty(path):
+  if not path or not os.path.isfile(path):
+    return True
+  try:
+    size = os.path.getsize(path)
+  except OSError:
+    return True
+  if size <= 4:
+    return True
+  try:
+    with open(path, "rb") as handle:
+      raw = handle.read(32).strip().lower()
+  except OSError:
+    return True
+  return raw.startswith(b"notfound") or raw in (b"[]", b"{}", b"null")
+
+
+def _idf_unwrap_value(value):
+  if isinstance(value, list):
+    return [_idf_unwrap_value(item) for item in value]
+  if not isinstance(value, dict):
+    return value
+  if "str_value" in value:
+    return value.get("str_value")
+  if "bool_value" in value:
+    return bool(value.get("bool_value"))
+  for key in ("int64_value", "uint64_value", "int32_value"):
+    if key in value:
+      return value.get(key)
+  if "str_list" in value:
+    inner = value.get("str_list")
+    items = inner.get("value_list") if isinstance(inner, dict) else inner
+    return list(items or [])
+  return value
+
+
+def _idf_flatten_entity(ent):
+  if not isinstance(ent, dict):
+    return None
+  attrs = {}
+  guid = ent.get("entity_guid") or {}
+  if isinstance(guid, dict):
+    uid = str(guid.get("entity_id") or "").strip()
+    match = UUID_RE.search(uid)
+    if match:
+      attrs["ext_id"] = match.group(0)
+  adm = ent.get("attribute_data_map")
+  items = []
+  if isinstance(adm, list):
+    items = adm
+  elif isinstance(adm, dict):
+    if adm.get("name"):
+      items = [adm]
+    else:
+      items = [{"name": key, "value": val} for key, val in adm.items()]
+  if not items:
+    row = dict(ent)
+    row.pop("attribute_data_map", None)
+    row.pop("__zprotobuf__", None)
+    if attrs.get("ext_id"):
+      row.setdefault("ext_id", attrs["ext_id"])
+    return row
+  for item in items:
+    if not isinstance(item, dict):
+      continue
+    name = item.get("name") or ""
+    if not name or name == "__zprotobuf__":
+      continue
+    if "value" in item:
+      attrs[name] = _idf_unwrap_value(item.get("value"))
+    else:
+      attrs[name] = _idf_unwrap_value(
+          {key: val for key, val in item.items() if key != "name"})
+  return attrs or None
+
+
+def _idf_load_rows(path):
+  if _idf_file_empty(path):
+    return []
+  try:
+    with open(path, "r") as handle:
+      parsed = json.load(handle)
+  except Exception:
+    return []
+  ents = []
+  if isinstance(parsed, list):
+    ents = parsed
+  elif isinstance(parsed, dict):
+    raw = parsed.get("entity")
+    if raw is None:
+      raw = parsed.get("entities")
+    if raw is None:
+      raw = parsed.get("data")
+    if isinstance(raw, list):
+      ents = raw
+    elif isinstance(raw, dict) and raw:
+      ents = [raw]
+    elif parsed.get("attribute_data_map") or parsed.get("entity_guid"):
+      ents = [parsed]
+  rows = []
+  for ent in ents:
+    if not isinstance(ent, dict):
+      continue
+    if ent.get("attribute_data_map") or ent.get("entity_guid"):
+      flat = _idf_flatten_entity(ent)
+      if flat:
+        rows.append(flat)
+      continue
+    row = dict(ent)
+    row.pop("__zprotobuf__", None)
+    rows.append(row)
+  return rows
+
+
+def _idf_uuid(value):
+  if isinstance(value, dict):
+    value = value.get("ext_id") or value.get("uuid") or value.get("entity_id")
+  text = str(value or "").strip()
+  match = UUID_RE.search(text)
+  return match.group(0) if match else ""
+
+
+def _vpc_name_from_subnet(name):
+  text = str(name or "").strip()
+  if not text:
+    return ""
+  lower = text.lower()
+  for token in ("_subnet_", "-subnet-"):
+    idx = lower.rfind(token)
+    if idx > 0:
+      return text[:idx]
+  return ""
+
+
+def _vpc_display_name(vpc_ref, subnet_name=None, existing=""):
+  vlan_uuid = globals().get("ALL_VLAN_VPC_UUID") or (
+      "00000000-0000-0000-0000-000000000001")
+  vlan_name = globals().get("ALL_VLAN_VPC_NAME") or "VLAN"
+  if vpc_ref == vlan_uuid:
+    return vlan_name
+  name = str(existing or "").strip()
+  if name and name.lower() not in ("unnamed", "(unnamed)", "none", "null"):
+    return name
+  inferred = _vpc_name_from_subnet(subnet_name)
+  if inferred:
+    return inferred
+  return ("VPC_%s" % vpc_ref[:8]) if vpc_ref else ""
+
+
+def _idf_synthetic_vpc_payload(rows):
+  ents = []
+  for rec in rows:
+    uid = rec.get("ext_id") or ""
+    if not uid:
+      continue
+    name = rec.get("name") or ""
+    vpc_type = rec.get("vpc_type") or "REGULAR"
+    ents.append({
+        "entity_guid": {"entity_id": uid, "entity_type_name": "vpc"},
+        "attribute_data_map": [
+            {"name": "name", "value": {"str_value": name}},
+            {"name": "uuid", "value": {"str_value": uid}},
+            {"name": "ext_id", "value": {"str_value": uid}},
+            {"name": "vpc_type", "value": {"str_value": vpc_type}},
+        ],
+    })
+  return {"entity": ents}
+
+
+def _idf_vpcs_from_subnets(subnet_rows):
+  vlan_uuid = globals().get("ALL_VLAN_VPC_UUID") or (
+      "00000000-0000-0000-0000-000000000001")
+  vlan_name = globals().get("ALL_VLAN_VPC_NAME") or "VLAN"
+  by_id = {}
+  for row in subnet_rows or []:
+    vpc_ref = _idf_uuid(
+        row.get("overlay_network_uuid") or row.get("vpc_uuid") or
+        row.get("vpc_reference"))
+    if not vpc_ref or vpc_ref == vlan_uuid:
+      continue
+    rec = by_id.get(vpc_ref)
+    if rec is None:
+      rec = {
+          "ext_id": vpc_ref,
+          "name": "",
+          "vpc_type": "REGULAR",
+      }
+      by_id[vpc_ref] = rec
+    if not rec.get("name"):
+      rec["name"] = _vpc_display_name(
+          vpc_ref, row.get("name") or row.get("subnet_name"), "")
+  rows = list(by_id.values())
+  rows.append({
+      "ext_id": vlan_uuid,
+      "name": vlan_name,
+      "vpc_type": "VLAN",
+  })
+  return rows
+
+
+def _idf_copy_aliases(dest, index):
+  groups = globals().get("IDF_COPY_ALIASES") or (
+      ("virtual_network", ("subnet",)),
+      ("network_address_group", ("address_group",)),
+      ("network_service_group", ("service_group",)),
+      ("network_entity_group", ("entity_group",)),
+      ("network_security_policy", ("security_policy",)),
+  )
+  for src_type, aliases in groups:
+    src = os.path.join(dest, "%s.json" % src_type)
+    if _idf_file_empty(src):
+      continue
+    for alias in aliases:
+      path = os.path.join(dest, "%s.json" % alias)
+      if not _idf_file_empty(path):
+        continue
+      shutil.copy2(src, path)
+      nbytes = os.path.getsize(path)
+      index.setdefault("entity_types", {})[alias] = {
+          "bytes": nbytes, "error": "", "file": "%s.json" % alias,
+          "alias_of": src_type}
+      LOG.info(
+          "DUMP idfcli %s filled from %s bytes=%s", alias, src_type, nbytes)
+
+
+def _idf_write_vpcs(dest, index):
+  vlan_uuid = globals().get("ALL_VLAN_VPC_UUID") or (
+      "00000000-0000-0000-0000-000000000001")
+  src = os.path.join(dest, "virtual_network.json")
+  if _idf_file_empty(src):
+    src = os.path.join(dest, "subnet.json")
+  rows = _idf_vpcs_from_subnets(_idf_load_rows(src))
+  overlay = [rec for rec in rows if rec.get("ext_id") != vlan_uuid]
+  if not overlay:
+    LOG.info("DUMP idfcli vpc: no overlay_network_uuid on subnets")
+    return
+  payload = _idf_synthetic_vpc_payload(rows)
+  for name in ("vpc", "virtual_private_cloud"):
+    path = os.path.join(dest, "%s.json" % name)
+    _write_json(path, payload)
+    index.setdefault("entity_types", {})[name] = {
+        "bytes": os.path.getsize(path), "error": "",
+        "file": "%s.json" % name, "source": "virtual_network.overlay_network_uuid",
+        "count": len(overlay)}
+  LOG.info(
+      "DUMP idfcli vpc from overlay_network_uuid count=%s", len(overlay))
+
 
 def dump_idfcli(output_dir, workers, timeout):
   dest = os.path.join(output_dir, "idfcli")
@@ -252,6 +537,7 @@ def dump_idfcli(output_dir, workers, timeout):
   def _one(entity_type):
     path = os.path.join(dest, "%s.json" % entity_type)
     err, stdout = "", b""
+    missing = False
     for argv in (
         [binary, "get", "entity", "-e", entity_type, "--all", "-o", "json"],
         [binary, "get", "entitytype", "-e", entity_type, "-o", "json"]):
@@ -262,12 +548,20 @@ def dump_idfcli(output_dir, workers, timeout):
         err = "%s: %s" % (entity_type, exc)
         continue
       stdout = proc.stdout or b""
+      if _idf_is_missing_type(stdout, proc.stderr):
+        missing = True
+        err = ""
+        continue
       if proc.returncode == 0 and stdout.strip():
         err = ""
+        missing = False
         break
       err = "%s: rc=%s %s" % (
           entity_type, proc.returncode,
-          (proc.stderr or b"").decode("utf-8", "replace")[:200])
+          _idf_bytes_to_text(proc.stderr)[-400:])
+    if missing and not err:
+      stdout = b"[]\n"
+      LOG.info("DUMP idfcli %s not registered (NotFound: 18)", entity_type)
     with open(path, "wb") as handle:
       handle.write(stdout)
     LOG.info("DUMP idfcli %s bytes=%s", entity_type, len(stdout))
@@ -280,6 +574,13 @@ def dump_idfcli(output_dir, workers, timeout):
           "bytes": nbytes, "error": err or "", "file": "%s.json" % entity_type}
       if err:
         errors["idfcli:%s" % entity_type] = err
+  _idf_copy_aliases(dest, index)
+  _idf_write_vpcs(dest, index)
+  for key in list(errors):
+    name = key.split(":", 1)[-1]
+    rec = (index.get("entity_types") or {}).get(name) or {}
+    if rec.get("alias_of") or rec.get("source"):
+      errors.pop(key, None)
   _write_json(os.path.join(dest, "index.json"), index)
   return index, errors
 
