@@ -246,11 +246,15 @@ def run_idfcli(entity_type, binary, timeout):
       err = "%s" % exc
       continue
     stdout = proc.stdout or b""
+    rows, parse_err = parse_idf_stdout(stdout)
+    if parse_err:
+      err = parse_err
+      continue
+    # Insights missing type: stdout "NotFound: 18" and rc=1. Same as empty.
+    if (stdout or b"").strip().lower().startswith(
+        b"notfound" if isinstance(stdout, (bytes, bytearray)) else "notfound"):
+      return [], ""
     if proc.returncode == 0 and stdout.strip():
-      rows, parse_err = parse_idf_stdout(stdout)
-      if parse_err:
-        err = parse_err
-        continue
       return rows, ""
     err = "rc=%s %s" % (
         proc.returncode,
@@ -780,6 +784,25 @@ def collect(binary, timeout, file_dir, workers):
     clusters = fut_clusters.result()
     subnets = fut_subnets.result()
     vpcs = fut_vpcs.result()
+    overlay = [
+        rec for rec in vpcs
+        if rec.get("ext_id") and rec.get("ext_id") != ALL_VLAN_VPC_UUID]
+    if not overlay:
+      seen = {rec.get("ext_id") for rec in vpcs if rec.get("ext_id")}
+      extra = []
+      for rec in subnets:
+        uid = rec.get("vpc_uuid") or ""
+        if not uid or uid == ALL_VLAN_VPC_UUID or uid in seen:
+          continue
+        extra.append({
+            "ext_id": uid,
+            "name": vpc_display_name(uid, rec.get("name"), ""),
+            "vpc_type": "REGULAR",
+        })
+        seen.add(uid)
+      vpcs = list(vpcs) + extra
+      log("idfcli vpcs from virtual_network.overlay_network_uuid mapped=%s" % (
+          len(extra)))
     caps = fut_caps.result()
     categories = fut_cats.result()
   return inventory_rows(
