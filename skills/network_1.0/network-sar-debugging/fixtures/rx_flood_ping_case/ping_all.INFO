@@ -1,0 +1,26 @@
+#TIMESTAMP 1788269846 : 09/01/2026 01:37:26 PM
+                        IP : latency (threshold = 0.5 ms, payload = 1472 bytes)
+           cvm-10.1.20.104 : 0.70 ms
+           host-10.1.20.51 : 1.07 ms
+#TIMESTAMP 1788269867 : 09/01/2026 01:37:47 PM
+                        IP : latency (threshold = 0.5 ms, payload = 1472 bytes)
+              gw-10.1.20.1 : 0.81 ms  LOST_PKT
+           cvm-10.1.20.105 : 3.00 ms
+            rs-10.1.20.201 : 699 ms
+#TIMESTAMP 1788269885 : 09/01/2026 01:38:05 PM
+                        IP : latency (threshold = 0.5 ms, payload = 1472 bytes)
+              gw-10.1.20.1 : unreachable
+           cvm-10.1.20.102 : 34.0 ms
+           cvm-10.1.20.104 : 0.20 ms  LOST_PKT
+            rs-10.1.20.203 : unreachable
+            pc-10.1.20.240 : unreachable
+#TIMESTAMP 1788269895 : 09/01/2026 01:38:15 PM
+                        IP : latency (threshold = 0.5 ms, payload = 1472 bytes)
+              gw-10.1.20.1 : 0.81 ms  LOST_PKT
+            rs-10.1.20.201 : 957 ms  LOST_PKT
+            rs-10.1.20.204 : unreachable
+            pc-10.1.20.240 : 2.43 ms  LOST_PKT
+#TIMESTAMP 1788269907 : 09/01/2026 01:38:27 PM
+                        IP : latency (threshold = 0.5 ms, payload = 1472 bytes)
+              gw-10.1.20.1 : unreachable
+            pc-10.1.20.240 : 2.02 ms  LOST_PKT
