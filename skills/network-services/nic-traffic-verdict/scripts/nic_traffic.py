@@ -431,10 +431,18 @@ def print_portsets(title, uids, by_uuid) -> None:
     print("")
 
 
-def acl_in_scope(acl: dict, src_pgs: set, dst_pgs: set) -> bool:
-    match = acl.get("match") or ""
-    tokens = set(PG_IN.findall(match) + PG_OUT.findall(match))
-    return bool(tokens & (src_pgs | dst_pgs))
+def source_outgoing(acl: dict, src_pgs: set) -> bool:
+    """from-lport whose inport is a port-set the source NIC belongs to."""
+    if acl.get("direction") != "from-lport":
+        return False
+    return bool(set(PG_IN.findall(acl.get("match") or "")) & src_pgs)
+
+
+def dest_incoming(acl: dict, dst_pgs: set) -> bool:
+    """to-lport whose outport is a port-set the destination NIC belongs to."""
+    if acl.get("direction") != "to-lport":
+        return False
+    return bool(set(PG_OUT.findall(acl.get("match") or "")) & dst_pgs)
 
 
 def latest_bundle() -> int:
@@ -582,39 +590,53 @@ def main() -> None:
 
     src_ids = unique_ids(src_ids)
     dst_ids = unique_ids(dst_ids)
-    scoped = [acl for acl in acls if acl_in_scope(acl, src_pgs, dst_pgs)]
-    scoped.sort(key=lambda item: (
-        -int(item.get("priority") or 0),
-        str(item.get("action") or ""),
-        str(item.get("direction") or ""),
-    ))
-    table = []
-    seen_rows = set()
-    for acl in scoped:
-        applied = applied_portset(acl, by_uuid)
-        match = acl.get("match") or ""
-        peer_list = peer_ips(match, peer_side(acl.get("direction") or ""), address_sets)
-        if not peer_list and not AS_FIELD.findall(match) and not LIT_FIELD.findall(match):
-            peer = "any"
-        else:
-            peer = name_peer(peer_list, by_uuid, ip_index, applied.get("port_set_uuid") or "")
-        direction = "out of the source" if acl.get("direction") == "from-lport" else "into the destination"
-        applies = "yes" if acl_matches(acl, pkt, address_sets) else "no"
-        marker = (
-            int(acl.get("priority") or 0),
-            acl.get("action") or "",
-            direction,
-            ip_family(match),
-            policy_label(applied),
-            category_label(applied),
-            peer,
-            l4_text(match),
-            applies,
-        )
-        if marker in seen_rows:
-            continue
-        seen_rows.add(marker)
-        table.append(marker)
+
+    def acl_table(selected):
+        selected = sorted(selected, key=lambda item: (
+            -int(item.get("priority") or 0),
+            str(item.get("action") or ""),
+        ))
+        table = []
+        seen_rows = set()
+        for acl in selected:
+            applied = applied_portset(acl, by_uuid)
+            match = acl.get("match") or ""
+            peer_list = peer_ips(match, peer_side(acl.get("direction") or ""), address_sets)
+            if not peer_list and not AS_FIELD.findall(match) and not LIT_FIELD.findall(match):
+                peer = "any"
+            else:
+                peer = name_peer(peer_list, by_uuid, ip_index, applied.get("port_set_uuid") or "")
+            applies = "yes" if acl_matches(acl, pkt, address_sets) else "no"
+            marker = (
+                int(acl.get("priority") or 0),
+                acl.get("action") or "",
+                ip_family(match),
+                policy_label(applied),
+                category_label(applied),
+                peer,
+                l4_text(match),
+                applies,
+            )
+            if marker in seen_rows:
+                continue
+            seen_rows.add(marker)
+            table.append(marker)
+        return table
+
+    def print_acl_table(title, table):
+        print("%s (%d)" % (title, len(table)))
+        if not table:
+            print("(none)")
+            print("")
+            return
+        print("| priority | action | ip | policy | category | peer | ports | matches |")
+        print("|---|---|---|---|---|---|---|---|")
+        for row in table:
+            print("| %s |" % " | ".join(cell(item) for item in row))
+        print("")
+
+    outgoing = acl_table([acl for acl in acls if source_outgoing(acl, src_pgs)])
+    incoming = acl_table([acl for acl in acls if dest_incoming(acl, dst_pgs)])
 
     src_ip = (src.get("ip") or "").split("/")[0]
     dst_ip = (dst.get("ip") or "").split("/")[0]
@@ -624,13 +646,9 @@ def main() -> None:
     print("NIC identity: %s -> %s" % (src.get("nic_uuid"), dst.get("nic_uuid")))
     print("")
     print_portsets("Source port-sets (%d)" % len(src_ids), src_ids, by_uuid)
+    print_acl_table("Source outgoing ACLs", outgoing)
     print_portsets("Destination port-sets (%d)" % len(dst_ids), dst_ids, by_uuid)
-    print("Consolidated ACL table (%d)" % len(table))
-    print("| priority | action | direction | ip | policy | category | peer | ports | matches |")
-    print("|---|---|---|---|---|---|---|---|---|")
-    for row in table:
-        print("| %s |" % " | ".join(cell(item) for item in row))
-    print("")
+    print_acl_table("Destination incoming ACLs", incoming)
     print("Conclusion")
     print("Verdict: %s" % verdict)
     print("Allow policy: %s" % allow_text)

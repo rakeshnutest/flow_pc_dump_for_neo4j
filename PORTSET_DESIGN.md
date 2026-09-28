@@ -411,7 +411,7 @@ NB join keys the ingest writes into those edges:
 
 ## Traffic between two VM NICs
 
-`skills/network-services/nic-traffic-verdict/scripts/nic_traffic.py` answers one forward packet: source VM NIC, destination VM NIC, and one L4 port. It lists every port-set of the source NIC, every port-set of the destination NIC, prints the consolidated ACL table in full, and then names the allow policy and the deny policy. TCP and UDP use the destination port. ICMP uses the type as `--port`. The skill is an atomic `network-services` skill (`skill_type`, `component`, `sub_component`, `keywords`) and lives under `skills/`, which is the corpus location.
+`skills/network-services/nic-traffic-verdict/scripts/nic_traffic.py` answers one forward packet: source VM NIC, destination VM NIC, and one L4 port. It lists every port-set of the source NIC and the outgoing ACLs for that source, then every port-set of the destination NIC and the incoming ACLs for that destination, and then names the allow policy and the deny policy. TCP and UDP use the destination port. ICMP uses the type as `--port`. The skill is an atomic `network-services` skill (`skill_type`, `component`, `sub_component`, `keywords`) and lives under `skills/`, which is the corpus location.
 
 The script reads the ingested bundle.
 
@@ -441,22 +441,30 @@ Printed sections, in this order. Every port-set row and every ACL row is printed
 |---|---|
 | Endpoints | Source and destination VM name, IP, traffic, and the two NIC uuids |
 | Source port-sets | One row per port-set that contains the source NIC: policy, category, role, port-set uuid |
-| Destination port-sets | One row per port-set that contains the destination NIC, same columns |
-| Consolidated ACL table | Every ACL on those port-sets, highest priority first. Columns: priority, action, direction, ip, policy, category, peer, ports, matches. `matches` is `yes` when the row fits this source, destination, and port. |
+| Source outgoing ACLs | Every `from-lport` ACL whose `inport` is a source port-set. Columns: priority, action, ip, policy, category, peer, ports, matches. |
+| Destination port-sets | One row per port-set that contains the destination NIC, same columns as the source list |
+| Destination incoming ACLs | Every `to-lport` ACL whose `outport` is a destination port-set. Same columns as the outgoing table. |
 | Conclusion | `Verdict`, then `Allow policy`, then `Deny policy` |
 
 The policy and peer text use the policy name and category. When the peer addresses belong to a port-set, the peer is that category and policy. When they belong to no port-set, the peer is the IP list. An address set whose OVN `addresses` list is empty is reported as having no addresses. The lines do not use `$address_set_…` or `@port_group_…` as the names.
 
 The skill that runs this is `skills/network-services/nic-traffic-verdict/SKILL.md`. `scripts/nic_traffic.py` is the command.
 
-Checked on bundle `159166`.
+Checked on bundle `159166`. Source NIC `192.168.254.130` (`inbound:inbound5`, VM `VPC_California_SJ_Pheonix_Customer_25_inbound_1`) to AppType:Apache_Spark NIC `192.168.1.23` (VM `VPC_California_SJ_Pheonix_Customer_29_FNS-L1-2_5`). `192.168.1.23` is also on two other NICs; this check uses `5620a7ae-7863-447f-8d94-cada1d746dad`. Both port-sets are `Global_Application_Policy1` (app, enforce).
 
-Inbound NIC `192.168.254.130` (`inbound:inbound5`, VM `VPC_California_SJ_Pheonix_Customer_25_inbound_1`) to AppType:Apache_Spark NIC `192.168.1.23` (VM `VPC_California_SJ_Pheonix_Customer_29_FNS-L1-2_5`), both in `Global_Application_Policy1` (app, enforce):
+Source outgoing ACLs are empty. The `inbound:inbound5` port-set has no `from-lport` rules. The decision is the destination incoming table on `AppType:Apache_Spark`:
 
-- `tcp/5560` is allowed. Allow policy: into the destination, priority 1050 `allow-related`, peer `inbound:inbound5`, TCP and UDP ranges starting at `5558-5567`. Deny policy: the same policy, priority 1045 drop, peer any, all ports. The deny does not apply.
-- `tcp/80` is denied. Allow policy: the same priority 1050 allow from `inbound:inbound5`, and `tcp/80` is outside it. Deny policy: priority 1045 drop, peer any, all ports.
+| priority | action | peer | ports | tcp/5560 | tcp/5555 |
+|---|---|---|---|---|---|
+| 1060 | drop | AppType:Apache_Spark | all ports | no | no |
+| 1052 | drop | AppType:Apache_Spark | all ports | no | no |
+| 1050 | allow-related | inbound:inbound5 | tcp/udp ranges starting at `5558-5567` | yes | no |
+| 1050 | allow-related | `192.168.253.133` and nine other addresses | tcp 22, tcp 80, tcp 1024, udp 22, icmp type 8 | no | no |
+| 1045 | drop | any | all IPv4 ports | yes | yes |
+| 1045 | drop | any | all IPv6 ports | no | no |
 
-Two AppType:Apache_Spark NICs, `192.168.1.23` to `192.168.1.16`, `tcp/80`: denied. Allow policy: none matches this pair. Deny policy: `Global_Application_Policy1` (app, enforce) on AppType:Apache_Spark, both directions, priority 1060 drop, peer AppType:Apache_Spark, all ports.
+- `tcp/5560` is allowed. Allow policy: priority 1050 `allow-related` from `inbound:inbound5`. Deny policy: priority 1045 drop. The deny does not apply.
+- `tcp/5555` is denied. Allow policy: the same priority 1050 allow, and `tcp/5555` is outside it (the first range starts at 5558). Deny policy: priority 1045 drop, all ports.
 
 ## End-to-end sequence
 

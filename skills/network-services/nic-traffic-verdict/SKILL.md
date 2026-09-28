@@ -2,7 +2,7 @@
 name: nic-traffic-verdict
 description: >-
   List every port-set a source VM NIC and a destination VM NIC belong to,
-  print the consolidated ACL table, and conclude whether that TCP, UDP, or
+  print the source outgoing ACLs and the destination incoming ACLs, and conclude whether that TCP, UDP, or
   ICMP port is allowed or denied, naming the allow policy and the deny policy.
   Use when the user gives two VM NICs and a port, asks which port-sets those
   VMs belong to, or asks which Flow policy allows or denies that traffic.
@@ -23,8 +23,9 @@ keywords:
 ## When to use
 
 A source VM NIC, a destination VM NIC, and one L4 port. The answer lists
-every port-set of the source, every port-set of the destination, the full
-consolidated ACL table, and then the conclusion.
+every port-set of the source, the outgoing ACLs for that source, every
+port-set of the destination, the incoming ACLs for that destination, and
+then the conclusion.
 
 ## STEP 1: Run the verdict
 
@@ -47,9 +48,10 @@ Print these sections in order. Keep every row of each table.
 
 1. Source and destination VM name, IP, and NIC uuid.
 2. **Source port-sets** — every port-set whose NIC list contains the source NIC.
-3. **Destination port-sets** — every port-set whose NIC list contains the destination NIC.
-4. **Consolidated ACL table** — every ACL on those port-sets, one row each, sorted by priority. Columns: priority, action, direction, ip, policy, category, peer, ports, matches.
-5. **Conclusion** — `Verdict`, `Allow policy`, and `Deny policy`.
+3. **Source outgoing ACLs** — every `from-lport` ACL whose `inport` is one of those source port-sets. Columns: priority, action, ip, policy, category, peer, ports, matches.
+4. **Destination port-sets** — every port-set whose NIC list contains the destination NIC.
+5. **Destination incoming ACLs** — every `to-lport` ACL whose `outport` is one of those destination port-sets. Same columns.
+6. **Conclusion** — `Verdict`, `Allow policy`, and `Deny policy`.
 
 `matches` is `yes` when that row fits this source, destination, and port.
 The conclusion is the highest matching row on each stage. A drop in
