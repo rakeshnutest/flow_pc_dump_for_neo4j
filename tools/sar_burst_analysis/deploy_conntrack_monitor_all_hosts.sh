@@ -12,7 +12,8 @@
 #
 # Env overrides:
 #   REMOTE_DIR=number_of_cps
-#   PYTHON_BIN=/.venv/bin/bin/python3
+#   PYTHON_BIN=          # empty (default) = auto-detect on each AHV
+#   PYTHON_BIN=/usr/bin/python3   # force a specific interpreter
 #   MAX_HOURS=24
 # ==============================================================================
 
@@ -21,7 +22,7 @@ set -euo pipefail
 REMOTE_DIR="${REMOTE_DIR:-number_of_cps}"
 # AHV sessions via hostssh/scp are root → ~ is /root
 REMOTE_PATH="/root/${REMOTE_DIR}"
-PYTHON_BIN="${PYTHON_BIN:-/.venv/bin/bin/python3}"
+PYTHON_BIN="${PYTHON_BIN:-}"
 MAX_HOURS="${MAX_HOURS:-24}"
 SCRIPT_SRC="${1:-}"
 
@@ -52,7 +53,11 @@ fi
 echo "[+] Target hosts: ${HOSTS}"
 echo "[+] Local script: ${SCRIPT_SRC}"
 echo "[+] Remote dir  : ${REMOTE_PATH}"
-echo "[+] Python      : ${PYTHON_BIN}"
+if [ -n "${PYTHON_BIN}" ]; then
+  echo "[+] Python      : ${PYTHON_BIN} (override)"
+else
+  echo "[+] Python      : auto (resolve on each AHV; override with PYTHON_BIN=/usr/bin/python3)"
+fi
 echo "[+] Max hours   : ${MAX_HOURS}"
 
 # 1) Create folder + permissions on all AHVs
@@ -67,14 +72,32 @@ for hip in ${HOSTS}; do
     "${SCRIPT_SRC}" "root@${hip}:${REMOTE_PATH}/${SCRIPT_BASENAME}"
 done
 
-# 3) Make executable and start monitor fully detached (survives hostssh exit)
+# 3) Make executable and start monitor fully detached (survives hostssh exit).
+#    On each host, resolve PY: PYTHON_BIN (if set) → /.venv/bin/python3 →
+#    /.venv/bin/bin/python3 → /usr/bin/python3 → /bin/python3 → PATH python3.
 echo "[+] start monitor in background on all hosts..."
 hostssh "chmod 755 ${REMOTE_PATH} ${REMOTE_PATH}/${SCRIPT_BASENAME}; \
-  test -x ${PYTHON_BIN} || { echo missing ${PYTHON_BIN} on \$(hostname); exit 1; }; \
+  PY=''; \
+  if [ -n '${PYTHON_BIN}' ] && [ -x '${PYTHON_BIN}' ]; then \
+    PY='${PYTHON_BIN}'; \
+  elif [ -x /.venv/bin/python3 ]; then \
+    PY=/.venv/bin/python3; \
+  elif [ -x /.venv/bin/bin/python3 ]; then \
+    PY=/.venv/bin/bin/python3; \
+  elif [ -x /usr/bin/python3 ]; then \
+    PY=/usr/bin/python3; \
+  elif [ -x /bin/python3 ]; then \
+    PY=/bin/python3; \
+  elif command -v python3 >/dev/null 2>&1 && [ -x \"\$(command -v python3)\" ]; then \
+    PY=\$(command -v python3); \
+  else \
+    echo missing python3 on \$(hostname); exit 1; \
+  fi; \
+  echo using_python=\$PY host=\$(hostname); \
   pkill -f '${REMOTE_PATH}/${SCRIPT_BASENAME}' 2>/dev/null || true; \
   sleep 1; \
   cd ${REMOTE_PATH} && \
-  setsid nohup ${PYTHON_BIN} ./${SCRIPT_BASENAME} \
+  setsid nohup \"\$PY\" ./${SCRIPT_BASENAME} \
     --output-dir ${REMOTE_PATH} \
     --max-hours ${MAX_HOURS} \
     </dev/null >${REMOTE_PATH}/monitor.out 2>&1 & \
