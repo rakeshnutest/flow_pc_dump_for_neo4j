@@ -2,7 +2,7 @@
 
 How a Flow port-set UUID is produced from a policy dump, how Atlas membership is joined to that UUID, how the two ClickHouse trees decide match, leftover, and path impact, and how two VM NICs plus one L4 port become an allow or deny verdict with the policy name on each side.
 
-Sources: `clickhouse_flow` (`ingest.py`, `compare.py`, `observe_leftovers.py`, `update_policy_port_sets.py`, `portset_traffic.py`, `schema.sql`), `clickhouse_ovn` (`dataplane.py`, `trace.py`), and `.cursor/skills/nic-traffic-verdict`. Identity is the port-set UUID. Names are display labels.
+Sources: `clickhouse_flow` (`ingest.py`, `compare.py`, `observe_leftovers.py`, `update_policy_port_sets.py`, `portset_traffic.py`, `schema.sql`), `clickhouse_ovn` (`dataplane.py`, `trace.py`), and `skills/network-services/nic-traffic-verdict`. Identity is the port-set UUID. Names are display labels.
 
 ## What a port-set is
 
@@ -411,7 +411,7 @@ NB join keys the ingest writes into those edges:
 
 ## Traffic between two VM NICs
 
-`.cursor/skills/nic-traffic-verdict/scripts/nic_traffic.py` answers one forward packet: source VM NIC, destination VM NIC, and one L4 port. The answer always names the allow policy and the deny policy. TCP and UDP use the destination port. ICMP uses the type as `--port`.
+`skills/network-services/nic-traffic-verdict/scripts/nic_traffic.py` answers one forward packet: source VM NIC, destination VM NIC, and one L4 port. It lists every port-set of the source NIC, every port-set of the destination NIC, prints the consolidated ACL table in full, and then names the allow policy and the deny policy. TCP and UDP use the destination port. ICMP uses the type as `--port`. The skill is an atomic `network-services` skill (`skill_type`, `component`, `sub_component`, `keywords`) and lives under `skills/`, which is the corpus location.
 
 The script reads the ingested bundle.
 
@@ -435,21 +435,19 @@ The policy name is `rule_u_sg.policy_name` on the port-set whose port group is i
 
 The allow line is the highest allow that matches both NICs and the port. When no allow covers the port, the line names the allow policy that matches the two NICs and states that this port is outside it. The deny line is the highest drop that matches. Both lines are printed for every verdict. When no allow matches the two NICs at all, the allow line says so. When no drop matches, the deny line says so.
 
-Printed fields, in this order:
+Printed sections, in this order. Every port-set row and every ACL row is printed.
 
-| Line | Content |
+| Section | Content |
 |---|---|
-| `Verdict` | `allowed` or `denied` |
-| `Source` | VM name and IP |
-| `Destination` | VM name and IP |
-| `Traffic` | `tcp/<port>`, `udp/<port>`, or `icmp/<type>` |
-| `Allow policy` | Policy name, type, mode, category, direction, priority, action, peer, and ports. A trailing sentence says when that allow does not apply or when the asked port is outside it. |
-| `Deny policy` | Same shape for the drop. A trailing sentence says when that drop does not apply. |
-| `NIC identity` | Source NIC uuid, then destination NIC uuid |
+| Endpoints | Source and destination VM name, IP, traffic, and the two NIC uuids |
+| Source port-sets | One row per port-set that contains the source NIC: policy, category, role, port-set uuid |
+| Destination port-sets | One row per port-set that contains the destination NIC, same columns |
+| Consolidated ACL table | Every ACL on those port-sets, highest priority first. Columns: priority, action, direction, ip, policy, category, peer, ports, matches. `matches` is `yes` when the row fits this source, destination, and port. |
+| Conclusion | `Verdict`, then `Allow policy`, then `Deny policy` |
 
 The policy and peer text use the policy name and category. When the peer addresses belong to a port-set, the peer is that category and policy. When they belong to no port-set, the peer is the IP list. An address set whose OVN `addresses` list is empty is reported as having no addresses. The lines do not use `$address_set_…` or `@port_group_…` as the names.
 
-The skill that runs this is `.cursor/skills/nic-traffic-verdict/`. `SKILL.md` is the trigger. `scripts/nic_traffic.py` is the command.
+The skill that runs this is `skills/network-services/nic-traffic-verdict/SKILL.md`. `scripts/nic_traffic.py` is the command.
 
 Checked on bundle `159166`.
 
@@ -496,5 +494,5 @@ python3 clickhouse_flow/ingest.py --dump_dir /path/to/dump --log_bundle_id 123
 python3 clickhouse_flow/compare.py --log_bundle_id 123
 python3 clickhouse_flow/observe_leftovers.py --log_bundle_id 123 --dump_dir /path/to/dump
 python3 clickhouse_ovn/trace.py --log_bundle_id 123 --src <vm|mac|lsp> --dst <vm|mac|lsp|external>
-python3 .cursor/skills/nic-traffic-verdict/scripts/nic_traffic.py --log_bundle_id 123 --src <nic-uuid-or-ip> --dst <nic-uuid-or-ip> --port 443 --proto tcp
+python3 skills/network-services/nic-traffic-verdict/scripts/nic_traffic.py --log_bundle_id 123 --src <nic-uuid-or-ip> --dst <nic-uuid-or-ip> --port 443 --proto tcp
 ```

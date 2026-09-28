@@ -281,10 +281,7 @@ def name_peer(ips: list, by_uuid: dict, ip_index: dict, applied_uuid: str) -> st
         for uid in ip_index.get(ip, ()):
             scores[uid] += 1
     if not scores:
-        sample = ", ".join(ips[:8])
-        if len(ips) > 8:
-            sample += " and %d more" % (len(ips) - 8)
-        return sample
+        return ", ".join(ips)
     best_id, _best_n = scores.most_common(1)[0]
     chosen = best_id
     if best_id == applied_uuid:
@@ -390,6 +387,54 @@ def dump_dir(bid: int) -> str:
     if found:
         return found[0].get("dump_dir") or ""
     return ""
+
+
+def ip_family(match: str) -> str:
+    has4 = "ip4" in (match or "")
+    has6 = "ip6" in (match or "")
+    if has4 and has6:
+        return "ip4 and ip6"
+    if has4:
+        return "ip4"
+    if has6:
+        return "ip6"
+    return "any"
+
+
+def cell(value) -> str:
+    return str(value or "").replace("|", "/").replace("\n", " ")
+
+
+def unique_ids(uids: list) -> list:
+    seen = []
+    for uid in uids:
+        if uid and uid not in seen:
+            seen.append(uid)
+    return seen
+
+
+def print_portsets(title, uids, by_uuid) -> None:
+    print(title)
+    print("| policy | category | role | port-set |")
+    print("|---|---|---|---|")
+    if not uids:
+        print("| (none) | | | |")
+        return
+    for uid in uids:
+        ps = by_uuid.get(uid) or {}
+        print("| %s | %s | %s | %s |" % (
+            cell(policy_label(ps)),
+            cell(category_label(ps)),
+            cell(ps.get("role") or ""),
+            uid,
+        ))
+    print("")
+
+
+def acl_in_scope(acl: dict, src_pgs: set, dst_pgs: set) -> bool:
+    match = acl.get("match") or ""
+    tokens = set(PG_IN.findall(match) + PG_OUT.findall(match))
+    return bool(tokens & (src_pgs | dst_pgs))
 
 
 def latest_bundle() -> int:
@@ -517,13 +562,10 @@ def main() -> None:
         if verdict == "denied":
             allow_text += ". Does not apply; a higher-priority deny wins."
     elif near_allows:
-        shown = []
-        for acl in near_allows[:3]:
-            shown.append(
-                describe(acl, by_uuid, ip_index, address_sets)
-                + ". %s/%s is outside this allow." % (args.proto, args.port)
-            )
-        allow_text = " ".join(shown)
+        allow_text = (
+            describe(near_allows[0], by_uuid, ip_index, address_sets)
+            + ". %s/%s is outside this allow." % (args.proto, args.port)
+        )
     else:
         allow_text = "No allow policy matches this source and destination."
 
@@ -538,15 +580,63 @@ def main() -> None:
     else:
         deny_text = "No deny policy matches this traffic."
 
-    print("Verdict: %s" % verdict)
-    print("Source: %s  %s" % (src.get("vm_name") or "", (src.get("ip") or "").split("/")[0]))
-    print("Destination: %s  %s" % (dst.get("vm_name") or "", (dst.get("ip") or "").split("/")[0]))
+    src_ids = unique_ids(src_ids)
+    dst_ids = unique_ids(dst_ids)
+    scoped = [acl for acl in acls if acl_in_scope(acl, src_pgs, dst_pgs)]
+    scoped.sort(key=lambda item: (
+        -int(item.get("priority") or 0),
+        str(item.get("action") or ""),
+        str(item.get("direction") or ""),
+    ))
+    table = []
+    seen_rows = set()
+    for acl in scoped:
+        applied = applied_portset(acl, by_uuid)
+        match = acl.get("match") or ""
+        peer_list = peer_ips(match, peer_side(acl.get("direction") or ""), address_sets)
+        if not peer_list and not AS_FIELD.findall(match) and not LIT_FIELD.findall(match):
+            peer = "any"
+        else:
+            peer = name_peer(peer_list, by_uuid, ip_index, applied.get("port_set_uuid") or "")
+        direction = "out of the source" if acl.get("direction") == "from-lport" else "into the destination"
+        applies = "yes" if acl_matches(acl, pkt, address_sets) else "no"
+        marker = (
+            int(acl.get("priority") or 0),
+            acl.get("action") or "",
+            direction,
+            ip_family(match),
+            policy_label(applied),
+            category_label(applied),
+            peer,
+            l4_text(match),
+            applies,
+        )
+        if marker in seen_rows:
+            continue
+        seen_rows.add(marker)
+        table.append(marker)
+
+    src_ip = (src.get("ip") or "").split("/")[0]
+    dst_ip = (dst.get("ip") or "").split("/")[0]
+    print("Source: %s  %s" % (src.get("vm_name") or "", src_ip))
+    print("Destination: %s  %s" % (dst.get("vm_name") or "", dst_ip))
     print("Traffic: %s/%s" % (args.proto, args.port))
+    print("NIC identity: %s -> %s" % (src.get("nic_uuid"), dst.get("nic_uuid")))
+    print("")
+    print_portsets("Source port-sets (%d)" % len(src_ids), src_ids, by_uuid)
+    print_portsets("Destination port-sets (%d)" % len(dst_ids), dst_ids, by_uuid)
+    print("Consolidated ACL table (%d)" % len(table))
+    print("| priority | action | direction | ip | policy | category | peer | ports | matches |")
+    print("|---|---|---|---|---|---|---|---|---|")
+    for row in table:
+        print("| %s |" % " | ".join(cell(item) for item in row))
+    print("")
+    print("Conclusion")
+    print("Verdict: %s" % verdict)
     print("Allow policy: %s" % allow_text)
     print("Deny policy: %s" % deny_text)
     if missing_nb:
         print("Address sets were not resolved because the OVN northbound dump is missing.")
-    print("NIC identity: %s -> %s" % (src.get("nic_uuid"), dst.get("nic_uuid")))
 
 
 if __name__ == "__main__":
