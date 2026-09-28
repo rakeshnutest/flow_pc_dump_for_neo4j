@@ -1,2 +1,3 @@
 __pycache__/
 *.py[cod]
+start_monitor_on_host.sh
