@@ -1,11 +1,11 @@
 ---
 name: nic-traffic-verdict
 description: >-
-  List every port-set a source VM NIC and a destination VM NIC belong to,
-  print the source outgoing ACLs and the destination incoming ACLs, and conclude whether that TCP, UDP, or
-  ICMP port is allowed or denied, naming the allow policy and the deny policy.
-  Use when the user gives two VM NICs and a port, asks which port-sets those
-  VMs belong to, or asks which Flow policy allows or denies that traffic.
+  ACL plus path traversal for two VM NICs. Walk VM, subnet, switch, router,
+  and gateway, then list the source outgoing ACLs and the destination
+  incoming ACLs and say whether that TCP, UDP, or ICMP port is allowed or
+  denied, naming the allow policy and the deny policy.
+  Use when the user gives two VMs or VM NICs and a port.
 skill_type: atomic
 component: network-services
 sub_component: nic_traffic_verdict
@@ -18,14 +18,17 @@ keywords:
   - Flow policy
   - from-lport
   - to-lport
+  - path traversal
+  - switch
+  - router
+  - gateway
 ---
 
 ## When to use
 
-A source VM NIC, a destination VM NIC, and one L4 port. The answer lists
-every port-set of the source, the outgoing ACLs for that source, every
-port-set of the destination, the incoming ACLs for that destination, and
-then the conclusion.
+Two VMs, or two VM NICs, and one L4 port. The skill does both halves.
+
+Traversal walks VM → subnet → switch → router → gateway, with northbound and southbound fields on each hop. ACL lists every port-set, the source outgoing rules, the destination incoming rules, and the allow policy and the deny policy.
 
 ## STEP 1: Run the verdict
 
@@ -42,16 +45,26 @@ python3 skills/network-services/nic-traffic-verdict/scripts/nic_traffic.py \
 ICMP type. Omit `--log_bundle_id` to use the latest `flow_policy` bundle.
 ClickHouse is `127.0.0.1:19000`, user `default`.
 
-## STEP 2: Emit the script output in full
+## STEP 2: Read the JSON and the markdown
 
-Print these sections in order. Keep every row. `peer IPs` is printed by default for every ACL: every address in that peer category, with none left out.
+The script writes both. The JSON is the analysis record. The markdown is the rendering.
 
-1. Source and destination VM name, IP, and NIC uuid.
-2. **Source port-sets** — every port-set whose NIC list contains the source NIC.
-3. **Source outgoing ACLs** — every `from-lport` ACL whose `inport` is one of those source port-sets. Columns: priority, action, ip, policy, category, peer, peer IPs, ports, matches. `peer IPs` is every address in that ACL's peer category.
-4. **Destination port-sets** — every port-set whose NIC list contains the destination NIC.
-5. **Destination incoming ACLs** — every `to-lport` ACL whose `outport` is one of those destination port-sets. Same columns.
-6. **Conclusion** — `Verdict`, `Allow policy`, and `Deny policy`.
+JSON keys, in order: `traffic`, `tables`, `path`, `acl_source`, `acl_destination`, `verdict`, `ip_mapping`.
+
+`tables` lists `ovn_switch`, `ovn_subnet`, `ovn_router`, and `ovn_l2gw`, and how each column is used. Those tables are filled at ingest. See [PATH_TABLES.md](../../../clickhouse_ovn/PATH_TABLES.md).
+
+`path` is always present. It has the source switch and the destination switch, each with northbound fields, southbound fields, and the VM port number. When the NICs are on different switches it lists every router on the path. When the path leaves through a gateway it includes that gateway's external IP. `l2gw` lists localnet, l2gateway, and geneve rows for those switches.
+
+The markdown draws one mermaid diagram. Each VPC is its own box: host, VM MAC and IP, switch tunnel key in hex, and the tenant router. External gateways sit in their own box, labeled with the redirect-chassis host, the external MAC, and the router tunnel key in hex. Geneve 6081 links a VPC to a gateway. The external link joins the gateways.
+
+Then the file lists VPC, subnet, VLAN, host, Geneve IP, MACs, and hex tunnel keys. Each external gateway has its own host block: hostname, Geneve IP, chassis, chassis name, HA group, and HA priority. The file also has tcpdump on the TAP and on the host NIC, and four tables:
+
+1. **ACL source** — `from-lport` rules whose `inport` is a source port-set. Columns: rule, action, ip, policy, category, peer, ports, matches.
+2. **ACL destination** — `to-lport` rules whose `outport` is a destination port-set. Same columns.
+3. **Verdict** — verdict, allow policy, deny policy.
+4. **IP mapping** — one row per peer address. Prefix lengths stay on the address.
+
+`rule` is the OVN priority. Peer addresses are not repeated inside the ACL tables.
 
 `matches` is `yes` when that row fits this source, destination, and port.
 The conclusion is the highest matching row on each stage. A drop in
