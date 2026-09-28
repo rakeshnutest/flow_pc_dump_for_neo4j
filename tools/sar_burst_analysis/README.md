@@ -10,6 +10,7 @@ synthetic UDP flow bursts to stress IPFIX / conntrack (new 5-tuple per packet).
 | `scan_sar_packet_bursts.sh` | List interface samples with rx/tx ≥ threshold (default 50k pkts/s) |
 | `analyze_sar_bursts.sh` | Top burst peaks + CPU `%sys` / `%soft` during ramp hour |
 | `analyze_udp_conntrack_pattern.sh` | AHV OVS conntrack dump: protocol mix, top UDP ports, NetBIOS 137 zones, diurnal estimate |
+| `monitor_conntrack_rates.py` | Netlink NEW/DESTROY rate CSV logger (host-IP suffix; default 24h max) |
 | `simulate_ipfix_flow_burst.py` | High-CPS UDP to one dest; new socket/sport each packet |
 | `simulate_netbios_multidst.py` | NetBIOS-ish UDP cycling multiple dests (default UDP/137) |
 
@@ -51,6 +52,29 @@ allssh "bash -s" < analyze_udp_conntrack_pattern.sh
 Stdout is **tee'd** to `/tmp/conntrack_analysis_<host>_<ts>.txt` on each host.
 
 Report sections: (1) table capacity & UDP timeout, (2) protocol distribution, (3) top UDP ports, (4) NetBIOS UDP 137 tuples/`zone=` (matches `sport=137` or `dport=137`), (5) estimated 24-hour diurnal UDP ranges. **Section 5 ranges are estimates scaled from the current UDP snapshot**, not measured historical samples.
+
+## Netlink conntrack rate monitor
+
+Live NEW/DESTROY rates via `NETLINK_NETFILTER` (needs root / `CAP_NET_ADMIN` on AHV). Print rates while logging CSV:
+
+```bash
+python3 monitor_conntrack_rates.py --print
+```
+
+Defaults:
+
+- CSV path: `/tmp/conntrack_rates_<host_ip>.csv`
+- `--max-hours 24` (use `0` for unlimited)
+- Any `--output` path still gets `_<host_ip>` inserted before the extension so `allssh` runs from multiple AHVs do not collide under `/tmp`
+
+Host IP selection order for the path suffix:
+
+1. first non-loopback IPv4 from `hostname -I`
+2. else first non-loopback IPv6 from `hostname -I` (colons → `_`)
+3. else UDP connect to `8.8.8.8:80` local address
+4. else hostname with dots → `_`
+
+Optional `--print-details` prints each NEW/DESTROY 5-tuple (very verbose under load).
 
 ## Correlate with AHV IPFIX exporter-cmd
 
