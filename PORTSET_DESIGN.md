@@ -271,6 +271,36 @@ ACL interpretation uses the same file:
 
 `flow_ovn` is a separate database. Path tracking does not write `flow_policy`.
 
+### 5. Path traversal (`nic_traffic.py`)
+
+This is the OVN check for one forward packet. It does not recompute a port-set hash. It joins the NIC to the subnet, the switch, the routers, and the external gateway, then applies the ACLs.
+
+Join, loaded at ingest into `ovn_switch`, `ovn_subnet`, `ovn_router`, and `ovn_l2gw`. Each of those rows keeps the northbound object and the southbound binding together.
+
+`flow_policy.vm_nic` → `ovn_subnet` → `ovn_switch` → `ovn_edge_ls_lr` / `ovn_edge_lr_lr` → `ovn_router` → external gateway.
+
+What the markdown verifies, in order:
+
+| Check | Where it comes from |
+|---|---|
+| VPC, subnet, prefix, VLAN, VM MAC, DHCP gateway MAC | `vm_nic` and `ovn_subnet` |
+| Host and Geneve IP | `ovn_chassis` and `ovn_encap` for the VM port binding |
+| Switch tunnel key and port tunnel key, decimal and 6-digit hex | `ovn_switch.sb_tunnel_key`, `ovn_port_binding.tunnel_key` |
+| Every router when the NICs are on different switches | Shortest path on `ovn_edge_ls_lr` and `ovn_edge_lr_lr` |
+| Router port MAC and address, including the logical-router MAC, which is not the DHCP gateway MAC | `ovn_router.ports` |
+| External gateway IP, MAC, redirect-chassis host, Geneve IP, chassis, chassis name, HA group, HA priority | External router port plus `ovn_ha_chassis` |
+| Tunnel id on the hop into the gateway | Transit switch between the tenant router and the gateway router |
+| Tunnel id on the external hop | External switch that both gateway ports sit on |
+| Tunnel id on the hop back to the destination router | Transit switch between the destination gateway and the destination tenant router |
+| Drop cookie and rule number, drawn on the switch that enforces it | First 32 bits of the ACL uuid (OVN stage-hint). `to-lport` is the destination switch. `from-lport` is the source switch. |
+| TAP and Geneve capture commands | VM logical port on that host, and UDP 6081 toward the next Geneve IP |
+| Source outgoing ACLs and destination incoming ACLs | `ovn_acl`. Peer addresses are a separate IP-mapping table. |
+| Allow policy and deny policy | Highest matching row on each stage. An enforce drop denies. A monitor drop is reported and the verdict stays allowed. |
+
+The mermaid is three boxes when the path leaves the VPC: source VPC, external gateways, destination VPC. A host that is both a VM host and a redirect chassis is named once and called out as two roles.
+
+`trace.py` in section 4 is the older composite path and the Atlas-leftover note. `nic_traffic.py` is the traversal above. Commands for both, run together or one stage at a time, are under [How to trigger](#how-to-trigger).
+
 ## ClickHouse schema
 
 Two databases on the same server. Native `127.0.0.1:19000`, HTTP `127.0.0.1:8123`, user `default`. `clickhouse_ovn` never writes `flow_policy`. `clickhouse_flow` never writes `flow_ovn`.
