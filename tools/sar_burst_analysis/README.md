@@ -63,9 +63,14 @@ python3 monitor_conntrack_rates.py --print
 
 Defaults:
 
-- CSV path: `/tmp/conntrack_rates_<host_ip>.csv`
+- CSV directory: `/tmp` (`--output-dir DIR` to change; creates DIR if needed)
+- CSV file: `<output-dir>/conntrack_rates_<host_ip>.csv`
 - `--max-hours 24` (use `0` for unlimited)
-- Any `--output` path still gets `_<host_ip>` inserted before the extension so `allssh` runs from multiple AHVs do not collide under `/tmp`
+- Optional `--output PATH` sets a full file path (still gets `_<host_ip>` before the extension)
+
+```bash
+python3 monitor_conntrack_rates.py --print --output-dir /var/log/conntrack_rates
+```
 
 Host IP selection order for the path suffix:
 

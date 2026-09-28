@@ -6,7 +6,7 @@ NETLINK_NETFILTER, tallies events per second, and appends CSV rows. Optional
 --print / --print-details emit rates (and parsed 5-tuples) to stdout.
 
 CSV paths always include a host-IP suffix so allssh runs from multiple AHVs
-do not collide under /tmp.
+do not collide. Default directory is /tmp; override with --output-dir.
 """
 
 from __future__ import annotations
@@ -275,18 +275,42 @@ def open_csv(path: str):
     return fh
 
 
+def resolve_output_path(output: str | None, output_dir: str, host_ip: str) -> str:
+    """Build CSV path under output_dir (default /tmp), always host-IP-suffixed.
+
+    If --output is a full file path, that path is used (still host-IP-suffixed).
+    Otherwise write conntrack_rates_<host_ip>.csv under --output-dir.
+    """
+    if output:
+        path = with_host_ip_suffix(output, host_ip)
+    else:
+        path = os.path.join(output_dir, f"conntrack_rates_{host_ip}.csv")
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    return path
+
+
 def main() -> int:
     host_ip = get_host_ip()
     parser = argparse.ArgumentParser(
         description=(
             "Netlink conntrack NEW/DESTROY rate monitor. "
-            "Logs per-second rates to a host-IP-suffixed CSV under /tmp by default."
+            "Logs per-second rates to a host-IP-suffixed CSV "
+            "(directory defaults to /tmp; override with --output-dir)."
         )
     )
     parser.add_argument(
+        "--output-dir",
+        default="/tmp",
+        help="Directory for the CSV log (default: /tmp)",
+    )
+    parser.add_argument(
         "--output",
-        default=f"/tmp/conntrack_rates_{host_ip}.csv",
-        help="CSV output path (host IP is inserted before the extension if missing)",
+        default=None,
+        help=(
+            "Full CSV path (optional). Overrides --output-dir for location; "
+            "host IP is still inserted before the extension if missing"
+        ),
     )
     parser.add_argument(
         "--max-hours",
@@ -318,7 +342,7 @@ def main() -> int:
         help="Print each NEW/DESTROY 5-tuple (very verbose under load)",
     )
     args = parser.parse_args()
-    args.output = with_host_ip_suffix(args.output, host_ip)
+    args.output = resolve_output_path(args.output, args.output_dir, host_ip)
 
     if args.interval <= 0:
         parser.error("--interval must be > 0")
