@@ -10,7 +10,7 @@ synthetic UDP flow bursts to stress IPFIX / conntrack (new 5-tuple per packet).
 | `scan_sar_packet_bursts.sh` | List interface samples with rx/tx ≥ threshold (default 50k pkts/s) |
 | `analyze_sar_bursts.sh` | Top burst peaks + CPU `%sys` / `%soft` during ramp hour |
 | `analyze_udp_conntrack_pattern.sh` | AHV OVS conntrack dump: protocol mix, top UDP ports, NetBIOS 137 zones, diurnal estimate |
-| `monitor_conntrack_rates.py` | Netlink NEW/DESTROY rate CSV logger (host-IP suffix; default 24h max) |
+| `monitor_conntrack_rates.py` | Netlink NEW/DESTROY rate CSV logger (`--output-dir`, host-IP suffix; default 24h) |
 | `simulate_ipfix_flow_burst.py` | High-CPS UDP to one dest; new socket/sport each packet |
 | `simulate_netbios_multidst.py` | NetBIOS-ish UDP cycling multiple dests (default UDP/137) |
 
