@@ -1,6 +1,6 @@
 # Path tables
 
-These four tables are loaded while the OVN dump is ingested. Each row holds the northbound object and the southbound binding. Analysis reads them. It does not parse the dump again.
+These tables are loaded while the OVN dump is ingested. Each row holds the northbound object and the southbound binding. Analysis reads them. It does not parse the dump again. `ovn_nat` and `ovn_pbr` are not in this set. The full OVN ingest fills those, and the verdict reads them when it labels NAT, no NAT, and policy routing.
 
 Join for a VM NIC:
 
@@ -17,7 +17,7 @@ python3 clickhouse_ovn/path_tables.py \
   --dump_dir /path/to/dump --log_bundle_id <id>
 ```
 
-That command reloads only these four tables. A full `ingest.py` run fills them with the rest of `flow_ovn`.
+That command reloads `ovn_switch`, `ovn_subnet`, `ovn_router`, `ovn_route`, and `ovn_l2gw`. A full `ingest.py` run fills them with the rest of `flow_ovn`, including `ovn_nat` and `ovn_pbr`.
 
 ## `ovn_switch`
 
@@ -80,6 +80,25 @@ One logical router. Router ports are the `ports` array. Each port carries the sw
 | `ports.sb_tunnel_key` | SB | Port number in southbound |
 | `ports.sb_up` | SB | 1 when the binding is up |
 
+## `ovn_route`
+
+One connected or static route on one logical router. The verdict marks `matches=yes` on the longest prefix that contains this packet. Two prefixes of that same length both match. `169.254.2.100` and `169.254.2.101` are the `nb_nexthop` values of the two tenant default routes. They are the transit addresses of the scale-out gateways, resolved from `ovn_router.ports.nb_networks`.
+
+| Column | Side | Use |
+|---|---|---|
+| `lr_uuid` | NB | Router this route belongs to |
+| `route_uuid` | NB | Static-route uuid. For a connected route, the router-port uuid |
+| `kind` | NB | `connected` or `static` |
+| `nb_prefix` | NB | Prefix tested against the packet |
+| `nb_nexthop` | NB | Next hop. Empty on a connected route |
+| `nb_policy` | NB | `dst-ip` uses the destination. `src-ip` uses the source |
+| `nb_output_port` | NB | Router port the route leaves on |
+| `nb_route_table` | NB | OVN route table name |
+| `sb_datapath_uuid` | SB | Router datapath. This dump has no southbound Route table |
+| `sb_tunnel_key` | SB | Router tunnel key |
+| `sb_output_tunnel_key` | SB | Tunnel key of the output port binding |
+| `sb_chassis_uuid` | SB | Chassis on that output port, when the binding has one |
+
 ## `ovn_l2gw`
 
 One localnet port, one l2gateway port, or one geneve stretch chassis.
@@ -110,4 +129,4 @@ One localnet port, one l2gateway port, or one geneve stretch chassis.
 
 The JSON always has `tables` (this catalog), `path`, `acl_source`, `acl_destination`, `verdict`, and `ip_mapping`. `path.tunnels` has the transit-switch tunnel id into the gateway, the external-switch tunnel id, and the transit-switch tunnel id back to the destination router. `verdict.drop_cookie` is the OpenFlow cookie of an enforce drop: the first 32 bits of that ACL uuid. `verdict.drop_where` is `destination switch` for `to-lport` and `source switch` for `from-lport`.
 
-The markdown draws one mermaid flowchart. Each hop label is that tunnel id. The drop cookie is written on the switch that enforces it. Then the file lists hosts, gateway redirect chassis, tcpdump commands, and four tables: ACL source, ACL destination, verdict, and IP mapping.
+The markdown draws one mermaid flowchart. Each hop label is that tunnel id. When the path leaves for an address outside this system, both scale-out transit next hops are nodes, labeled NAT or no NAT, and a policy-routing reroute is an edge between those gateways. Inbound to a private address draws every gateway that routes the prefix, labeled no NAT. Inbound to a NAT external IP draws only the gateway that owns it, labeled DNAT. The drop cookie is written on the switch that enforces it. Then the file lists hosts, routing tables, policy routing, NAT, gateway redirect chassis, tcpdump commands, and four ACL tables: ACL source, ACL destination, verdict, and IP mapping. The worked diagrams are in [PORTSET_DESIGN.md](../PORTSET_DESIGN.md) under "Path traversal".
