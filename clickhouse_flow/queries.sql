@@ -115,3 +115,12 @@ SELECT
 FROM flow_policy.vm_nic AS n
 WHERE n.log_bundle_id = {log_bundle_id:UInt64}
   AND n.nic_uuid = {nic_uuid:UUID};
+
+SELECT
+    port_set_uuid,
+    traffic_in,
+    traffic_out
+FROM flow_policy.portset
+WHERE log_bundle_id = {log_bundle_id:UInt64}
+  AND (notEmpty(traffic_in) OR notEmpty(traffic_out))
+LIMIT 20;

@@ -351,7 +351,18 @@ Shared rules, from `clickhouse_flow/schema.sql` and `clickhouse_ovn/schema.sql`:
 | `mismatch_kind` | `LowCardinality(String)` | `computed_without_atlas`, `atlas_without_computed`, `nic_set`, or empty on a match |
 | `atlas_name`, `vpc_name` | `String`, `LowCardinality(String)` | Atlas display name and VPC name |
 | `all_ports` | `UInt8` | `1` when the rule is isolation, allow-spec `NONE`, or all-protocol with no service group |
+| `traffic_in` | `Array(Tuple(priority Int32, action LowCardinality(String), peers Array(String), ports Array(String)))` | Allow rules for traffic **into** this port-set |
+| `traffic_out` | same tuple | Allow rules for traffic **out of** this port-set |
 | `updated_at` | `DateTime64(3)` | ReplacingMergeTree version |
+
+`traffic_in` and `traffic_out` are the port-set form of `policy_port_set/ovn_port_set_traffic.sh`. OVN names the port-set `port_group_<uuid with '-' turned into '_'>`.
+
+| Direction | ACL match | Who the peer is |
+|---|---|---|
+| Into the port-set (`traffic_in`) | `outport == @port_group_<uuid>` | `ip4.src` / `ip6.src` |
+| Out of the port-set (`traffic_out`) | `inport == @port_group_<uuid>` | `ip4.dst` / `ip6.dst` |
+
+Stored actions are `allow`, `allow-related`, and `allow-stateless`. Drop ACLs stay in `flow_ovn.ovn_acl` and are not copied onto the port-set row. `peers` is `ANY` when the match has no address, the address-set name when the NB dump has no addresses for it, or the `Address_Set.addresses` list when the NB dump resolves `$address_set_…`. `ports` is `tcp.dst 22`, `tcp.dst 15981-15990`, `icmp4.type 8`, or `ALL`. `clickhouse_flow/portset_traffic.py` fills both columns during ingest from `dump_dir/cmsp_ovn/anc-ovn/commands/ovsdb-client_dump_nb.txt`, or from `flow_ovn.ovn_acl` when that file is absent. `compare.py` copies the columns through the match stamp.
 
 `vm_nic` is the NIC lookup used to fill those tuples: `nic_uuid`, `vm_uuid`, `vm_name`, `subnet_uuid`, `subnet`, `vpc_uuid`, `vpc`, `ip`, `host_uuid`, `host`, `cluster_uuid`, `cluster`. `category` is `category_uuid` → `name` (`key:value` when the dump has both).
 

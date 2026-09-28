@@ -20,6 +20,12 @@
 -- every VM NIC if the policy has no project.
 -- Secured-group NICs exclude VLAN Basic (advance_vlan /
 -- is_advanced_networking false). Advanced VLAN and overlay stay.
+-- traffic_in  = allow ACLs whose match is outport == @port_group_<this uuid>
+--   (traffic allowed into the port-set; peer is ip.src).
+-- traffic_out = allow ACLs whose match is inport == @port_group_<this uuid>
+--   (traffic allowed out of the port-set; peer is ip.dst).
+-- peers are Address_Set addresses when the NB dump resolves them, else ANY.
+-- ports are tcp/udp/icmp selectors, or ALL. Drops are not stored.
 -- Zero UUID means not present.
 -- Native 127.0.0.1:19000 / HTTP 8123.
 -- Panacea-style: every fact row has log_bundle_id; PARTITION BY log_bundle_id
@@ -154,6 +160,18 @@ CREATE TABLE IF NOT EXISTS flow_policy.portset
         cluster String
     )) DEFAULT [],
     all_ports                  UInt8 DEFAULT 0,
+    traffic_in Array(Tuple(
+        priority Int32,
+        action LowCardinality(String),
+        peers Array(String),
+        ports Array(String)
+    )) DEFAULT [],
+    traffic_out Array(Tuple(
+        priority Int32,
+        action LowCardinality(String),
+        peers Array(String),
+        ports Array(String)
+    )) DEFAULT [],
     updated_at                 DateTime64(3) DEFAULT now64()
 )
 ENGINE = ReplacingMergeTree(updated_at)

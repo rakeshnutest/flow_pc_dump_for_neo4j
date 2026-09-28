@@ -267,6 +267,8 @@ def main():
         help="Panacea log_bundle_id (default: latest flow_policy.bundle)")
     args = parser.parse_args()
     bid = env_or_latest_bundle(args.log_bundle_id)
+    from portset_traffic import ensure_traffic_columns
+    ensure_traffic_columns()
     sys.stderr.write("log_bundle_id=%s\n" % bid)
     sys.stderr.flush()
 
