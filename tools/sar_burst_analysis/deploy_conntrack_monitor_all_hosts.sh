@@ -59,9 +59,10 @@ echo "[+] chmod script on all hosts..."
 hostssh "chmod 755 ${REMOTE_PATH}/${SCRIPT_BASENAME}"
 
 echo "[+] start monitor in background on all hosts..."
-hostssh "nohup python3 /root/number_of_cps/monitor_conntrack_rates.py --print --output-dir /root/number_of_cps  2>&1 &"
+hostssh 'setsid -f python3 /root/number_of_cps/monitor_conntrack_rates.py --output-dir /root/number_of_cps </dev/null >/root/number_of_cps/monitor.out 2>&1'
 
 echo "[+] Done. Start issued on all hosts."
 echo "    CSV : ${REMOTE_PATH}/conntrack_rates_<hostname>.csv"
-echo "Check: hostssh 'pgrep -af monitor_conntrack_rates || true'"
+echo "    Log : ${REMOTE_PATH}/monitor.out"
+echo "Check: hostssh 'ls -la /root/number_of_cps/; tail -n 10 /root/number_of_cps/conntrack_rates_*.csv'"
 echo "Stop:  hostssh 'pkill -f ${REMOTE_PATH}/${SCRIPT_BASENAME}'"

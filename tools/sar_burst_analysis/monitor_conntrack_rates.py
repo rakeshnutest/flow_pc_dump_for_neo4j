@@ -247,10 +247,11 @@ def open_netlink_socket(rcvbuf_bytes: int = DEFAULT_RCVBUF_BYTES) -> socket.sock
     try:
         granted = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
         # Kernel doubles the requested value for bookkeeping on Linux.
-        print(
-            f"netlink SO_RCVBUF granted≈{granted} bytes (requested {rcvbuf_bytes})",
-            file=sys.stderr,
-        )
+        if sys.stderr.isatty():
+            print(
+                f"netlink SO_RCVBUF granted~={granted} bytes (requested {rcvbuf_bytes})",
+                file=sys.stderr,
+            )
     except OSError:
         pass
 
@@ -365,12 +366,13 @@ def main() -> int:
         return 1
 
     csv_fh = open_csv(args.output)
-    print(
-        f"conntrack rate monitor: hostname={hostname} output={args.output} "
-        f"max_hours={args.max_hours} interval={args.interval} "
-        f"rcvbuf_mb={args.rcvbuf_mb}",
-        file=sys.stderr,
-    )
+    if sys.stderr.isatty():
+        print(
+            f"conntrack rate monitor: hostname={hostname} output={args.output} "
+            f"max_hours={args.max_hours} interval={args.interval} "
+            f"rcvbuf_mb={args.rcvbuf_mb}",
+            file=sys.stderr,
+        )
 
     new_count = 0
     new_total = 0
