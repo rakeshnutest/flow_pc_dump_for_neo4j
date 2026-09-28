@@ -800,6 +800,8 @@ def hash_selector(
     Skip FLEX Global applied_to (dump key applied_to_entity_group_references
     missing). AppliedTo uses the policy scope, same as Salus.
     FLEX allow-any is hashed; Security Policy allow-any is skipped.
+    INTRA_GROUP / secured is a port-set (EG / VM / SUBNET / VPC), not
+    an address-set.
     """
     if skip_computed_port_set(sel, is_flex):
         return "", [], ""
@@ -812,7 +814,7 @@ def hash_selector(
         global_uuid=global_uuid,
         policy_vpc_uuids=vpc_refs,
         is_flex=is_flex,
-        as_address_set=(is_flex or is_endpoint) and not applied,
+        as_address_set=((is_flex or is_endpoint) and not applied),
         skip_cidrs=applied,
         ipv4_only=ipv4_only,
         ipv6_only=ipv6_only,
@@ -1414,6 +1416,9 @@ def add_component(
                 or sel.get("has_direct_vm")
                 or sel.get("has_direct_subnet")):
             return "ag_na"
+    # INTRA_GROUP / secured: hash as a port-set (EG / VM / SUBNET / VPC).
+    # FnsPortSetValidator skips allow-any, allow-none, and raw address_group
+    # only — an EG that contains AGs is still a port-set.
     # Kube EGs are not Atlas port-sets (neo4j kube_cluster path).
     if sel.get("is_kube"):
         return "kube"
