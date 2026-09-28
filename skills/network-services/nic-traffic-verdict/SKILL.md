@@ -55,7 +55,7 @@ JSON keys, in order: `traffic`, `tables`, `path`, `acl_source`, `acl_destination
 
 `path` is always present. It has the source switch and the destination switch, each with northbound fields, southbound fields, and the VM port number. When the NICs are on different switches it lists every router on the path. When the path leaves through a gateway it includes that gateway's external IP. `l2gw` lists localnet, l2gateway, and geneve rows for those switches.
 
-The markdown draws one mermaid diagram. Each VPC is its own box: host, VM MAC and IP, switch tunnel key in hex, and the tenant router. External gateways sit in their own box, labeled with the redirect-chassis host, the external MAC, and the router tunnel key in hex. Geneve 6081 links a VPC to a gateway. The external link joins the gateways.
+The markdown draws one mermaid diagram. Each VPC is its own box: host, VM MAC and IP, switch tunnel key in hex, and the tenant router. External gateways sit in their own box, labeled with the redirect-chassis host, the external MAC, and the router tunnel key in hex. Each hop is labeled with the tunnel id on that hop. A VPC-to-gateway hop uses the transit switch tunnel id. The external hop uses the external switch tunnel id. When the verdict is denied, the switch that enforces the drop shows the OpenFlow cookie. That cookie is the first 32 bits of the ACL uuid, which is the OVN stage-hint. A to-lport drop is on the destination switch. A from-lport drop is on the source switch.
 
 Then the file lists VPC, subnet, VLAN, host, Geneve IP, MACs, and hex tunnel keys. Each external gateway has its own host block: hostname, Geneve IP, chassis, chassis name, HA group, and HA priority. The file also has tcpdump on the TAP and on the host NIC, and four tables:
 

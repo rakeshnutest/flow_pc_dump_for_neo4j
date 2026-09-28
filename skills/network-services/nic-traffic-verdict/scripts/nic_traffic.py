@@ -483,6 +483,18 @@ def hex24(value) -> str:
         return "0x000000"
 
 
+def acl_cookie(acl_uuid: str) -> str:
+    """OVN OpenFlow cookie: stage-hint, the first 32 bits of the ACL uuid."""
+    text = (acl_uuid or "").split("-")[0]
+    if len(text) != 8:
+        return ""
+    try:
+        int(text, 16)
+    except ValueError:
+        return ""
+    return "0x" + text
+
+
 def chassis_host(bid: int, token: str) -> dict:
     token = (token or "").strip()
     empty = {"hostname": "", "geneve_ip": "", "chassis_name": "", "chassis_uuid": ""}
@@ -771,6 +783,45 @@ def load_forwarding(bid: int, src: dict, dst: dict) -> dict:
             "WHERE log_bundle_id = %d AND toString(ls_uuid) IN (%s) "
             "FORMAT JSONEachRow" % (bid, id_sql)
         )
+    def switch_tunnel(ls_uuid):
+        if not ls_uuid or ls_uuid == "00000000-0000-0000-0000-000000000000":
+            return 0
+        found = _q(
+            "SELECT sb_tunnel_key FROM flow_ovn.ovn_switch FINAL "
+            "WHERE log_bundle_id = %d AND toString(ls_uuid) = %s "
+            "LIMIT 1 FORMAT JSONEachRow" % (bid, sql_str(ls_uuid))
+        )
+        return int(found[0].get("sb_tunnel_key") or 0) if found else 0
+
+    def via_tunnel(left, right):
+        if not left or not right:
+            return 0
+        found = _q(
+            "SELECT toString(via_ls_uuid) AS via FROM flow_ovn.ovn_edge_lr_lr FINAL "
+            "WHERE log_bundle_id = %d AND ("
+            "(toString(lr_a) = %s AND toString(lr_b) = %s) OR "
+            "(toString(lr_a) = %s AND toString(lr_b) = %s)) "
+            "LIMIT 1 FORMAT JSONEachRow" % (
+                bid, sql_str(left), sql_str(right), sql_str(right), sql_str(left))
+        )
+        if not found:
+            return 0
+        return switch_tunnel(found[0].get("via") or "")
+
+    tenant_ids = [
+        item.get("lr_uuid") or ""
+        for item in routers
+        if "gw-scale-out" not in (item.get("nb_name") or "")
+    ]
+    gw_ids = [item.get("lr_uuid") or "" for item in gateways]
+    ext_ls = ""
+    if gateways:
+        ext_ls = (gateways[0].get("external_port") or {}).get("nb_ls_uuid") or ""
+    tunnels = {
+        "to_gateway": via_tunnel(tenant_ids[0], gw_ids[0]) if tenant_ids and gw_ids else 0,
+        "external": switch_tunnel(ext_ls),
+        "from_gateway": via_tunnel(gw_ids[-1], tenant_ids[-1]) if gw_ids and len(tenant_ids) > 1 else 0,
+    }
     same = bool(src_ls) and src_ls == dst_ls
     external = bool(gateways) and not same
     if same:
@@ -788,6 +839,7 @@ def load_forwarding(bid: int, src: dict, dst: dict) -> dict:
         "routers": routers,
         "gateways": gateways if external or path_class == "external" else [],
         "l2gw": l2_rows,
+        "tunnels": tunnels,
         "loaded": bool(src_ep["switch"]["nb"].get("name") or dst_ep["switch"]["nb"].get("name")),
     }
 
@@ -809,7 +861,7 @@ def _vm_label(endpoint: dict) -> str:
     return name
 
 
-def _endpoint_box(node: str, title: str, endpoint: dict, router: dict) -> list:
+def _endpoint_box(node: str, title: str, endpoint: dict, router: dict, drop: dict = None) -> list:
     host = endpoint.get("host") or {}
     port = endpoint.get("port") or {}
     sub = endpoint.get("subnet") or {}
@@ -825,8 +877,9 @@ def _endpoint_box(node: str, title: str, endpoint: dict, router: dict) -> list:
             _qmark(_vm_label(endpoint)),
             _qmark(port.get("mac") or ""),
             _qmark(endpoint.get("ip") or "")),
-        '    %s_s["switch %s<br>vlan %s"]' % (
-            node, hex24(tnl), endpoint.get("vlan") or 0),
+        '    %s_s["switch %s<br>vlan %s%s"]' % (
+            node, hex24(tnl), endpoint.get("vlan") or 0,
+            ("<br>drop cookie %s<br>rule %s" % (drop.get("cookie") or "", drop.get("rule") or "")) if drop else ""),
     ]
     if router:
         mac = ""
@@ -872,7 +925,7 @@ def _gw_label(router: dict) -> str:
     )
 
 
-def mermaid(path: dict) -> str:
+def mermaid(path: dict, drop: dict = None) -> str:
     src = path["source"]
     dst = path["destination"]
     routers = path.get("routers") or []
@@ -883,8 +936,10 @@ def mermaid(path: dict) -> str:
     if src.get("switch", {}).get("nb", {}).get("ls_uuid") == dst.get("switch", {}).get("nb", {}).get("ls_uuid"):
         dst_router = {}
     lines = ["flowchart LR"]
-    lines.extend(_endpoint_box("SRC", src.get("vpc") or "source VPC", src, src_router))
-    lines.extend(_endpoint_box("DST", dst.get("vpc") or "dest VPC", dst, dst_router if dst_router is not src_router else {}))
+    src_drop = drop if drop and drop.get("where") == "source" else None
+    dst_drop = drop if drop and drop.get("where") == "destination" else None
+    lines.extend(_endpoint_box("SRC", src.get("vpc") or "source VPC", src, src_router, src_drop))
+    lines.extend(_endpoint_box("DST", dst.get("vpc") or "dest VPC", dst, dst_router if dst_router is not src_router else {}, dst_drop))
     if gateways:
         lines.append('  subgraph GWX["external gateways"]')
         lines.append("    direction TB")
@@ -893,16 +948,20 @@ def mermaid(path: dict) -> str:
             node = "g%d" % index
             lines.append('    %s["%s"]' % (node, _gw_label(router)))
             ids.append(node)
+        tunnels = path.get("tunnels") or {}
+        ext = "tunnel %s" % hex24(tunnels.get("external") or 0)
         for left, right in zip(ids, ids[1:]):
-            lines.append("    %s -->|external| %s" % (left, right))
+            lines.append("    %s -->|%s| %s" % (left, ext, right))
         lines.append("  end")
-        lines.append("  SRC_r -->|geneve 6081| g0" if src_router else "  SRC_s -->|geneve 6081| g0")
+        to_gw = "tunnel %s" % hex24(tunnels.get("to_gateway") or (src_router.get("sb_tunnel_key") if src_router else 0))
+        from_gw = "tunnel %s" % hex24(tunnels.get("from_gateway") or (dst_router.get("sb_tunnel_key") if dst_router else 0))
+        lines.append("  %s -->|%s| g0" % ("SRC_r" if src_router else "SRC_s", to_gw))
         last = "g%d" % (len(gateways) - 1)
-        lines.append("  %s -->|geneve 6081| %s" % (last, "DST_r" if dst_router else "DST_s"))
+        lines.append("  %s -->|%s| %s" % (last, from_gw, "DST_r" if dst_router else "DST_s"))
     elif src_router and dst_router:
-        lines.append("  SRC_r -->|routed| DST_r")
+        lines.append("  SRC_r -->|tunnel %s| DST_r" % hex24(src_router.get("sb_tunnel_key") or 0))
     elif src_router:
-        lines.append("  SRC_r -->|routed| DST_s")
+        lines.append("  SRC_r -->|tunnel %s| DST_s" % hex24(src_router.get("sb_tunnel_key") or 0))
     else:
         lines.append("  SRC_s --> DST_s")
     return "\n".join(lines)
@@ -1042,6 +1101,7 @@ def main() -> None:
     else:
         allow_text = "No allow policy matches this source and destination."
 
+    deny_acl = None
     if stage_drops:
         deny_acl = max(stage_drops, key=lambda item: int(item.get("priority") or 0))
         deny_text = describe(deny_acl, by_uuid, ip_index, address_sets, both=both_deny)
@@ -1159,10 +1219,22 @@ def main() -> None:
             "verdict": verdict,
             "allow_policy": allow_text,
             "deny_policy": deny_text,
+            "drop_cookie": acl_cookie(deny_acl.get("acl_uuid") or "") if verdict == "denied" and deny_acl else "",
+            "drop_rule": int(deny_acl.get("priority") or 0) if verdict == "denied" and deny_acl else 0,
+            "drop_where": (
+                "destination switch" if deny_acl.get("direction") == "to-lport" else "source switch"
+            ) if verdict == "denied" and deny_acl else "",
         },
         "ip_mapping": ip_map,
     }
-    chart = mermaid(forwarding)
+    drop = None
+    if verdict == "denied" and deny_acl:
+        drop = {
+            "cookie": acl_cookie(deny_acl.get("acl_uuid") or ""),
+            "rule": int(deny_acl.get("priority") or 0),
+            "where": "destination" if deny_acl.get("direction") == "to-lport" else "source",
+        }
+    chart = mermaid(forwarding, drop)
 
     def md_acl(title, records):
         lines = ["## %s" % title, ""]
@@ -1262,6 +1334,10 @@ def main() -> None:
     md.append("")
     md.append("Class: %s" % forwarding["class"])
     md.append("")
+    if drop:
+        md.append("Drop cookie %s is rule %s on the %s switch." % (
+            drop["cookie"], drop["rule"], drop["where"]))
+        md.append("")
     hosts = []
     src_host = (forwarding["source"].get("host") or {}).get("hostname") or ""
     dst_host = (forwarding["destination"].get("host") or {}).get("hostname") or ""
