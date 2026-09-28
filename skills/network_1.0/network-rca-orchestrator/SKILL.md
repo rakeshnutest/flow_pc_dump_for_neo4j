@@ -2,7 +2,7 @@
 name: network-rca-orchestrator
 description: >-
   Composite Network RCA chain for Panacea 1.0. Mandatory path includes DND,
-  ping/TCP, NIC/MTU/L1-CRC, SAR+iostat host pressure, then expert checks.
+  ping/TCP, NIC/MTU/L1-CRC, SAR link health, then expert checks.
   Never close without CRC/drop/link and storage classes stated.
 skill_type: composite
 component: networking
@@ -39,53 +39,53 @@ last_verified: 2026-09-01
 ---
 
 ## Purpose
-Coordinator checklist for Network RCA. Prefer **logbay PE bundle** when
-ClickHouse lightweight bundles lack sysstats.
+
+Coordinator for the network_1.0 underlay RCA graph: ordered nodes with
+conditional edges. Prefer complete class coverage before synthesis.
 
 ## Hard rule — complete class coverage
 
 Before synthesis, every chain must emit status for:
 
-1. **DND window**
-2. **Path** (ping/TCP)
-3. **L1 / CRC / link / drops** (ethtool + host_nic_stats — CRC=0 is a finding)
-4. **SAR + iostat + L1 one-pass** — [network-sar-debugging](../network-sar-debugging/SKILL.md)
-   **Product:** `scripts/check_sar_debugging.py` → `run(db_client, context)` on
-   `nu_metrics_sysstats` (ingest PR https://github.com/nutanix-core/panacea-ingestion-pipeline/pull/408).
-   Detect **EXTERNAL_RX_FLOOD** + ping LOST_PKT correlation from CH.
-   Offline fallback only: `analyze_sar_network.py --bundle-root …`.
-   Do **not** emit trunk/VLAN/stop-source plans.
-
-5. **Host pressure** (iostat iowait / disk await)
+1. DND window
+2. Path (ping/TCP)
+3. L1 / CRC / link / drops (CRC=0 is a finding)
+4. SAR traffic + EXTERNAL_RX_FLOOD / ping correlation
+5. Host pressure (iostat iowait / disk await)
 6. Expert branches as triggered (firewall, Cassandra, OVS, upgrade, storage-io)
 
-Missing source → `EVIDENCE_INSUFFICIENT` for that class. Do **not** omit.
+Missing source → `EVIDENCE_INSUFFICIENT` for that class. Do not omit.
 
-## Chain (ReAct order)
+## Chain (nodes → edges)
 
-1. **DND** — [network-dnd-window](../network-dnd-window/SKILL.md)
-2. **Ping/TCP** — [network-ping-tcp-baseline](../network-ping-tcp-baseline/SKILL.md)
-3. **NIC + L1 CRC** — [network-nic-mtu-ncc](../network-nic-mtu-ncc/SKILL.md)
-4. **SAR + iostat + L1 one-pass** — [network-sar-debugging](../network-sar-debugging/SKILL.md)
-   **Product:** `scripts/check_sar_debugging.py` → `run(db_client, context)` on
-   `nu_metrics_sysstats` (requires ingest PR
-   https://github.com/nutanix-core/panacea-ingestion-pipeline/pull/408).
-   Detect **EXTERNAL_RX_FLOOD** + **PING_FLOOD_CORRELATION** from CH metrics.
-   Offline fallback only: `analyze_sar_network.py --bundle-root …`.
-   Do **not** emit trunk/VLAN/stop-source plans — not in metrics/logs.
-5. **Host pressure / storage** — [network-host-pressure](../network-host-pressure/SKILL.md),
+1. DND — [network-dnd-window](../network-dnd-window/SKILL.md)
+2. Ping/TCP — [network-ping-tcp-baseline](../network-ping-tcp-baseline/SKILL.md)
+3. NIC + L1 CRC — [network-nic-mtu-ncc](../network-nic-mtu-ncc/SKILL.md)
+4. SAR link health — [network-sar-debugging](../network-sar-debugging/SKILL.md)
+   Emit EXTERNAL_RX_FLOOD + PING_FLOOD_CORRELATION when evidence supports.
+   Do not emit trunk/VLAN/stop-source plans — not in metrics/logs.
+5. Host pressure / storage — [network-host-pressure](../network-host-pressure/SKILL.md),
    [network-storage-io](../network-storage-io/SKILL.md) if storage class positive
    (co-contributor when flood also correlates — do not hide the flood).
 6. Expert: firewall / Cassandra / OVS / upgrade as suggested by baselines
 7. Synthesize primary `root_class` + contributors; list ruled-out checks
 
+## Dispatch edges
+
+- Child ISSUE_FOUND / FAIL: record evidence; continue only to confirm or to
+  collect OVS if the fail is overlay.
+- Child NO_ISSUE_FOUND: skip its expert follow-ups.
+- Child EVIDENCE_INSUFFICIENT: do not treat as healthy; list the gap.
+
+Stop with underlay RCA if ping/NIC/firewall found the drop. Do not run the
+full OVN layer stack from this composite.
+
 ## Common Pitfalls
 
-- Closing on SAR drops without stating **CRC**
-- Treating missing CH coverage as no issue (use diamond/logbay **or** wait for ingest)
-- Running only file analyzer in product when CH metrics exist
-- Inventing trunk/VLAN/stop-source remediations not present in diamond/CH
-- Calling active-backup standby “NIC down” when link is up and member enabled
+- Closing on SAR drops without stating CRC
+- Treating missing class coverage as no issue
+- Inventing trunk/VLAN/stop-source remediations not present in evidence
+- Calling active-backup standby "NIC down" when link is up and member enabled
 
 ## See also
 

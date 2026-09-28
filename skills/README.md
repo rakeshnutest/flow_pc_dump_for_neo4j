@@ -14,3 +14,10 @@ Emits JSON with mandatory classes: L1/CRC, drops, link, SAR traffic,
 host pressure (iostat), ping. Missing sources → `EVIDENCE_INSUFFICIENT`.
 
 Start with `network-rca-orchestrator/SKILL.md` for the full chain.
+
+## Live SAR burst + IPFIX lab tools
+
+See [`tools/sar_burst_analysis/`](../tools/sar_burst_analysis/README.md):
+
+- `scan_sar_packet_bursts.sh` / `analyze_sar_bursts.sh` — AHV/CVM SAR scanners
+- `simulate_ipfix_flow_burst.py` / `simulate_netbios_multidst.py` — guest traffic sims
