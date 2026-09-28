@@ -1,0 +1,435 @@
+# Port-set creation and verification
+
+How a Flow port-set UUID is produced from a policy dump, how Atlas membership is joined to that UUID, and how the two ClickHouse trees decide match, leftover, and path impact.
+
+Sources: `clickhouse_flow` (`ingest.py`, `compare.py`, `observe_leftovers.py`, `update_policy_port_sets.py`, `schema.sql`) and `clickhouse_ovn` (`dataplane.py`, `trace.py`). Identity is the port-set UUID. Names are display labels.
+
+## What a port-set is
+
+A port-set is the Atlas object that holds the NICs selected by one policy side: secured group, source, destination, FLEX applied-to, or an isolation group. OVN attaches the same UUID as a port group (`port_group_<uuid with underscores>`). Address groups are a different object (an address-set). They do not become port-sets.
+
+`flow_policy.portset` stores one row per UUID:
+
+| Column | Meaning |
+|---|---|
+| `port_set_uuid` | The identity. Computed hash when ingest emitted it, otherwise the Atlas UUID. |
+| `computed_port_set_uuid` | Hash from the policy selector. Zero UUID when Atlas has the object and the dump did not emit it. |
+| `atlas_port_set_uuid` | UUID from `port_set.list` / `port_set.get`. Zero UUID when the hash is absent from Atlas. |
+| `applied_to_port_set_uuid` | Second UUID on a FLEX src/dest row: the applied-to entity group. |
+| `computed_nic_uuids` / `atlas_nic_uuids` | NIC membership on each side. |
+| `rule_u_sg` | Every policy+rule that uses this hash. The row itself has no policy or rule column. |
+
+Zero UUID `00000000-0000-0000-0000-000000000000` means that side is absent.
+
+## How a port-set UUID is created
+
+Ingest does not call Atlas. It rebuilds the UUID Atlas stored, from the dump, with the same hash Atlas and Salus use.
+
+### Scope namespace
+
+The hash namespace comes from the policy scope and from `unique_uuids.json`.
+
+| Policy scope | Security Policy namespace | FLEX namespace |
+|---|---|---|
+| `GLOBAL`, `kGlobal`, `ALL_VPC` | `global_unique_uuid` | literal `global-scope-unique-id` |
+| `ALL_VLAN`, `kAllVlan` | `vlan_unique_uuid` | literal `vlan-scope-unique-id` |
+| `VPC_AS_CATEGORY` | first `scope_references` UUID | same UUID |
+| `VPC_LIST`, `VPC` | first `vpc_references` (else `scope_references`) | same UUID |
+
+CMSP reads the two scope UUIDs with `zkcat`:
+
+- `/appliance/logical/flow/vlan_unique_uuid`
+- `/appliance/logical/flow/global_unique_uuid`
+
+SMSP reads the same keys from ZooKeeper inside the Atlas pod. The dump records which source it used (`cmsp_pc_zk` or `smsp_atlas_zk`). A non-default `project_ext_id` is appended to the hash body as `:project:<uuid>`. The all-zero project is omitted.
+
+Policies in `SAVE` are skipped. They are not programmed, so they do not create port-sets.
+
+### Which selector becomes a port-set
+
+`selectors_from_spec` walks each rule spec and emits `(role, selector)` pairs.
+
+Secured group (either branch):
+
+1. `secured_group_category_references`, typed by `secured_group_category_associated_entity_type` (`VM` / `SUBNET` / `VPC`).
+2. Else `secured_group_entity_group_reference`.
+
+Source and destination, FLEX (`rule.type` `FLEX` or `KFLEX`):
+
+1. `src_` / `dest_entity_group_reference` (or the references list).
+2. Else allow-any (`should_allow_any_src` / `should_allow_any_dst`, or `src_allow_spec` / `dest_allow_spec` in `ALL` or `NONE`).
+3. Else a side subnet (`value` + `prefix_length`).
+4. Else an address group, and only when the dump already expanded that group to CIDRs.
+
+Source and destination, Security Policy (`APPLICATION`, intra-group, quarantine, isolation rules that are not FLEX):
+
+1. Side subnet.
+2. Else address group with dump CIDRs.
+3. Else side category references, typed by `*_category_associated_entity_type`.
+4. Else side entity group.
+5. Else allow-any.
+
+FLEX applied-to:
+
+- `applied_to_entity_group_references` present and non-empty: one `applied_to` port-set, hashed in the policy scope.
+- Key missing: UI Global applied-to. No port-set is emitted.
+- Key present and empty: no applied-to selector.
+
+Isolation:
+
+- `first_isolation_group` / `second_isolation_group` as VM category refs (`isolation_a`, `isolation_b`).
+- Nested `spec.isolation_groups[]`: category refs or an entity group (`isolation_0`, …). Isolation groups hash as secured entities, not as endpoint address-sets.
+
+A FLEX rule with no hashable selector (Default Workload) is hashed as dest allow-any: the empty Go slice `[]`.
+
+### Selectors that do not become a port-set
+
+| Case | Result |
+|---|---|
+| Security Policy allow-any | Atlas token `all`. No hashed UUID. Counted as `allow_all`. |
+| FLEX allow-any | Real port-set. Body is `[]`. |
+| FLEX endpoint that is an entity group plus CIDRs | Address-set path. `port_set_uuid` returns empty. |
+| Security Policy src/dest entity group with no VM, subnet, or VPC category and no direct VM or subnet | AG/NA. Counted as `ag_na`. |
+| Kube-only entity group (`KUBE*` members and no VM/SUBNET/VPC) | Skipped. Counted as `kube`. |
+| Address group or raw subnet with no category or entity-group refs | No port-set. Address-set UUID is `uuid5(entity UUID, "IPv4"\|"IPv6")`. |
+| Missing scope namespace | Counted as `no_hash`. |
+
+### Hash body
+
+Refs are sorted. Category entity types other than `VM` and `EG` append the Atlas selection suffix: `:kVM` is not used for entity type `VM`; `SUBNET` appends `:kSubnet`; `VPC` appends `:kVPC`.
+
+Security Policy (uuid5):
+
+```text
+body = Python list of refs with a u-prefix on each quoted token
+       e.g. [u'<uuid-a>', u'<uuid-b>']
+       + optional :kSubnet or :kVPC
+       + optional :project:<project-uuid>
+port_set_uuid = uuid5(UUID(scope namespace), body)
+```
+
+The `u` prefix matches the Python 2 `str(sorted(list))` form Atlas hashes (`u'…'`), applied by rewriting `'…'` tokens. Allow-any on this path is not hashed; the refs would have been `["all"]`.
+
+FLEX (MD5, Salus):
+
+```text
+body = Go slice, space-separated, sorted
+       e.g. [<uuid-a> <uuid-b>]   or   []
+       + optional category suffix and :project:
+port_set_uuid = UUID( MD5( "Salus" + scope_namespace + body ) )
+```
+
+`ingest.py` uses the Salus constant `Salus`. `update_policy_port_sets.py` uses `salus` and also runs the `u'` rewrite on the Go-slice body. Those two strings hash differently. ClickHouse verification follows `ingest.py`.
+
+`update_policy_port_sets.py` is the on-PC annotator. It walks proto `rules_list` components (`endpoint`, `secured_group`, `src_endpoint`, `dest_endpoint`, isolation groups), skips `kTypeAll` / `kTypeNone`, writes `port_set` then `ip_list` into `/tmp/policy.json`, and can insert `port_set_uuid` into the proto text. IP lists come from `port_set_ips.json` / `vms_port_set.json` produced by `vm_host_collect_port_set.py`. That file is a catalog of the hash, not the Atlas-vs-computed check.
+
+### Worked shapes
+
+VM category, ALL_VLAN Security Policy, default project:
+
+```text
+uuid5(vlan_unique_uuid, "[u'<category-uuid>']")
+```
+
+Subnet category, same scope:
+
+```text
+uuid5(vlan_unique_uuid, "[u'<category-uuid>']:kSubnet")
+```
+
+Entity group, VPC_LIST:
+
+```text
+uuid5(<first vpc uuid>, "[u'<eg-uuid>']")
+```
+
+Same entity group on a FLEX rule in GLOBAL scope:
+
+```text
+UUID(MD5("Salus" + "global-scope-unique-id" + "[<eg-uuid>]"))
+```
+
+FLEX allow-any:
+
+```text
+UUID(MD5("Salus" + <flex scope id> + "[]"))
+```
+
+Non-default project appends `:project:<project-uuid>` before the hash in every case above.
+
+### NIC membership on the computed side
+
+After the UUID exists, `match_nics` fills `computed_nic_uuids` from `vms.json`.
+
+| Selector contents | NICs |
+|---|---|
+| `vm_ext_ids` or `subnet_ext_ids` | Union of NICs on those VMs or subnets. |
+| VM category refs only | Intersection of NICs tagged with every listed VM category. |
+| Subnet category refs only | Intersection of NICs on subnets tagged with every listed subnet category. |
+| Both VM and subnet categories | Intersection of the two sets. |
+| VPC category refs only | NICs whose VPC carries every listed VPC category. |
+| CIDRs (`subnet_list`) | NICs whose learned or configured IPs sit in the CIDRs and outside `exception_list`. |
+| `all`, `any`, or allow-any | Empty computed NIC list. Compare treats category names `all` or `any` as NIC-equal. |
+
+Entity groups are expanded first (`expand_entity_group`): category refs, direct VM/subnet ext ids (including NAME and REGEX), address-group CIDRs, FQDN resolutions, and except-config CIDRs.
+
+Scope then clips the set:
+
+- `applied_to`: no VPC/VLAN clip. Membership is global.
+- `secured` and `isolation_*`: drop VLAN Basic NICs (`advance_vlan` / `is_advanced_networking` false). Overlay and advanced VLAN stay.
+- `ALL_VLAN`: keep NICs in the placeholder VPC `00000000-0000-0000-0000-000000000001`.
+- `GLOBAL`, `ALL_VPC`, `VPC_AS_CATEGORY`: no VPC clip.
+- `VPC_LIST`: keep NICs in that VPC.
+
+IP version follows the policy (`is_ipv4_address_scope`, `is_ipv6_address_scope`, `is_ipv6_traffic_allowed`) and the rule `ip_version`. Link-local addresses are kept unless the dump sets `link_local` false.
+
+### Row assembly
+
+1. Each successful selector is a component carrying `port_set_uuid`, role, selector columns, and one `rule_u_sg` tuple (`end_point_src`, `end_point_dst`, or `secured_entity`; policy type `app` / `isolation` / `quarantine`; mode `enforce` / `monitor` / `save`, with dump `APPLY` stored as `enforce`).
+2. On a FLEX rule, the applied-to row is copied onto the src and dest rows as `applied_to_*`. Role `applied_to` remains its own row so Atlas can match that second UUID.
+3. Components collapse to one row per `port_set_uuid`. NIC UUID lists are unioned. `rule_u_sg` keeps every policy+rule.
+4. `port_set_list.json` and `port_set_get.json` are indexed by UUID. A hit sets `atlas_port_set_uuid` to the same UUID and copies `virtual_nic_uuid_list` into `atlas_nic_uuids`, plus `name` and `virtual_network_uuid`.
+5. An Atlas UUID with no computed hash is inserted as its own row: `computed_port_set_uuid` is zero, `atlas_port_set_uuid` is the Atlas UUID, computed NICs are empty.
+
+`flow_policy.vm_nic` and `flow_policy.category` are lookup tables. Re-ingest drops only that `log_bundle_id` partition.
+
+## How a port-set is verified
+
+Verification is UUID equality, then NIC-UUID set equality. A matching name on a different UUID is a different object.
+
+### 1. Presence, written at ingest
+
+| `computed_port_set_uuid` | `atlas_port_set_uuid` | Meaning |
+|---|---|---|
+| non-zero | same non-zero UUID | UUID match. NIC sets are checked next. |
+| non-zero | zero | Computed hash missing from Atlas. Critical. |
+| zero | non-zero | Atlas leftover. The dump did not emit this UUID. |
+
+### 2. Scorecard (`compare.py`)
+
+`compare.py` reads ClickHouse only. For each `port_set_uuid` it takes any non-zero computed UUID, any non-zero Atlas UUID, and compares the flattened NIC UUID arrays. NIC arrays also count as equal when `vm_category_names` or `vpc_category_names` contains `all` or `any`.
+
+`match_fields` then stamps a replacement row (`ReplacingMergeTree`, not `ALTER UPDATE`):
+
+| Condition | `match_status` | `mismatch_kind` |
+|---|---|---|
+| Both UUIDs present and NIC sets equal | `match` | empty |
+| Computed present, Atlas zero | `mismatch` | `computed_without_atlas` |
+| Atlas present, computed zero | `mismatch` | `atlas_without_computed` |
+| Both present, NIC sets differ | `mismatch` | `nic_set` |
+
+Overall **PASS** requires all of the following:
+
+- Every comparable port-set is `match`.
+- `computed_without_atlas` count is 0.
+- `atlas_without_computed` count is 0 after the ignore class below.
+- `nic_set` count is 0.
+- Every `isolation*` row has the hash present in Atlas and `match_status = match`.
+- At least one comparable port-set exists.
+
+Ignore class (scorecard and leftover observer). These rows stay in the table and are excluded from the fail counts:
+
+- Atlas name starts with `K8s_` (`compare.py`). The observer also ignores names matching `k8s`, `kubernetes`, or `cilium_vlan_scope`.
+- Name starts with `Quarantine` and `atlas_nic_uuids` is empty.
+
+`only_computed_nics` and `only_atlas_nics` are stored empty by the stamp. The scorecard uses `mismatch_kind` and UUID presence. NIC diffs are computed again by the leftover observer.
+
+### 3. Leftover explanation (`observe_leftovers.py`)
+
+This pass explains UUIDs that failed presence. It loads leftovers from ClickHouse (`mismatch` rows where exactly one side is zero) or from `portset.jsonl` without querying ClickHouse.
+
+For each leftover UUID it reverse-hashes every dump category (as `VM`, `SUBNET`, and `VPC`), every entity group (as `EG`), FLEX allow-any (empty refs), and address-set hashes (`uuid5(entity, "IPv4"|"IPv6")`). Namespaces tried: VLAN uuid, global uuid, the FLEX scope literals, each VPC uuid, each policy `scope_references` uuid. Projects tried: the zero project and every policy project.
+
+The note is one of:
+
+- Reverse-hash hits an entity the dump policies never reference, so ingest cannot emit the UUID.
+- Reverse-hash hits selector UUIDs that policies do reference, but no programmed rule emitted this exact hash (scope, FLEX vs Security Policy, or project differs).
+- Reverse-hash hits an address-set, which is not a port-set row.
+- No dump category, entity group, or address group produces this UUID.
+- NIC UUID in computed and missing in Atlas, or the reverse: a NIC bug. Reported even when the port-set UUID itself is one-sided.
+
+Atlas-missing (`computed_without_atlas`) is the critical class. Atlas leftover (`atlas_without_computed`) is the class OVN path reports call out.
+
+### 4. Path check (`clickhouse_ovn`)
+
+OVN verification does not recompute the hash. It reads the already-stamped `portset.jsonl` and asks whether the NICs on a traced path sit on a bad port-set.
+
+`trace.py` walks VM NIC → LSP → logical switch → routers → destination, then calls `portset_issues_md` with the source NIC UUID and the destination NIC UUID. The section in the path markdown is "Port-set issues (Atlas-only leftovers)".
+
+For those NICs, and for the whole dump:
+
+- Count Atlas-only port-sets after dropping K8s and empty-Quarantine noise (`leftover_ignore.py`).
+- List each leftover UUID, Atlas name, role, and `mismatch_kind`.
+- List every port-set (match or mismatch) that contains a path NIC, with Atlas and computed NIC counts.
+- Say whether a path NIC is a member of an `atlas_without_computed` port-set.
+- Say whether a path NIC is Atlas-only or computed-only inside a port-set that otherwise matched.
+
+ACL interpretation uses the same file:
+
+- `@port_group_<underscored uuid>` is looked up as a port-set. The label is category, Atlas name, role, and NIC count. A drop ACL at priority 1060 or higher is described as isolation: that applied-to group cannot reach the secured address-set.
+- `$address_set_…` is labeled by IP overlap with port-set NIC IPs (best overlap, at least 3 addresses or one third of the set). That label is a display join. The port-set match itself stays UUID-based.
+
+`flow_ovn` is a separate database. Path tracking does not write `flow_policy`.
+
+## ClickHouse schema
+
+Two databases on the same server. Native `127.0.0.1:19000`, HTTP `127.0.0.1:8123`, user `default`. `clickhouse_ovn` never writes `flow_policy`. `clickhouse_flow` never writes `flow_ovn`.
+
+Shared rules, from `clickhouse_flow/schema.sql` and `clickhouse_ovn/schema.sql`:
+
+- Every fact row carries `log_bundle_id` (`UInt64`). One Panacea dump is one id.
+- `PARTITION BY log_bundle_id`. Re-ingest is `ALTER TABLE … DROP PARTITION <id>`, then insert. Other dumps stay.
+- `ENGINE = ReplacingMergeTree(updated_at)`. A later insert of the same ORDER BY key replaces the older row at merge. `compare.py` stamps match columns this way. There is no `ALTER UPDATE` and no `ALTER DELETE`.
+- No `Nullable`. A missing UUID is `00000000-0000-0000-0000-000000000000`. A missing string is `''`. A missing flag is `0`.
+- `ORDER BY` starts with `log_bundle_id` (the filter), then a low-cardinality type or direction, then the UUID.
+- Native types: `UUID`, `UInt64`, `UInt32`, `UInt16`, `UInt8`, `Int32`, `DateTime64(3)`, `LowCardinality(String)` for enums (`role`, `entity_type`, `direction`, `action`, `type`). IPv4 and IPv6 stay `String` because the same column holds addresses and CIDRs.
+- Ingest is `CREATE DATABASE IF NOT EXISTS` plus `CREATE TABLE IF NOT EXISTS`. `--reset-schema` drops the database tables once, then recreates them. Inserts are JSONEachRow, 10k rows per batch (`flow_policy.portset` uses 50).
+
+### `flow_policy` — port-set identity and the Atlas check
+
+| Table | ORDER BY | Grain |
+|---|---|---|
+| `bundle` | `(log_bundle_id)` | Dump catalog: `dump_dir`, `cluster_uuid`, `cluster_name`, `pc_ip`, `nos_version`, `collected_at` |
+| `portset` | `(log_bundle_id, entity_type, port_set_uuid)` | One port-set UUID |
+| `u_sg` | `(log_bundle_id, u_sg_id)` | One unique service (dump SG, SG list, or inline ports) |
+| `vm_nic` | `(log_bundle_id, nic_uuid)` | One VM NIC |
+| `category` | `(log_bundle_id, category_uuid)` | One category display name |
+
+`portset` is the only table the scorecard reads. Policy and rule identity live inside `rule_u_sg`, not as row columns. There is no `policy_uuid` or `rule_uuid` column on the row.
+
+**Identity and presence**
+
+| Column | Type | Role |
+|---|---|---|
+| `port_set_uuid` | `UUID` | Row identity. Computed hash, or the Atlas UUID when the hash was not emitted. |
+| `computed_port_set_uuid` | `UUID` | Hash from `ingest.py`. Zero when the row is Atlas-only. |
+| `atlas_port_set_uuid` | `UUID` | UUID from `port_set.list` / `port_set.get`. Zero when Atlas has no such object. |
+| `applied_to_port_set_uuid` | `UUID` | FLEX applied-to hash copied onto src/dest. Zero on Security Policy rows and on the applied-to row itself. |
+| `role` | `LowCardinality(String)` | `secured`, `src`, `dest`, `applied_to`, `isolation_a`, `isolation_b`, `isolation_<n>`. Empty on an Atlas-only row. |
+| `entity_type` | `LowCardinality(String)` | `VM`, `SUBNET`, `VPC`, or `EG`. Part of the sort key. |
+| `namespace_uuid` | `UUID` | Policy scope UUID stored on the row: VLAN unique UUID, global unique UUID, or the VPC UUID. The FLEX hash itself uses the literals `vlan-scope-unique-id` / `global-scope-unique-id` as the MD5 namespace. Those literals are not written in this column. |
+| `virtual_network_uuid` | `UUID` | Atlas `virtual_network_uuid` when the list/get record has one. |
+
+**Selector that was hashed**
+
+| Column | Type |
+|---|---|
+| `entity_group_uuid`, `entity_group_name` | `UUID`, `String` |
+| `reference_uuids`, `reference_names` | `Array(UUID)`, `Array(String)` |
+| `vm_category_refs`, `subnet_category_refs`, `vpc_category_refs` | `Array(UUID)` |
+| `vm_category_names`, `subnet_category_names`, `vpc_category_names` | `Array(String)` |
+| `vm_ext_ids`, `subnet_ext_ids` | `Array(UUID)` |
+| `subnet_list`, `exception_list` | `Array(String)` CIDRs |
+| `eg_address_grp`, `eg_exception_address_grp` | `Array(String)` address-group names expanded into the EG |
+| `effective_vpc_refs`, `effective_vpc_names` | VPCs whose categories contain every selector VPC category |
+| `applied_to_entity_group_uuid` and `applied_to_*` refs, ext ids, lists, names | Same shape as the selector columns, copied from the FLEX applied-to entity group |
+
+**Rules that use this hash.** `rule_u_sg` is `Array(Tuple(...))`:
+
+| Tuple field | Type | Values |
+|---|---|---|
+| `rule_uuid` | `UUID` | Dump rule `ext_id` |
+| `sg_id` | `Array(UUID)` | Dump service-group UUIDs. Inline and multi-SG lists keep this empty of a synthetic id; the lookup row in `u_sg` uses zero `sg_id` for those. |
+| `sg_ports` | `Tuple(tcp, udp, icmp, icmpv6)` | Each element is `Array(String)` (`start-end` or `type:code`) |
+| `policy_name`, `policy_uuid` | `String`, `UUID` | |
+| `policy_type` | `LowCardinality(String)` | `app`, `isolation`, `quarantine` |
+| `policy_mode` | `LowCardinality(String)` | `enforce`, `monitor`, `save`. Dump `APPLY` is stored as `enforce`. |
+| `flex_policy` | `UInt8` | `1` when `rule.type` is `FLEX` or `KFLEX` |
+| `rule_priority` | `Int32` | FLEX `spec.priority`. Security Policy stores `0`. |
+| `type` | `LowCardinality(String)` | `secured_entity`, `end_point_src`, `end_point_dst` |
+
+`u_sg` is the service lookup, keyed by `u_sg_id = uuid5(DNS namespace, "u_sg:" + kind + refs + inline ports + network-function UUID + action)`. Columns: `sg_id`, `kind` (`sg` / `sg_list` / `inline`), `sg_uuids`, `sg_names`, `tcp_ports`, `udp_ports`, `icmp_types`, `icmp_v6_types`, `is_inline`, `is_all_ports`, `secured_group_action`, and the network-function UUID, name, failure handling, forwarding mode, HA mode, and `nic_pairs` `(vm_uuid, ingress_nic_uuid, egress_nic_uuid, high_availability_state, data_plane_health_status)`.
+
+**NIC membership and the verdict**
+
+| Column | Type | Role |
+|---|---|---|
+| `computed_nic_uuids`, `atlas_nic_uuids` | `Array(UUID)` | Sets `compare.py` sorts and compares |
+| `computed_nics`, `atlas_nics` | `Array(Tuple(vm_name, nic_uuid, subnet, vpc, ip, host_uuid, host, cluster_uuid, cluster))` | Display. Host from VM `host.ext_id`. Cluster from `hosts.json` → `clusters.json`. |
+| `only_computed_nics`, `only_atlas_nics` | same 9-field tuple | Schema slot for the diff. The stamp writes them empty; the observer recomputes the UUID diff. |
+| `match_status` | `LowCardinality(String)` | `match` or `mismatch`. Empty until `compare.py`. |
+| `mismatch_kind` | `LowCardinality(String)` | `computed_without_atlas`, `atlas_without_computed`, `nic_set`, or empty on a match |
+| `atlas_name`, `vpc_name` | `String`, `LowCardinality(String)` | Atlas display name and VPC name |
+| `all_ports` | `UInt8` | `1` when the rule is isolation, allow-spec `NONE`, or all-protocol with no service group |
+| `updated_at` | `DateTime64(3)` | ReplacingMergeTree version |
+
+`vm_nic` is the NIC lookup used to fill those tuples: `nic_uuid`, `vm_uuid`, `vm_name`, `subnet_uuid`, `subnet`, `vpc_uuid`, `vpc`, `ip`, `host_uuid`, `host`, `cluster_uuid`, `cluster`. `category` is `category_uuid` → `name` (`key:value` when the dump has both).
+
+Queries always filter `log_bundle_id` first, then `port_set_uuid`. `queries.sql` is that lookup: one port-set, FLEX rows that carry `applied_to_port_set_uuid`, `role = 'applied_to'`, `rule_u_sg` unnested with `ARRAY JOIN`, `u_sg`, and one `vm_nic`.
+
+### `flow_ovn` — NB/SB path the port-set is enforced on
+
+Port-set verification on a path does not join these tables in SQL. `trace.py` reads `flow_ovn` for the hop list and reads `flow_policy/portset.jsonl` for the UUID check. The join key in the report is the port-group name: `port_group_<port_set_uuid with '-' turned into '_'>` equals `flow_policy.portset.port_set_uuid`.
+
+| Table | ORDER BY (after `log_bundle_id`) | Grain | What it holds |
+|---|---|---|---|
+| `bundle` | `(log_bundle_id)` | Dump catalog | Same catalog columns as `flow_policy.bundle` |
+| `ovn_ls` | `(ls_uuid)` | Logical switch | Name, `other_config` pairs |
+| `ovn_lsp` | `(type, ls_uuid, lsp_uuid)` | Switch port | `mac`, `ip4`, `ip6`, `addresses`, `options_router_port`, `options_network_name`, `peer`, `nic_uuid` |
+| `ovn_lr` | `(lr_uuid)` | Logical router | `enabled`, `has_nat` |
+| `ovn_lrp` | `(lr_uuid, lrp_uuid)` | Router port | `mac`, `networks`, `peer`, `ha_chassis_group`, `is_ext_gw` |
+| `ovn_acl` | `(direction, action, acl_uuid)` | ACL body | `match`, `priority`, `log`. Direction is `from-lport` / `to-lport`. |
+| `ovn_acl_on_ls` | `(ls_uuid, acl_uuid)` | LS → ACL | Edge. ACL body stays in `ovn_acl`. |
+| `ovn_pg` | `(pg_uuid)` | Port group | `name`. This is the OVN face of a port-set when the name is `port_group_<uuid>`. |
+| `ovn_acl_on_pg` | `(pg_uuid, acl_uuid)` | Port group → ACL | ACLs attached to the port-set's port group |
+| `ovn_pg_port` | `(pg_uuid, lsp_uuid)` | Port-group membership | LSP UUIDs in that port group |
+| `ovn_pbr` | `(lr_uuid, priority, pbr_uuid)` | Router policy | `match`, `action`, `nexthop`, `nexthops` |
+| `ovn_nat` | `(lr_uuid, nat_uuid)` | NAT | `type`, `external_ip`, `logical_ip`, `logical_port`, `external_mac` |
+| `ovn_vm` | `(vm_uuid)` | AHV domain | `name`, `host_ip` |
+| `ovn_vm_nic` | `(vm_uuid, nic_uuid)` | NIC | `mac`, `ip4`, `host_ip`, `lsp_uuid`, `ls_uuid`. MAC joins the NIC to an LSP. LSP `name` `port_<uuid>` is not always the Acropolis NIC UUID. |
+| `ovn_chassis` | `(chassis_uuid)` | Hypervisor | `name`, `hostname` |
+| `ovn_encap` | `(chassis_uuid, encap_uuid)` | Tunnel endpoint | `ip`, `encap_type` (`geneve` in the reference dump) |
+| `ovn_datapath` | `(kind, nb_uuid)` | SB datapath | `kind` is logical-switch or logical-router. `nb_uuid` is the NB UUID. `tunnel_key` is the datapath key. |
+| `ovn_port_binding` | `(type, datapath_uuid, pb_uuid)` | SB port | `logical_port`, `chassis_uuid`, `mac`, `tunnel_key`, `up` |
+| `ovn_mac_binding` | `(datapath_uuid, ip)` | ARP/ND cache | `logical_port`, `mac` |
+| `ovn_ha_chassis` | `(group_uuid, chassis_name)` | Gateway HA | `group_name`, `priority`. Used because `Gateway_Chassis` is empty in the reference dump. |
+| `ovn_edge_ls_lr` | `(ls_uuid, lr_uuid, lsp_uuid)` | LS–LR edge | Router LSP (`type=router`, `options:router-port=<LRP name>`) joined to the LRP |
+| `ovn_edge_lr_lr` | `(via, lr_a, lr_b, via_ls_uuid)` | LR–LR edge | `via` is `peer` or a transit LS. This dump uses the transit LS (`gw-scale-out-network`); `LRP.peer` is empty. |
+| `ovn_ls_stretch` | `(ls_uuid, chassis_uuid)` | L2 Geneve stretch | `hostname`, `encap_type`, `encap_ip`, `vif_count` |
+
+NB join keys the ingest writes into those edges:
+
+- `Logical_Switch.ports[]` = `ovn_lsp.lsp_uuid`. `Logical_Router.ports[]` = `ovn_lrp.lrp_uuid`.
+- `Logical_Switch.acls[]` and `Port_Group.acls[]` land in `ovn_acl_on_ls` and `ovn_acl_on_pg`, not inside the ACL row.
+- `Port_Group.ports[]` lands in `ovn_pg_port`.
+- `Datapath_Binding.external_ids` `logical-switch` / `logical-router` = `ovn_datapath.nb_uuid`.
+- `Port_Binding.logical_port` is the LSP or LRP name. `Port_Binding.datapath` and `.chassis` are the SB datapath and chassis UUIDs.
+- `Chassis.encaps[]` = `ovn_encap.encap_uuid`.
+
+`trace.py` BFS uses `ovn_edge_ls_lr` and `ovn_edge_lr_lr` only. VIF LSPs hang off `ovn_lsp` where `type` is empty. NAT and localnet mark a router or switch as external. The port-set section of the path report is filled from `portset.jsonl`, using NIC UUIDs from `ovn_vm_nic` and port-group UUIDs parsed out of `ovn_acl.match`.
+
+## End-to-end sequence
+
+```text
+policies.json + entity_groups.json + vms.json
+        │
+        ▼
+selectors_from_spec  →  skip SAVE / kube / AG-NA / Security allow-any
+        │
+        ▼
+atlas_port_set_id    →  computed_port_set_uuid
+match_nics           →  computed_nic_uuids
+        │
+        ▼
+port_set_list.json + port_set_get.json
+        │
+        ▼
+one flow_policy.portset row per UUID
+(computed side, Atlas side, or both)
+        │
+        ├─ compare.py        stamp match | computed_without_atlas
+        │                     | atlas_without_computed | nic_set
+        │                     PASS/FAIL scorecard
+        ├─ observe_leftovers  reverse-hash and NIC-bug notes
+        └─ trace.py          path NICs vs leftover port-sets
+                              and vs OVN port_group / address_set
+```
+
+Commands:
+
+```text
+python3 clickhouse_flow/ingest.py --dump_dir /path/to/dump --log_bundle_id 123
+python3 clickhouse_flow/compare.py --log_bundle_id 123
+python3 clickhouse_flow/observe_leftovers.py --log_bundle_id 123 --dump_dir /path/to/dump
+python3 clickhouse_ovn/trace.py --log_bundle_id 123 --src <vm|mac|lsp> --dst <vm|mac|lsp|external>
+```
