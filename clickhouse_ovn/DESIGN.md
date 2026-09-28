@@ -1,5 +1,7 @@
 # OVN NB/SB path tracking (`flow_ovn`)
 
+The full schema of both databases, including `flow_policy.traffic_in` / `traffic_out`, is `CLICKHOUSE_DESIGN.md`.
+
 ClickHouse database **`flow_ovn`** (do not touch `flow_policy`). Source is
 `ovsdb-client dump` text from the CMSP OVN pair, plus AHV `virsh dumpxml`
 for VM display names.
