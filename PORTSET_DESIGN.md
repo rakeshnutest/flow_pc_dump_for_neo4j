@@ -439,12 +439,15 @@ Printed sections, in this order. Every port-set row and every ACL row is printed
 
 | Section | Content |
 |---|---|
-| Endpoints | Source and destination VM name, IP, traffic, and the two NIC uuids |
-| Source port-sets | One row per port-set that contains the source NIC: policy, category, role, port-set uuid |
-| Source outgoing ACLs | Every `from-lport` ACL whose `inport` is a source port-set. Columns: priority, action, ip, policy, category, peer, peer IPs, ports, matches. `peer IPs` lists every address in that peer category. |
-| Destination port-sets | One row per port-set that contains the destination NIC, same columns as the source list |
-| Destination incoming ACLs | Every `to-lport` ACL whose `outport` is a destination port-set. Same columns. `peer IPs` lists every address in that peer category, so a category name can be checked against the source IP. |
-| Conclusion | `Verdict`, then `Allow policy`, then `Deny policy` |
+| Path | Mermaid. Each VPC is a box (host, VM MAC and IP, switch tunnel key, tenant router). External gateways are their own box (redirect-chassis host, external MAC, router tunnel key). Each hop is labeled with the tunnel id used on that hop. A denied verdict prints the OpenFlow cookie on the switch that drops the packet. |
+| Endpoints | VPC, subnet, VLAN, VM MAC, DHCP gateway MAC, host, Geneve IP, switch tunnel key in hex, port tunnel key in hex |
+| Routers and gateways | One row per router port on the path: MAC, address, tunnel key, hex |
+| External gateways | One block per gateway: external IP and MAC, host, Geneve IP, chassis, chassis name, HA group, HA priority |
+| Capture | TAP tcpdump on each VM host, and Geneve tcpdump (UDP 6081) on the host NIC toward the next Geneve IP |
+| ACL source | Every `from-lport` rule. Columns: rule, action, ip, policy, category, peer, ports, matches. Peer addresses are not in this table. |
+| ACL destination | Every `to-lport` rule. Same columns. |
+| Verdict | Verdict, allow policy, deny policy. A deny also names the cookie, the rule number, and the switch. |
+| IP mapping | One row per peer address. Prefix lengths stay on the address. |
 
 The policy and peer text use the policy name and category. When the peer addresses belong to a port-set, the peer is that category and policy. When they belong to no port-set, the peer is the IP list. An address set whose OVN `addresses` list is empty is reported as having no addresses. The lines do not use `$address_set_…` or `@port_group_…` as the names.
 
@@ -466,41 +469,54 @@ Source outgoing ACLs are empty. The `inbound:inbound5` port-set has no `from-lpo
 - `tcp/5560` is allowed. Allow policy: priority 1050 `allow-related` from `inbound:inbound5`. Deny policy: priority 1045 drop. The deny does not apply.
 - `tcp/5555` is denied. Allow policy: the same priority 1050 allow, and `tcp/5555` is outside it (the first range starts at 5558). Deny policy: priority 1045 drop, all ports.
 
-## End-to-end sequence
+## How to trigger
+
+ClickHouse is `127.0.0.1:19000`, user `default`. Databases are `flow_policy` and `flow_ovn`. A re-run of an ingest drops only that `log_bundle_id` partition. `--reset-schema` drops every bundle. Use it for the first migration, not for a refresh.
+
+The verdict does not ingest. It reads tables that are already loaded. Load policy and OVN first, then run the verdict as many times as you want.
+
+### End to end
+
+One dump, then one verdict. Policy and OVN are separate ingests. The full OVN ingest also fills `ovn_switch`, `ovn_subnet`, `ovn_router`, and `ovn_l2gw`.
 
 ```text
-policies.json + entity_groups.json + vms.json
-        │
-        ▼
-selectors_from_spec  →  skip SAVE / kube / AG-NA / Security allow-any
-        │
-        ▼
-atlas_port_set_id    →  computed_port_set_uuid
-match_nics           →  computed_nic_uuids
-        │
-        ▼
-port_set_list.json + port_set_get.json
-        │
-        ▼
-one flow_policy.portset row per UUID
-(computed side, Atlas side, or both)
-        │
-        ├─ compare.py        stamp match | computed_without_atlas
-        │                     | atlas_without_computed | nic_set
-        │                     PASS/FAIL scorecard
-        ├─ observe_leftovers  reverse-hash and NIC-bug notes
-        ├─ trace.py          path NICs vs leftover port-sets
-        │                     and vs OVN port_group / address_set
-        └─ nic_traffic.py    two VM NICs + L4 port
-                              allow policy and deny policy
+python3 clickhouse_flow/ingest.py \
+  --dump_dir /path/to/dump --log_bundle_id 159166
+
+python3 clickhouse_ovn/ingest.py \
+  --dump_dir /path/to/dump --log_bundle_id 159166
+
+python3 skills/network-services/nic-traffic-verdict/scripts/nic_traffic.py \
+  --log_bundle_id 159166 \
+  --src 192.168.254.130 \
+  --dst b4e93b84-06ef-41bb-b834-061b2b65d632 \
+  --port 80 --proto tcp \
+  --out /tmp/nic_192_168_254_130__192_168_3_26_tcp80
 ```
 
-Commands:
+`--out` writes `<stem>.json` and `<stem>.md`. Omit `--log_bundle_id` on the verdict to use the latest `flow_policy` bundle. `--src` and `--dst` take a NIC uuid, an IP, or a VM name. A VM name that matches several NICs prints the NIC uuids and exits. `--proto` is `tcp`, `udp`, or `icmp`. For icmp, `--port` is the ICMP type.
 
-```text
-python3 clickhouse_flow/ingest.py --dump_dir /path/to/dump --log_bundle_id 123
-python3 clickhouse_flow/compare.py --log_bundle_id 123
-python3 clickhouse_flow/observe_leftovers.py --log_bundle_id 123 --dump_dir /path/to/dump
-python3 clickhouse_ovn/trace.py --log_bundle_id 123 --src <vm|mac|lsp> --dst <vm|mac|lsp|external>
-python3 skills/network-services/nic-traffic-verdict/scripts/nic_traffic.py --log_bundle_id 123 --src <nic-uuid-or-ip> --dst <nic-uuid-or-ip> --port 443 --proto tcp
-```
+That run walks VM → subnet → switch → router → gateway, draws the mermaid, and prints the ACL tables. For the pair above the path is external, and tcp/80 is denied on the destination switch by rule 1045, cookie `0x65c25b48`.
+
+### Part by part
+
+Run only the stage you need. Later stages assume the earlier tables for that database are already loaded.
+
+| Part | Command | Loads or answers | Leaves alone |
+|---|---|---|---|
+| Policy ingest | `python3 clickhouse_flow/ingest.py --dump_dir /path/to/dump --log_bundle_id 159166` | `flow_policy` port-sets, VM NICs, categories | `flow_ovn` |
+| Policy from JSONL | `python3 clickhouse_flow/ingest.py --from_jsonl /path/to/jsonl --log_bundle_id 159166` | Same tables when the PC JSON is absent | `flow_ovn` |
+| Policy scorecard | `python3 clickhouse_flow/compare.py --log_bundle_id 159166` | PASS/FAIL on UUID and NIC match | No new rows |
+| Leftover port-sets | `python3 clickhouse_flow/observe_leftovers.py --log_bundle_id 159166 --dump_dir /path/to/dump` | Why a computed port-set has no Atlas row | No verdict |
+| OVN ingest | `python3 clickhouse_ovn/ingest.py --dump_dir /path/to/dump --log_bundle_id 159166` | NB/SB tables, edges, and the four path tables | `flow_policy` |
+| OVN without AHV | `python3 clickhouse_ovn/ingest.py --dump_dir /path/to/dump --log_bundle_id 159166 --skip-ahv` | NB and SB | AHV host collect |
+| OVN without SB | `python3 clickhouse_ovn/ingest.py --dump_dir /path/to/dump --log_bundle_id 159166 --skip-sb` | Northbound only | Southbound bindings |
+| Path tables only | `python3 clickhouse_ovn/path_tables.py --dump_dir /path/to/dump --log_bundle_id 159166` | `ovn_switch`, `ovn_subnet`, `ovn_router`, `ovn_l2gw` | Every other OVN table. Does not drop the bundle. |
+| Path tables via ingest | `python3 clickhouse_ovn/ingest.py --dump_dir /path/to/dump --log_bundle_id 159166 --only-path-tables` | Same four tables | Same as `path_tables.py` |
+| Drop one bundle | `python3 clickhouse_ovn/ingest.py --drop-bundle 159166` | Removes that OVN partition and exits | Other bundles |
+| Verdict only | `python3 skills/network-services/nic-traffic-verdict/scripts/nic_traffic.py --log_bundle_id 159166 --src <nic-or-ip> --dst <nic-or-ip> --port 80 --proto tcp --out /tmp/verdict` | Mermaid, tunnel ids, gateway hosts, drop cookie, ACL tables | Does not ingest |
+| Older path trace | `python3 clickhouse_ovn/trace.py --log_bundle_id 159166 --src <vm-or-mac-or-lsp> --dst <vm-or-mac-or-lsp-or-external>` | Composite upstream and downstream mermaid under `clickhouse_ovn/out/` | Not the NIC verdict |
+
+`--nb /path/to/ovsdb-client_dump_nb.txt` on the verdict overrides the northbound dump used for address-set IPs. The default is `bundle.dump_dir` plus `cmsp_ovn/anc-ovn/commands/ovsdb-client_dump_nb.txt`.
+
+Column catalog for the four path tables: [clickhouse_ovn/PATH_TABLES.md](clickhouse_ovn/PATH_TABLES.md). The skill that runs the verdict is [skills/network-services/nic-traffic-verdict/SKILL.md](skills/network-services/nic-traffic-verdict/SKILL.md).

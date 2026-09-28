@@ -202,10 +202,12 @@ Join keys written by ingest:
 
 ## Commands
 
+End to end, and each stage on its own, are in [PORTSET_DESIGN.md](PORTSET_DESIGN.md) under "How to trigger".
+
 ```text
-python3 clickhouse_flow/ingest.py --dump_dir /path/to/dump --log_bundle_id 123
-python3 clickhouse_flow/compare.py --log_bundle_id 123
-python3 clickhouse_ovn/ingest.py --dump_dir /path/to/dump --log_bundle_id 123
-python3 clickhouse_ovn/trace.py --log_bundle_id 123 --src <vm|mac|lsp> --dst <vm|mac|lsp|external>
-python3 skills/network-services/nic-traffic-verdict/scripts/nic_traffic.py --log_bundle_id 123 --src <nic> --dst <nic> --port 443 --proto tcp
+python3 clickhouse_flow/ingest.py --dump_dir /path/to/dump --log_bundle_id 159166
+python3 clickhouse_ovn/ingest.py --dump_dir /path/to/dump --log_bundle_id 159166
+python3 skills/network-services/nic-traffic-verdict/scripts/nic_traffic.py \
+  --log_bundle_id 159166 --src <nic-or-ip> --dst <nic-or-ip> --port 80 --proto tcp \
+  --out /tmp/verdict
 ```

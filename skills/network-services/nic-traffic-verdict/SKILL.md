@@ -84,4 +84,4 @@ set stays empty.
 ## Design
 
 Port-set creation, the two stages, and this verdict are recorded in
-[PORTSET_DESIGN.md](../../../PORTSET_DESIGN.md).
+[PORTSET_DESIGN.md](../../../PORTSET_DESIGN.md). End to end and each stage on its own are under "How to trigger".

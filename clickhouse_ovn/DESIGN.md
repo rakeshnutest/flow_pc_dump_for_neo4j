@@ -102,14 +102,16 @@ Mermaid is **composite per direction** (Upstream = srcâ†’dst, Downstream = dstâ†
 
 ## Scripts
 
+The NIC verdict trigger, including path-table-only and verdict-only, is in [PORTSET_DESIGN.md](../PORTSET_DESIGN.md) under "How to trigger". `trace.py` is the older composite path. `nic_traffic.py` is the two-NIC verdict.
+
 ```text
-python3 ingest.py --dump_dir /home/rakeshkumar.r/panacea/flow_pc_dumps/ovn_ovs_verify --log_bundle_id 123
-python3 trace.py --log_bundle_id 123 --find-scenarios
-python3 trace.py --log_bundle_id 123 --src <vm|mac|lsp-uuid> --dst <vm|mac|lsp-uuid|external>
-# always writes clickhouse_ovn/out/<src>__<dst>.md (or --out FILE.md)
-# each file: Upstream composite + Downstream composite mermaid (ACL|L2|L3|GW|External)
-python3 trace.py --log_bundle_id 123 --run-scenarios
-# writes clickhouse_ovn/out/scenarios.md plus one .md per scenario
-# re-ingest same bundle: DROP PARTITION 123 only
-# first migration: ingest.py --reset-schema
+python3 clickhouse_ovn/ingest.py --dump_dir /path/to/dump --log_bundle_id 159166
+python3 clickhouse_ovn/ingest.py --dump_dir /path/to/dump --log_bundle_id 159166 --only-path-tables
+python3 clickhouse_ovn/path_tables.py --dump_dir /path/to/dump --log_bundle_id 159166
+python3 clickhouse_ovn/trace.py --log_bundle_id 159166 --src <vm|mac|lsp> --dst <vm|mac|lsp|external>
+python3 clickhouse_ovn/trace.py --log_bundle_id 159166 --run-scenarios
+python3 skills/network-services/nic-traffic-verdict/scripts/nic_traffic.py \
+  --log_bundle_id 159166 --src <nic-or-ip> --dst <nic-or-ip> --port 80 --proto tcp --out /tmp/verdict
 ```
+
+A full ingest drops only that bundle's partition. `--only-path-tables` and `path_tables.py` reload the four path tables and leave the other OVN tables in place. `--reset-schema` is the first migration. It drops every bundle.

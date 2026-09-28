@@ -104,8 +104,8 @@ One localnet port, one l2gateway port, or one geneve stretch chassis.
 
 ## What the verdict reads
 
-`nic_traffic.py` writes one JSON document and one markdown file.
+`nic_traffic.py` writes one JSON document and one markdown file. How to run the ingest and the verdict, end to end or one stage at a time, is in [PORTSET_DESIGN.md](../PORTSET_DESIGN.md) under "How to trigger".
 
-The JSON always has `tables` (this catalog), `path`, `acl_source`, `acl_destination`, `verdict`, and `ip_mapping`. `path` lists both switches with NB and SB fields and the VM port number, every router on the path, the external gateway when the path leaves the tenant switches, and the L2 gateway rows for those switches.
+The JSON always has `tables` (this catalog), `path`, `acl_source`, `acl_destination`, `verdict`, and `ip_mapping`. `path.tunnels` has the transit-switch tunnel id into the gateway, the external-switch tunnel id, and the transit-switch tunnel id back to the destination router. `verdict.drop_cookie` is the OpenFlow cookie of an enforce drop: the first 32 bits of that ACL uuid. `verdict.drop_where` is `destination switch` for `to-lport` and `source switch` for `from-lport`.
 
-The markdown draws one mermaid flowchart of that path, then four tables: ACL source, ACL destination, verdict, and IP mapping. ACL rows show the rule number. Peer addresses stay in the IP mapping table.
+The markdown draws one mermaid flowchart. Each hop label is that tunnel id. The drop cookie is written on the switch that enforces it. Then the file lists hosts, gateway redirect chassis, tcpdump commands, and four tables: ACL source, ACL destination, verdict, and IP mapping.
