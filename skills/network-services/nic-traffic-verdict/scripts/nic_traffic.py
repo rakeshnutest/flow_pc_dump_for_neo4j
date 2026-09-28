@@ -602,22 +602,36 @@ def _forward_nexthops(router: dict) -> list:
     return hops
 
 
-def _nat_label(router: dict, inbound: bool) -> str:
+def _host_ip(value: str) -> str:
+    return (value or "").split("/")[0]
+
+
+def _nat_label(router: dict, inbound: bool, src_ip: str, dst_ip: str) -> str:
     hits = [row for row in (router.get("nat") or []) if row.get("applies") == "yes"]
-    if not hits:
-        return "no NAT"
     if inbound:
+        if not hits:
+            return "no NAT, %s stays" % dst_ip
         row = hits[0]
-        return "DNAT %s to %s" % (row.get("external_ip") or "", row.get("logical_ip") or "")
+        return "DNAT %s → %s" % (_host_ip(row.get("external_ip") or ""), _host_ip(row.get("logical_ip") or ""))
+    if not hits:
+        return "no NAT, %s stays" % src_ip
     best = max(_prefix_len(_nat_spec(row.get("logical_ip") or "")) for row in hits)
     ips = []
     for row in hits:
         if _prefix_len(_nat_spec(row.get("logical_ip") or "")) != best:
             continue
-        ip = row.get("external_ip") or ""
+        ip = _host_ip(row.get("external_ip") or "")
         if ip and ip not in ips:
             ips.append(ip)
-    return "NAT " + ", ".join(ips)
+    return "SNAT %s → %s" % (src_ip, ", ".join(ips))
+
+
+def _enter_label(router: dict, dst_ip: str, dnat_external: str) -> str:
+    if dnat_external:
+        for row in router.get("nat") or []:
+            if (row.get("type") or "") in ("dnat", "dnat_and_snat") and _host_ip(row.get("external_ip") or "") == dnat_external:
+                return "DNAT %s → %s" % (dnat_external, _host_ip(row.get("logical_ip") or ""))
+    return "no NAT, %s stays" % dst_ip
 
 
 def _dnat_logical(bid: int, ip: str) -> str:
@@ -1224,7 +1238,7 @@ def load_forwarding(bid: int, src: dict, dst: dict) -> dict:
                     chosen.append(gw)
         chosen.sort(key=_transit_ip)
         for gw in chosen:
-            gw["nat_label"] = _nat_label(gw, src_out)
+            gw["nat_label"] = _nat_label(gw, src_out, src_ip, dst_ip)
             if src_out:
                 back = ""
                 pbr = gw.get("pbr_hit")
@@ -1242,7 +1256,7 @@ def load_forwarding(bid: int, src: dict, dst: dict) -> dict:
                 gw["edge_outside"] = gw["nat_label"]
                 pbr = gw.get("pbr_hit")
                 if pbr and pbr.get("action") == "reroute" and pbr.get("nexthop"):
-                    gw["nat_label"] = "PBR reroute %s" % pbr.get("nexthop")
+                    gw["nat_label"] = "PBR %s → %s" % (src_ip, pbr.get("nexthop"))
                     gw["edge_outside"] = gw["nat_label"]
                     gw["pbr_exit"] = pbr.get("nexthop")
             if tenants:
@@ -1294,6 +1308,24 @@ def load_forwarding(bid: int, src: dict, dst: dict) -> dict:
         else:
             direction = "Scale-out next hops on this path: " + "; ".join(bits) + "."
         forwarding_note = " ".join(pbr_bits + ([direction] if bits else []))
+    by_lr = {item.get("lr_uuid"): item for item in routers}
+    for index, gw in enumerate(gateways):
+        src_item = by_lr.get(gw.get("lr_uuid")) or {}
+        if not gw.get("nat"):
+            gw["nat"] = src_item.get("nat") or []
+            gw["pbr"] = gw.get("pbr") or src_item.get("pbr") or []
+            gw["pbr_hit"] = gw.get("pbr_hit") or src_item.get("pbr_hit")
+        if gw.get("nat_label"):
+            continue
+        entering = len(gateways) > 1 and index == len(gateways) - 1
+        if entering:
+            gw["nat_label"] = _enter_label(gw, dst_ip, dst_ep.get("dnat_external") or "")
+        else:
+            gw["nat_label"] = _nat_label(gw, False, src_ip, dst_ip)
+        pbr = gw.get("pbr_hit")
+        if pbr and pbr.get("action") == "reroute" and pbr.get("nexthop"):
+            gw["nat_label"] = "PBR %s → %s" % (src_ip, pbr.get("nexthop"))
+            gw["pbr_exit"] = pbr.get("nexthop")
     return {
         "class": path_class,
         "source": src_ep,
@@ -1375,23 +1407,19 @@ def _endpoint_box(node: str, title: str, endpoint: dict, router: dict, drop: dic
 def _gw_label(router: dict) -> str:
     rc = router.get("rc") or {}
     ext = router.get("external_port") or {}
-    ips = router.get("nb_gw_external_ips") or []
-    ip = ips[0] if ips else ""
     networks = ext.get("nb_networks") or []
-    if networks:
-        ip = networks[0]
-    return "GW %s<br>RC %s<br>%s<br>router %s" % (
-        _qmark(ip),
-        _qmark(rc.get("hostname") or "unresolved"),
-        _qmark(ext.get("nb_mac") or ""),
-        hex24(router.get("sb_tunnel_key") or 0),
-    )
-
-
-def _outside_gw_label(router: dict) -> str:
-    nat = router.get("nat_label") or "no NAT"
+    port = networks[0] if isinstance(networks, list) and networks else ""
+    lines = [router.get("nat_label") or "no NAT"]
     transit = _transit_ip(router)
-    return "%s<br>%s<br>%s" % (_qmark(nat), _qmark(transit), _gw_label(router))
+    if transit:
+        lines.append("transit " + transit)
+    if port:
+        lines.append("port " + port)
+    lines.append("RC " + (rc.get("hostname") or "unresolved"))
+    if ext.get("nb_mac"):
+        lines.append(ext.get("nb_mac") or "")
+    lines.append("router " + hex24(router.get("sb_tunnel_key") or 0))
+    return "<br>".join(_qmark(line) for line in lines)
 
 
 def mermaid(path: dict, drop: dict = None) -> str:
@@ -1424,7 +1452,7 @@ def mermaid(path: dict, drop: dict = None) -> str:
         lines.append('  subgraph GWX["external gateways"]')
         lines.append("    direction TB")
         for index, router in enumerate(gateways):
-            lines.append('    g%d["%s"]' % (index, _outside_gw_label(router)))
+            lines.append('    g%d["%s"]' % (index, _gw_label(router)))
         lines.append("  end")
         tunnels = path.get("tunnels") or {}
         ext_tnl = hex24(tunnels.get("external") or 0)
@@ -1471,9 +1499,12 @@ def mermaid(path: dict, drop: dict = None) -> str:
             lines.append('    %s["%s"]' % (node, _gw_label(router)))
             ids.append(node)
         tunnels = path.get("tunnels") or {}
+        nat = (gateways[0].get("nat_label") or "").strip()
         ext = "tunnel %s" % hex24(tunnels.get("external") or 0)
+        if nat:
+            ext = "%s<br>%s" % (nat, ext)
         for left, right in zip(ids, ids[1:]):
-            lines.append("    %s -->|%s| %s" % (left, ext, right))
+            lines.append("    %s -->|%s| %s" % (left, _qmark(ext), right))
         lines.append("  end")
         to_gw = "tunnel %s" % hex24(tunnels.get("to_gateway") or (src_router.get("sb_tunnel_key") if src_router else 0))
         from_gw = "tunnel %s" % hex24(tunnels.get("from_gateway") or (dst_router.get("sb_tunnel_key") if dst_router else 0))

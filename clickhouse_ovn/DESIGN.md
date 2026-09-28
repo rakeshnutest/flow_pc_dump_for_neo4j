@@ -98,11 +98,11 @@ Mermaid is **composite per direction** (Upstream = src→dst, Downstream = dst�
 1. **Same L2** — src and dst VIF on the same `ls_uuid`. Hops: NIC1, LSP1, LS, ACLs, LSP2, NIC2. Stretch from `ovn_ls_stretch`.
 2. **L2–L3–L2, one router** — two VIF LSs that share one LR via `ovn_edge_ls_lr`. ACLs on each LS; PBR on the LR.
 3. **Two routers / VPC via transit** — shortest LS–LR path with two tenant LRs. This dump has **zero** `LRP.peer`; routers meet on a per-VPC `gw-scale-out-network` (transit LS) and a shared External localnet. VM–VM across user VPCs: src LS → src tenant LR → src transit → src `gw-scale-out-router` (NAT, External GW MAC+IP) → External localnet → dest GW → dest transit → dest tenant LR → dest LS. `Gateway_Chassis` is empty; HA chassis groups + sibling `gw-scale-out-router_*` on the transit LS. `trace.py` prints every scale-out host. Fallback if no two-VIF pair: VIF → tenant LR → gw-scale-out-router.
-4. **Northbound** — VIF LS → tenant LR → gw-scale-out-network → gw-scale-out-router with `ovn_nat` and/or `lrp-ext_gw_port` / localnet.
+4. **Northbound** — VIF LS → tenant LR → gw-scale-out-network → gw-scale-out-router with `ovn_nat` and/or `lrp-ext_gw_port` / localnet. `nic_traffic.py` draws both scale-out transit next hops (`169.254.2.100` and `169.254.2.101` on the checked VPC). Policy routing is applied before the route. Outbound SNAT, inbound no NAT, inbound DNAT of a floating IP, and a reroute from one scale-out gateway to the other are the four diagrams in [PORTSET_DESIGN.md](../PORTSET_DESIGN.md) under "Path traversal".
 
 ## Scripts
 
-`trace.py` walks the four shapes above and writes the composite mermaid. `nic_traffic.py` is the two-NIC traversal: VPC boxes, tunnel id on each hop, redirect-chassis host, and the drop cookie on the switch that enforces the ACL. What that check prints, and how to run ingest plus verdict together or one stage at a time, is in [PORTSET_DESIGN.md](../PORTSET_DESIGN.md) under "Path traversal" and "How to trigger".
+`trace.py` walks the four shapes above and writes the composite mermaid. `nic_traffic.py` is the two-NIC traversal: VPC boxes, tunnel id on each hop, both scale-out gateways, NAT or no NAT, policy routing, redirect-chassis host, and the drop cookie on the switch that enforces the ACL. What that check prints, and how to run ingest plus verdict together or one stage at a time, is in [PORTSET_DESIGN.md](../PORTSET_DESIGN.md) under "Path traversal" and "How to trigger".
 
 ```text
 python3 clickhouse_ovn/ingest.py --dump_dir /path/to/dump --log_bundle_id 159166

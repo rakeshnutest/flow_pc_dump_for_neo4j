@@ -275,7 +275,7 @@ ACL interpretation uses the same file:
 
 This is the OVN check for one forward packet. It does not recompute a port-set hash. It joins the NIC to the subnet, the switch, the routers, and the external gateway, then applies the ACLs.
 
-Join, loaded at ingest into `ovn_switch`, `ovn_subnet`, `ovn_router`, and `ovn_l2gw`. Each of those rows keeps the northbound object and the southbound binding together.
+Join, loaded at ingest into `ovn_switch`, `ovn_subnet`, `ovn_router`, `ovn_route`, and `ovn_l2gw`. Each of those rows keeps the northbound object and the southbound binding together. NAT and policy routing are `ovn_nat` and `ovn_pbr` from the full OVN ingest.
 
 `flow_policy.vm_nic` → `ovn_subnet` → `ovn_switch` → `ovn_edge_ls_lr` / `ovn_edge_lr_lr` → `ovn_router` → external gateway.
 
@@ -296,10 +296,135 @@ What the markdown verifies, in order:
 | TAP and Geneve capture commands | VM logical port on that host, and UDP 6081 toward the next Geneve IP |
 | Source outgoing ACLs and destination incoming ACLs | `ovn_acl`. Peer addresses are a separate IP-mapping table. |
 | Allow policy and deny policy | Highest matching row on each stage. An enforce drop denies. A monitor drop is reported and the verdict stays allowed. |
-| Routing table | `ovn_route` for every router on the path. Connected prefixes come from the router ports. Static prefixes come from `Logical_Router_Static_Route`. The longest prefix that contains this packet is marked. |
-| Scale-out next hop, NAT, no NAT, and PBR | `169.254.2.100` and `169.254.2.101` are the transit addresses of the two scale-out gateways. Outbound draws every matching default next hop and labels the gateway NAT or no NAT from `ovn_nat`. Inbound draws each gateway that routes the destination, and labels DNAT when a DNAT row matches. `ovn_pbr` is checked first: reroute replaces the next hop, drop stops the packet, allow uses the routing table. |
+| Routing table | `ovn_route` for every router on the path. Connected prefixes come from the router ports. Static prefixes come from `Logical_Router_Static_Route`. The longest prefix that contains this packet is marked. Equal-length matches both stay. |
+| Policy routing | `ovn_pbr`, checked before the routing table. The highest matching row is the one that is used. |
+| NAT or no NAT | `ovn_nat` on each gateway, for this direction only. |
 
-The mermaid is three boxes when the path leaves the VPC: source VPC, external gateways, destination VPC. A host that is both a VM host and a redirect chassis is named once and called out as two roles.
+`ovn_route` is loaded with the path tables. `ovn_nat` and `ovn_pbr` are loaded by the full OVN ingest. An empty table is reported as no match. The verdict does not invent a next hop or a translation.
+
+#### Scale-out next hops
+
+On this dump a tenant router has two equal default routes, `0.0.0.0/0`. The next hops are the transit addresses of the two scale-out gateways on that VPC's transit switch. They are not VM addresses and they are not the external gateway addresses.
+
+Checked on bundle `159166`, VPC `VPC_California_SJ_Pheonix_Customer_25`, tenant `router_b63dc5cc-db7d-4244-ba7d-007448e8e083`. The tenant's own transit address is `169.254.2.20`. Both gateways sit on transit tunnel `0x00003a`. Both external ports sit on tunnel `0x002779`.
+
+| Transit | Gateway | External | Redirect chassis | Router tunnel |
+|---|---|---|---|---|
+| `169.254.2.100` | `gw-scale-out-router_nat_…_0` | `10.116.246.5/18` | zadkiel04-4 | `0x000049` |
+| `169.254.2.101` | `gw-scale-out-router_nat_…_1` | `10.116.246.12/18` | zadkiel04-3 | `0x000002` |
+
+Both next hops are drawn. The diagram does not keep only the gateway that has NAT configured.
+
+#### Order on each router
+
+1. Policy routing. The highest `ovn_pbr` row whose `match` fits this source and destination is the one that is used. `drop` stops the packet. `reroute` replaces the next hop. `allow` keeps the routing table. A lower row that also matches is printed and marked unused. No matching row means the routing table is used.
+2. Routing table. `src-ip` is tested against the source. Every other policy is tested against the destination. The longest prefix wins. Two prefixes of that same length both match, so both default next hops stay.
+3. NAT, after the next hop is chosen. Outbound uses the longest SNAT, or `dnat_and_snat`, whose logical IP contains the source. The gateway is labeled `SNAT <inside> → <external>`. No such row is `no NAT, <address> stays`. Inbound DNAT applies only when the outside destination is that rule's external IP, labeled `DNAT <external> → <inside>`. A packet already addressed to the VM's private IP is not DNAT. The external port prefix is labeled `port`, separate from the translated address. A policy reroute is labeled `PBR <packet> → <next hop>`.
+
+A gateway whose winning policy is `reroute` to the other transit address does not exit outside. The edge goes to that other gateway, on the transit tunnel.
+
+#### Outside, leaving the VPC
+
+`192.168.254.130` is not a special address. It is a VM NIC. `8.8.8.8` is outside this system, so the path stops at the two scale-out gateways. Only the inside NIC's ACLs apply. Policy routing priority 100 on the tenant router is `allow`, so both defaults are used. Each gateway SNATs `192.168.254.0/24`.
+
+```mermaid
+flowchart LR
+  subgraph SRC["VPC_California_SJ_Pheonix_Customer_25"]
+    direction TB
+    SRC_h["host flashfire01-1<br>geneve 10.116.29.154"]
+    SRC_v["inbound_1<br>50:6b:8d:3a:94:7a<br>192.168.254.130"]
+    SRC_s["switch 0x002e2d<br>vlan 0"]
+    SRC_r["router 0x00278e<br>e0:19:95:fa:5f:25<br>192.168.254.1/24"]
+    SRC_h --> SRC_v --> SRC_s --> SRC_r
+  end
+  OUT["outside<br>8.8.8.8"]
+  subgraph GWX["external gateways"]
+    direction TB
+    g0["SNAT 192.168.254.130 → 10.116.246.5<br>transit 169.254.2.100<br>port 10.116.246.5/18<br>RC zadkiel04-4<br>e0:19:95:d7:6b:53<br>router 0x000049"]
+    g1["SNAT 192.168.254.130 → 10.116.246.12<br>transit 169.254.2.101<br>port 10.116.246.12/18<br>RC zadkiel04-3<br>e0:19:95:ae:c4:f8<br>router 0x000002"]
+  end
+  SRC_r -->|169.254.2.100<br>tunnel 0x00003a| g0
+  g0 -->|SNAT 192.168.254.130 → 10.116.246.5<br>tunnel 0x002779| OUT
+  SRC_r -->|169.254.2.101<br>tunnel 0x00003a| g1
+  g1 -->|SNAT 192.168.254.130 → 10.116.246.12<br>tunnel 0x002779| OUT
+```
+
+#### Outside, coming in to a private address
+
+`8.8.8.8` → `192.168.254.130`. No DNAT row has this private address as its external IP, so both gateways are `no NAT`. Each has a static route `192.168.254.0/24` via `169.254.2.20`, which is the tenant router. The tenant's connected route `192.168.254.1/24` then delivers the VM.
+
+```mermaid
+flowchart LR
+  OUT["outside<br>8.8.8.8"]
+  subgraph DST["VPC_California_SJ_Pheonix_Customer_25"]
+    direction TB
+    DST_h["host flashfire01-1<br>geneve 10.116.29.154"]
+    DST_v["inbound_1<br>50:6b:8d:3a:94:7a<br>192.168.254.130"]
+    DST_s["switch 0x002e2d<br>vlan 0"]
+    DST_r["router 0x00278e<br>e0:19:95:fa:5f:25<br>192.168.254.1/24"]
+    DST_h --> DST_v --> DST_s --> DST_r
+  end
+  subgraph GWX["external gateways"]
+    direction TB
+    g0["no NAT, 192.168.254.130 stays<br>transit 169.254.2.100<br>port 10.116.246.5/18<br>RC zadkiel04-4<br>e0:19:95:d7:6b:53<br>router 0x000049"]
+    g1["no NAT, 192.168.254.130 stays<br>transit 169.254.2.101<br>port 10.116.246.12/18<br>RC zadkiel04-3<br>e0:19:95:ae:c4:f8<br>router 0x000002"]
+  end
+  OUT -->|no NAT, 192.168.254.130 stays<br>tunnel 0x002779| g0
+  g0 -->|169.254.2.20<br>tunnel 0x00003a| DST_r
+  OUT -->|no NAT, 192.168.254.130 stays<br>tunnel 0x002779| g1
+  g1 -->|169.254.2.20<br>tunnel 0x00003a| DST_r
+```
+
+#### Outside, coming in to a floating IP
+
+`10.116.246.129` is `dnat_and_snat` on the `169.254.2.100` gateway, logical IP `192.168.253.133` (Jump_Host1). The verdict follows that logical IP into the VPC and draws only the gateway that owns the external IP.
+
+```mermaid
+flowchart LR
+  OUT["outside<br>8.8.8.8"]
+  subgraph DST["VPC_California_SJ_Pheonix_Customer_25"]
+    direction TB
+    DST_h["host spymaster01-3<br>geneve 10.116.26.73"]
+    DST_v["Jump_Host1<br>50:6b:8d:2a:64:85<br>192.168.253.133"]
+    DST_s["switch 0x002dfc<br>vlan 0"]
+    DST_r["router 0x00278e<br>e0:19:95:3f:10:79<br>192.168.253.1/24"]
+    DST_h --> DST_v --> DST_s --> DST_r
+  end
+  subgraph GWX["external gateways"]
+    direction TB
+    g0["DNAT 10.116.246.129 → 192.168.253.133<br>transit 169.254.2.100<br>port 10.116.246.5/18<br>RC zadkiel04-4<br>e0:19:95:d7:6b:53<br>router 0x000049"]
+  end
+  OUT -->|DNAT 10.116.246.129 → 192.168.253.133<br>tunnel 0x002779| g0
+  g0 -->|169.254.2.20<br>tunnel 0x00003a| DST_r
+```
+
+#### Policy routing that moves one next hop
+
+`192.168.253.133` → `8.8.8.8`. The tenant policy is still `allow`, so both defaults are candidates. On the `169.254.2.101` gateway, priority 1000 `reroute` matches `ip4.src==192.168.253.133/32` and sends the packet to `169.254.2.100`. That gateway's longest NAT for this source is `dnat_and_snat` to `10.116.246.129`, which wins over the subnet SNAT `10.116.246.5`.
+
+```mermaid
+flowchart LR
+  subgraph SRC["VPC_California_SJ_Pheonix_Customer_25"]
+    direction TB
+    SRC_h["host spymaster01-3<br>geneve 10.116.26.73"]
+    SRC_v["Jump_Host1<br>50:6b:8d:2a:64:85<br>192.168.253.133"]
+    SRC_s["switch 0x002dfc<br>vlan 0"]
+    SRC_r["router 0x00278e<br>e0:19:95:3f:10:79<br>192.168.253.1/24"]
+    SRC_h --> SRC_v --> SRC_s --> SRC_r
+  end
+  OUT["outside<br>8.8.8.8"]
+  subgraph GWX["external gateways"]
+    direction TB
+    g0["SNAT 192.168.253.133 → 10.116.246.129<br>transit 169.254.2.100<br>port 10.116.246.5/18<br>RC zadkiel04-4<br>e0:19:95:d7:6b:53<br>router 0x000049"]
+    g1["PBR 192.168.253.133 → 169.254.2.100<br>transit 169.254.2.101<br>port 10.116.246.12/18<br>RC zadkiel04-3<br>e0:19:95:ae:c4:f8<br>router 0x000002"]
+  end
+  SRC_r -->|169.254.2.100<br>tunnel 0x00003a| g0
+  g0 -->|SNAT 192.168.253.133 → 10.116.246.129<br>tunnel 0x002779| OUT
+  SRC_r -->|169.254.2.101<br>tunnel 0x00003a| g1
+  g1 -->|PBR 192.168.253.133 → 169.254.2.100<br>tunnel 0x00003a| g0
+```
+
+Two VM NICs in different VPCs stay the three-box diagram: source VPC, external gateways, destination VPC. That diagram is not replaced by the scale-out pair above. A host that is both a VM host and a redirect chassis is named once and called out as two roles. On `192.168.254.130` → NIC `b4e93b84-06ef-41bb-b834-061b2b65d632`, tcp/80, the hops are tunnel `0x00003a`, `0x002779`, and `0x00000d`, and the destination switch shows drop cookie `0x65c25b48`, rule 1045.
 
 `trace.py` in section 4 is the older composite path and the Atlas-leftover note. `nic_traffic.py` is the traversal above. Commands for both, run together or one stage at a time, are under [How to trigger](#how-to-trigger).
 
@@ -416,8 +541,9 @@ Port-set verification on a path does not join these tables in SQL. `trace.py` re
 | `ovn_pg` | `(pg_uuid)` | Port group | `name`. This is the OVN face of a port-set when the name is `port_group_<uuid>`. |
 | `ovn_acl_on_pg` | `(pg_uuid, acl_uuid)` | Port group → ACL | ACLs attached to the port-set's port group |
 | `ovn_pg_port` | `(pg_uuid, lsp_uuid)` | Port-group membership | LSP UUIDs in that port group |
-| `ovn_pbr` | `(lr_uuid, priority, pbr_uuid)` | Router policy | `match`, `action`, `nexthop`, `nexthops` |
-| `ovn_nat` | `(lr_uuid, nat_uuid)` | NAT | `type`, `external_ip`, `logical_ip`, `logical_port`, `external_mac` |
+| `ovn_pbr` | `(lr_uuid, priority, pbr_uuid)` | Router policy | `match`, `action`, `nexthop`, `nexthops`. Checked before `ovn_route`. |
+| `ovn_nat` | `(lr_uuid, nat_uuid)` | NAT | `type`, `external_ip`, `logical_ip`, `logical_port`, `external_mac`. `snat` and `dnat_and_snat` on the way out. `dnat` and `dnat_and_snat` on the way in, matched on `external_ip`. |
+| `ovn_route` | `(lr_uuid, kind, nb_prefix, nb_nexthop, nb_output_port)` | Connected or static route | `kind` is `connected` or `static`. No southbound Route table. SB columns are the router datapath and the output-port binding. |
 | `ovn_vm` | `(vm_uuid)` | AHV domain | `name`, `host_ip` |
 | `ovn_vm_nic` | `(vm_uuid, nic_uuid)` | NIC | `mac`, `ip4`, `host_ip`, `lsp_uuid`, `ls_uuid`. MAC joins the NIC to an LSP. LSP `name` `port_<uuid>` is not always the Acropolis NIC UUID. |
 | `ovn_chassis` | `(chassis_uuid)` | Hypervisor | `name`, `hostname` |
@@ -471,10 +597,14 @@ Printed sections, in this order. Every port-set row and every ACL row is printed
 
 | Section | Content |
 |---|---|
-| Path | Mermaid. Each VPC is a box (host, VM MAC and IP, switch tunnel key, tenant router). External gateways are their own box (redirect-chassis host, external MAC, router tunnel key). Each hop is labeled with the tunnel id used on that hop. A denied verdict prints the OpenFlow cookie on the switch that drops the packet. |
-| Endpoints | VPC, subnet, VLAN, VM MAC, DHCP gateway MAC, host, Geneve IP, switch tunnel key in hex, port tunnel key in hex |
-| Routers and gateways | One row per router port on the path: MAC, address, tunnel key, hex |
-| External gateways | One block per gateway: external IP and MAC, host, Geneve IP, chassis, chassis name, HA group, HA priority |
+| Path | Mermaid. Each VPC is a box (host, VM MAC and IP, switch tunnel key, tenant router). External gateways are their own box. An outside address is one node, and both scale-out transit next hops are drawn. Each hop is labeled with the transit address or the NAT action, and with the tunnel id. A denied verdict prints the OpenFlow cookie on the switch that drops the packet. |
+| Endpoints | VPC, subnet, VLAN, VM MAC, DHCP gateway MAC, host, Geneve IP, switch tunnel key in hex, port tunnel key in hex. An outside address is a two-row table. |
+| Routers and gateways | One row per router port on the path: MAC, address, tunnel key, hex. Transit addresses `169.254.2.100` and `169.254.2.101` are rows. |
+| Routing tables | One table per router. Columns: kind, prefix, nexthop, policy, output port, matches. `matches` is the longest prefix for this packet. |
+| Forwarding | Which policy routing row won, and which scale-out next hop is NAT, no NAT, DNAT, or a reroute. |
+| Policy based routing | Matching `ovn_pbr` rows. Columns: priority, action, nexthop, match, used. |
+| NAT | Matching `ovn_nat` rows for this direction. Columns: type, external ip, logical ip, applies. No matching row is no NAT. |
+| External gateways | One block per gateway: transit address, NAT or no NAT, external IP and MAC, host, Geneve IP, chassis, chassis name, HA group, HA priority |
 | Capture | TAP tcpdump on each VM host, and Geneve tcpdump (UDP 6081) on the host NIC toward the next Geneve IP |
 | ACL source | Every `from-lport` rule. Columns: rule, action, ip, policy, category, peer, ports, matches. Peer addresses are not in this table. |
 | ACL destination | Every `to-lport` rule. Same columns. |
@@ -509,7 +639,7 @@ The verdict does not ingest. It reads tables that are already loaded. Load polic
 
 ### End to end
 
-One dump, then one verdict. Policy and OVN are separate ingests. The full OVN ingest also fills `ovn_switch`, `ovn_subnet`, `ovn_router`, and `ovn_l2gw`.
+One dump, then one verdict. Policy and OVN are separate ingests. The full OVN ingest fills `ovn_switch`, `ovn_subnet`, `ovn_router`, `ovn_route`, `ovn_l2gw`, `ovn_nat`, and `ovn_pbr`.
 
 ```text
 python3 clickhouse_flow/ingest.py \
@@ -528,7 +658,29 @@ python3 skills/network-services/nic-traffic-verdict/scripts/nic_traffic.py \
 
 `--out` writes `<stem>.json` and `<stem>.md`. Omit `--log_bundle_id` on the verdict to use the latest `flow_policy` bundle. `--src` and `--dst` take a NIC uuid, an IP, or a VM name. A VM name that matches several NICs prints the NIC uuids and exits. `--proto` is `tcp`, `udp`, or `icmp`. For icmp, `--port` is the ICMP type.
 
-That run walks VM → subnet → switch → router → gateway, draws the mermaid, and prints the ACL tables. For the pair above the path is external, and tcp/80 is denied on the destination switch by rule 1045, cookie `0x65c25b48`.
+That run walks VM → subnet → switch → router → gateway, draws the mermaid, and prints the ACL tables. For the pair above the path is external, and tcp/80 is denied on the destination switch by rule 1045, cookie `0x65c25b48`. The scale-out, NAT, and policy-routing diagrams for that VPC are in [Path traversal](#5-path-traversal-nic_trafficpy).
+
+Outside, NAT, and policy routing. These read the same loaded tables. They do not ingest.
+
+```text
+python3 skills/network-services/nic-traffic-verdict/scripts/nic_traffic.py \
+  --log_bundle_id 159166 --src 192.168.254.130 --dst 8.8.8.8 \
+  --port 80 --proto tcp --out /tmp/nic_out_tcp80
+
+python3 skills/network-services/nic-traffic-verdict/scripts/nic_traffic.py \
+  --log_bundle_id 159166 --src 8.8.8.8 --dst 192.168.254.130 \
+  --port 80 --proto tcp --out /tmp/nic_in_tcp80
+
+python3 skills/network-services/nic-traffic-verdict/scripts/nic_traffic.py \
+  --log_bundle_id 159166 --src 8.8.8.8 --dst 10.116.246.129 \
+  --port 80 --proto tcp --out /tmp/nic_dnat_in
+
+python3 skills/network-services/nic-traffic-verdict/scripts/nic_traffic.py \
+  --log_bundle_id 159166 --src 192.168.253.133 --dst 8.8.8.8 \
+  --port 80 --proto tcp --out /tmp/nic_fip_out
+```
+
+The first draws both transit next hops and both SNAT gateways. The second draws both gateways as no NAT, returning through `169.254.2.20`. The third DNATs `10.116.246.129` to `192.168.253.133` on `169.254.2.100` only. The fourth reroutes the `169.254.2.101` gateway to `169.254.2.100` and NATs that host to `10.116.246.129`. An IP that is neither a VM NIC nor a NAT external IP, with the other side also outside, exits with "Both addresses are outside this system".
 
 ### Part by part
 
@@ -540,15 +692,15 @@ Run only the stage you need. Later stages assume the earlier tables for that dat
 | Policy from JSONL | `python3 clickhouse_flow/ingest.py --from_jsonl /path/to/jsonl --log_bundle_id 159166` | Same tables when the PC JSON is absent | `flow_ovn` |
 | Policy scorecard | `python3 clickhouse_flow/compare.py --log_bundle_id 159166` | PASS/FAIL on UUID and NIC match | No new rows |
 | Leftover port-sets | `python3 clickhouse_flow/observe_leftovers.py --log_bundle_id 159166 --dump_dir /path/to/dump` | Why a computed port-set has no Atlas row | No verdict |
-| OVN ingest | `python3 clickhouse_ovn/ingest.py --dump_dir /path/to/dump --log_bundle_id 159166` | NB/SB tables, edges, and the four path tables | `flow_policy` |
+| OVN ingest | `python3 clickhouse_ovn/ingest.py --dump_dir /path/to/dump --log_bundle_id 159166` | NB/SB tables, edges, the path tables, `ovn_nat`, and `ovn_pbr` | `flow_policy` |
 | OVN without AHV | `python3 clickhouse_ovn/ingest.py --dump_dir /path/to/dump --log_bundle_id 159166 --skip-ahv` | NB and SB | AHV host collect |
 | OVN without SB | `python3 clickhouse_ovn/ingest.py --dump_dir /path/to/dump --log_bundle_id 159166 --skip-sb` | Northbound only | Southbound bindings |
-| Path tables only | `python3 clickhouse_ovn/path_tables.py --dump_dir /path/to/dump --log_bundle_id 159166` | `ovn_switch`, `ovn_subnet`, `ovn_router`, `ovn_l2gw` | Every other OVN table. Does not drop the bundle. |
-| Path tables via ingest | `python3 clickhouse_ovn/ingest.py --dump_dir /path/to/dump --log_bundle_id 159166 --only-path-tables` | Same four tables | Same as `path_tables.py` |
+| Path tables only | `python3 clickhouse_ovn/path_tables.py --dump_dir /path/to/dump --log_bundle_id 159166` | `ovn_switch`, `ovn_subnet`, `ovn_router`, `ovn_route`, `ovn_l2gw` | `ovn_nat`, `ovn_pbr`, and every other OVN table |
+| Path tables via ingest | `python3 clickhouse_ovn/ingest.py --dump_dir /path/to/dump --log_bundle_id 159166 --only-path-tables` | Same five tables | Same as `path_tables.py` |
 | Drop one bundle | `python3 clickhouse_ovn/ingest.py --drop-bundle 159166` | Removes that OVN partition and exits | Other bundles |
 | Verdict only | `python3 skills/network-services/nic-traffic-verdict/scripts/nic_traffic.py --log_bundle_id 159166 --src <nic-or-ip> --dst <nic-or-ip> --port 80 --proto tcp --out /tmp/verdict` | Mermaid, tunnel ids, gateway hosts, drop cookie, ACL tables | Does not ingest |
 | Older path trace | `python3 clickhouse_ovn/trace.py --log_bundle_id 159166 --src <vm-or-mac-or-lsp> --dst <vm-or-mac-or-lsp-or-external>` | Composite upstream and downstream mermaid under `clickhouse_ovn/out/` | Not the NIC verdict |
 
 `--nb /path/to/ovsdb-client_dump_nb.txt` on the verdict overrides the northbound dump used for address-set IPs. The default is `bundle.dump_dir` plus `cmsp_ovn/anc-ovn/commands/ovsdb-client_dump_nb.txt`.
 
-Column catalog for the four path tables: [clickhouse_ovn/PATH_TABLES.md](clickhouse_ovn/PATH_TABLES.md). The skill that runs the verdict is [skills/network-services/nic-traffic-verdict/SKILL.md](skills/network-services/nic-traffic-verdict/SKILL.md).
+Column catalog for the path tables: [clickhouse_ovn/PATH_TABLES.md](clickhouse_ovn/PATH_TABLES.md). The skill that runs the verdict is [skills/network-services/nic-traffic-verdict/SKILL.md](skills/network-services/nic-traffic-verdict/SKILL.md).
