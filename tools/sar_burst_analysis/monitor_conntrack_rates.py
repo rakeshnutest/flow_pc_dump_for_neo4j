@@ -12,6 +12,7 @@ do not collide. Default directory is /tmp; override with --output-dir.
 from __future__ import annotations
 
 import argparse
+import errno
 import gzip
 import os
 import select
@@ -84,6 +85,10 @@ NLA_TYPE_MASK = 0x3FFF
 
 # Default rotate threshold (bytes) before gzip + open a fresh CSV.
 DEFAULT_ROTATE_BYTES = 50 * 1024 * 1024
+DEFAULT_RCVBUF_BYTES = 64 * 1024 * 1024  # 64 MiB netlink socket receive buffer
+# linux/socket.h — bypasses net.core.rmem_max when running as root
+SO_RCVBUFFORCE = 33
+NETLINK_RECV_CHUNK = 1024 * 1024  # 1 MiB per recv call under burst
 
 
 def get_host_ip() -> str:
@@ -251,17 +256,46 @@ def parse_ct_message(buf: bytes, offset: int, msglen: int) -> tuple[str, Optiona
     return (event, orig)
 
 
-def open_netlink_socket() -> socket.socket:
-    """Bind a NETLINK_NETFILTER socket subscribed to NEW + DESTROY groups."""
+def open_netlink_socket(rcvbuf_bytes: int = DEFAULT_RCVBUF_BYTES) -> socket.socket:
+    """Bind a NETLINK_NETFILTER socket subscribed to NEW + DESTROY groups.
+
+    Under high NEW/DESTROY CPS the kernel drops events into ENOBUFS if the
+    userspace receive buffer is too small. Request a large SO_RCVBUF, and as
+    root try SO_RCVBUFFORCE / raise net.core.rmem_max so the kernel actually
+    grants the size.
+    """
     sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_NETFILTER)
-    # pid=0 -> kernel assigns; groups bitmask for NEW|DESTROY
     groups = (1 << (NFNLGRP_CONNTRACK_NEW - 1)) | (1 << (NFNLGRP_CONNTRACK_DESTROY - 1))
     sock.bind((0, groups))
-    # Larger receive buffer to reduce overrun under high CPS.
+
+    # Raise system max so SO_RCVBUF is not silently capped (best-effort).
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 * 1024 * 1024)
+        with open("/proc/sys/net/core/rmem_max", "r+") as f:
+            cur = int(f.read().strip())
+            if cur < rcvbuf_bytes:
+                f.seek(0)
+                f.write(str(rcvbuf_bytes))
+                f.truncate()
     except OSError:
         pass
+
+    for opt in (SO_RCVBUFFORCE, socket.SO_RCVBUF):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, opt, rcvbuf_bytes)
+            break
+        except OSError:
+            continue
+
+    try:
+        granted = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+        # Kernel doubles the requested value for bookkeeping on Linux.
+        print(
+            f"netlink SO_RCVBUF granted≈{granted} bytes (requested {rcvbuf_bytes})",
+            file=sys.stderr,
+        )
+    except OSError:
+        pass
+
     return sock
 
 
@@ -271,7 +305,11 @@ def open_csv(path: str):
     exists = os.path.exists(path) and os.path.getsize(path) > 0
     fh = open(path, "a", buffering=1)
     if not exists:
-        fh.write("timestamp_utc,new_per_sec,destroy_per_sec,new_total,destroy_total\n")
+        fh.write(
+            "timestamp_utc,new_per_sec,destroy_per_sec,"
+            "new_avg_per_sec,destroy_avg_per_sec,"
+            "new_total,destroy_total,enobuf_events\n"
+        )
     return fh
 
 
@@ -331,6 +369,21 @@ def main() -> int:
         help=f"Rotate+gzip CSV when size reaches this many bytes (default: {DEFAULT_ROTATE_BYTES})",
     )
     parser.add_argument(
+        "--rcvbuf-mb",
+        type=int,
+        default=DEFAULT_RCVBUF_BYTES // (1024 * 1024),
+        help="Netlink socket receive buffer in MiB (default: 64). Raises rmem_max if possible.",
+    )
+    parser.add_argument(
+        "--avg-window",
+        type=float,
+        default=60.0,
+        help=(
+            "Also report a sliding-window average over this many seconds "
+            "(default: 60). Set 0 to disable window avg (lifetime avg still printed)."
+        ),
+    )
+    parser.add_argument(
         "--print",
         dest="do_print",
         action="store_true",
@@ -348,6 +401,10 @@ def main() -> int:
         parser.error("--interval must be > 0")
     if args.max_hours < 0:
         parser.error("--max-hours must be >= 0")
+    if args.rcvbuf_mb <= 0:
+        parser.error("--rcvbuf-mb must be > 0")
+    if args.avg_window < 0:
+        parser.error("--avg-window must be >= 0")
 
     if os.geteuid() != 0:
         print(
@@ -357,7 +414,7 @@ def main() -> int:
         )
 
     try:
-        nl = open_netlink_socket()
+        nl = open_netlink_socket(rcvbuf_bytes=args.rcvbuf_mb * 1024 * 1024)
     except OSError as exc:
         print(f"error: failed to open NETLINK_NETFILTER socket: {exc}", file=sys.stderr)
         return 1
@@ -365,7 +422,8 @@ def main() -> int:
     csv_fh = open_csv(args.output)
     print(
         f"conntrack rate monitor: host_ip={host_ip} output={args.output} "
-        f"max_hours={args.max_hours} interval={args.interval}",
+        f"max_hours={args.max_hours} interval={args.interval} "
+        f"rcvbuf_mb={args.rcvbuf_mb} avg_window={args.avg_window}",
         file=sys.stderr,
     )
 
@@ -373,9 +431,14 @@ def main() -> int:
     destroy_count = 0
     new_total = 0
     destroy_total = 0
+    enobuf_count = 0
+    enobuf_total = 0
     interval = args.interval
-    next_sample = time.monotonic() + interval
-    deadline = None if args.max_hours == 0 else (time.monotonic() + args.max_hours * 3600.0)
+    # Sliding window of (mono_ts, new_events, destroy_events) per sample.
+    window: list[tuple[float, int, int]] = []
+    start_mono = time.monotonic()
+    next_sample = start_mono + interval
+    deadline = None if args.max_hours == 0 else (start_mono + args.max_hours * 3600.0)
 
     try:
         while True:
@@ -390,27 +453,34 @@ def main() -> int:
             readable, _, _ = select.select([nl], [], [], timeout)
             if readable:
                 try:
-                    data = nl.recv(65536)
+                    data = nl.recv(NETLINK_RECV_CHUNK)
                 except OSError as exc:
-                    print(f"error: netlink recv failed: {exc}", file=sys.stderr)
-                    break
-                off = 0
-                while off + 16 <= len(data):
-                    (msglen,) = struct.unpack_from("=I", data, off)
-                    if msglen < 16 or off + msglen > len(data):
+                    # ENOBUFS: kernel dropped netlink messages; rates are undercount —
+                    # keep running instead of aborting under CPS bursts.
+                    if getattr(exc, "errno", None) == errno.ENOBUFS:
+                        enobuf_count += 1
+                        enobuf_total += 1
+                    else:
+                        print(f"error: netlink recv failed: {exc}", file=sys.stderr)
                         break
-                    event, orig = parse_ct_message(data, off, msglen)
-                    if event == "new":
-                        new_count += 1
-                        new_total += 1
-                        if args.print_details and orig is not None:
-                            print(f"NEW     {format_flow(orig)}")
-                    elif event == "destroy":
-                        destroy_count += 1
-                        destroy_total += 1
-                        if args.print_details and orig is not None:
-                            print(f"DESTROY {format_flow(orig)}")
-                    off += _align(msglen)
+                else:
+                    off = 0
+                    while off + 16 <= len(data):
+                        (msglen,) = struct.unpack_from("=I", data, off)
+                        if msglen < 16 or off + msglen > len(data):
+                            break
+                        event, orig = parse_ct_message(data, off, msglen)
+                        if event == "new":
+                            new_count += 1
+                            new_total += 1
+                            if args.print_details and orig is not None:
+                                print(f"NEW     {format_flow(orig)}")
+                        elif event == "destroy":
+                            destroy_count += 1
+                            destroy_total += 1
+                            if args.print_details and orig is not None:
+                                print(f"DESTROY {format_flow(orig)}")
+                        off += _align(msglen)
 
             now = time.monotonic()
             if now >= next_sample:
@@ -419,17 +489,47 @@ def main() -> int:
                 scale = elapsed if elapsed > 0 else interval
                 new_rate = new_count / scale
                 destroy_rate = destroy_count / scale
+
+                life_elapsed = max(now - start_mono, interval)
+                new_avg = new_total / life_elapsed
+                destroy_avg = destroy_total / life_elapsed
+
+                window.append((now, new_count, destroy_count))
+                if args.avg_window > 0:
+                    cutoff = now - args.avg_window
+                    while window and window[0][0] < cutoff:
+                        window.pop(0)
+                    win_new = sum(n for _, n, _ in window)
+                    win_destroy = sum(d for _, _, d in window)
+                    win_span = max(now - window[0][0], interval) if window else interval
+                    win_new_avg = win_new / win_span
+                    win_destroy_avg = win_destroy / win_span
+                else:
+                    win_new_avg = new_avg
+                    win_destroy_avg = destroy_avg
+
                 ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 csv_fh.write(
-                    f"{ts},{new_rate:.3f},{destroy_rate:.3f},{new_total},{destroy_total}\n"
+                    f"{ts},{new_rate:.3f},{destroy_rate:.3f},"
+                    f"{new_avg:.3f},{destroy_avg:.3f},"
+                    f"{new_total},{destroy_total},{enobuf_total}\n"
                 )
                 if args.do_print or args.print_details:
+                    extra = f"  enobuf={enobuf_count}" if enobuf_count else ""
+                    win_txt = ""
+                    if args.avg_window > 0:
+                        win_txt = (
+                            f"  win{int(args.avg_window)}s_new/s={win_new_avg:.1f}"
+                            f"  win{int(args.avg_window)}s_destroy/s={win_destroy_avg:.1f}"
+                        )
                     print(
-                        f"{ts}  new/s={new_rate:.1f}  destroy/s={destroy_rate:.1f}  "
-                        f"totals new={new_total} destroy={destroy_total}"
+                        f"{ts}  new/s={new_rate:.1f}  avg_new/s={new_avg:.1f}  "
+                        f"destroy/s={destroy_rate:.1f}  avg_destroy/s={destroy_avg:.1f}"
+                        f"{win_txt}  totals new={new_total} destroy={destroy_total}{extra}"
                     )
                 new_count = 0
                 destroy_count = 0
+                enobuf_count = 0
                 next_sample += interval
                 while next_sample <= time.monotonic():
                     next_sample += interval
