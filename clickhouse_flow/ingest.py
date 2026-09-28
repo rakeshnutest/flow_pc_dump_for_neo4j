@@ -23,6 +23,8 @@ import subprocess
 import uuid as uuid_lib
 from collections import defaultdict
 
+from portset_traffic import attach_portset_traffic, ensure_traffic_columns
+
 CH_HOST = "127.0.0.1"
 CH_NATIVE = "19000"
 BATCH = 10_000
@@ -463,6 +465,11 @@ def ingest_from_jsonl(path):
     }])
     for table in ("category", "vm_nic", "u_sg", "portset"):
         rows = load_jsonl(os.path.join(d, table + ".jsonl"))
+        if table == "portset":
+            n_in, n_out = attach_portset_traffic(
+                rows, dump_dir=d, log_bundle_id=LOG_BUNDLE_ID)
+            print("traffic_in_rules", n_in)
+            print("traffic_out_rules", n_out)
         insert_json("flow_policy." + table, rows)
         print("jsonl_%s" % table, len(rows))
     print("inserted_into",
@@ -2330,6 +2337,7 @@ def main():
         ch_client("--multiquery", input_text=RESET_SCHEMA_SQL)
     schema_path = args.schema or os.path.join(here, "schema.sql")
     ch_client("--multiquery", input_text=load_schema_sql(schema_path))
+    ensure_traffic_columns(ch_client)
     print("dropping old partition %s (other bundles kept)..." % LOG_BUNDLE_ID)
     drop_bundle_partitions(LOG_BUNDLE_ID)
     if args.from_jsonl:
@@ -2607,6 +2615,8 @@ def main():
         }
         fill_names(row, atlas_rec)
         rows.append(row)
+    n_in, n_out = attach_portset_traffic(
+        rows, dump_dir=dump_dir, log_bundle_id=LOG_BUNDLE_ID)
     insert_json("flow_policy.u_sg", list(u_sg_rows.values()))
     insert_json("flow_policy.portset", rows)
 
@@ -2615,6 +2625,8 @@ def main():
     print("computed_components", computed_component_count)
     print("isolation_components", isolation_component_count)
     print("portset_rows", len(rows))
+    print("traffic_in_rules", n_in)
+    print("traffic_out_rules", n_out)
     print("dump_should_allow_any", verify["dump_should_allow_any"])
     print("dump_should_allow_any_src", verify["dump_should_allow_any_src"])
     print("dump_should_allow_any_dst", verify["dump_should_allow_any_dst"])
