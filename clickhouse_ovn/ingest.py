@@ -54,6 +54,10 @@ OVN_TABLES = (
     "ovn_edge_ls_lr",
     "ovn_edge_lr_lr",
     "ovn_ls_stretch",
+    "ovn_switch",
+    "ovn_subnet",
+    "ovn_router",
+    "ovn_l2gw",
 )
 RESET_SCHEMA_SQL = (
     "CREATE DATABASE IF NOT EXISTS flow_ovn;\n"
@@ -73,6 +77,7 @@ NB_TABLES = {
     "Port_Group",
     "HA_Chassis_Group",
     "HA_Chassis",
+    "DHCP_Options",
 }
 SB_TABLES = {
     "Chassis",
@@ -1137,6 +1142,11 @@ def main() -> int:
     )
     ap.add_argument("--skip-ahv", action="store_true")
     ap.add_argument("--skip-sb", action="store_true")
+    ap.add_argument(
+        "--only-path-tables",
+        action="store_true",
+        help="Load ovn_switch, ovn_subnet, ovn_router, ovn_l2gw only. Other tables stay.",
+    )
     args = ap.parse_args()
     if args.drop_bundle:
         drop_bundle_partitions(args.drop_bundle)
@@ -1151,6 +1161,9 @@ def main() -> int:
             print("  existing tables lack log_bundle_id; recreating schema")
         ch_run(["--multiquery", "--query", RESET_SCHEMA_SQL])
     apply_schema()
+    if args.only_path_tables:
+        from path_tables import ingest_only
+        return ingest_only(nb_path, sb_path)
     print(f"dropping old partition {LOG_BUNDLE_ID} (other bundles kept)...")
     drop_bundle_partitions(LOG_BUNDLE_ID)
     print(f"parsing NB {nb_path}")
@@ -1183,6 +1196,7 @@ def main() -> int:
     pb_rows: List[dict] = []
     mb_rows: List[dict] = []
     stretch_rows: List[dict] = []
+    sb: Dict[str, List[Dict[str, Any]]] = {}
     if not args.skip_sb:
         print(f"parsing SB {sb_path}")
         sb = parse_dump(sb_path, SB_TABLES)
@@ -1240,6 +1254,9 @@ def main() -> int:
     insert_rows("ovn_edge_ls_lr", ls_lr)
     insert_rows("ovn_edge_lr_lr", lr_lr)
     insert_rows("ovn_ls_stretch", stretch_rows)
+    from path_tables import build_path_tables
+    for table, path_rows in build_path_tables(nb, sb).items():
+        insert_rows(table, path_rows)
     print("done")
     return 0
 
