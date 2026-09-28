@@ -10,13 +10,14 @@ from __future__ import annotations
 import os
 import sys
 
-PATH_TABLES = ("ovn_switch", "ovn_subnet", "ovn_router", "ovn_l2gw")
+PATH_TABLES = ("ovn_switch", "ovn_subnet", "ovn_router", "ovn_route", "ovn_l2gw")
 PATH_NB = (
     "DHCP_Options",
     "Logical_Switch",
     "Logical_Switch_Port",
     "Logical_Router",
     "Logical_Router_Port",
+    "Logical_Router_Static_Route",
     "NAT",
 )
 PATH_SB = (
@@ -85,6 +86,23 @@ CATALOG = [
             ["ports.sb_chassis_uuid", "SB", "Chassis that binds this router port"],
             ["ports.sb_tunnel_key", "SB", "SB port tunnel key, the port number"],
             ["ports.sb_up", "SB", "1 when the SB binding is up"],
+        ],
+    },
+    {
+        "table": "flow_ovn.ovn_route",
+        "grain": "one connected or static route on a logical router",
+        "join": "ovn_route.lr_uuid = ovn_router.lr_uuid",
+        "columns": [
+            ["kind", "NB", "connected, from a router port network, or static"],
+            ["nb_prefix", "NB", "Destination prefix"],
+            ["nb_nexthop", "NB", "Static nexthop. Empty on a connected route"],
+            ["nb_policy", "NB", "dst-ip or src-ip"],
+            ["nb_output_port", "NB", "Router port the route uses"],
+            ["nb_route_table", "NB", "NB route_table name. Empty is the main table"],
+            ["sb_datapath_uuid", "SB", "SB datapath of the router. This dump has no SB Route table"],
+            ["sb_tunnel_key", "SB", "SB tunnel key of that router datapath"],
+            ["sb_output_tunnel_key", "SB", "SB tunnel key of the output port binding"],
+            ["sb_chassis_uuid", "SB", "Chassis of the output port binding"],
         ],
     },
     {
@@ -436,10 +454,78 @@ def build_path_tables(nb: dict, sb: dict) -> dict:
             "updated_at": ts,
         })
 
+    static_by_uuid = {}
+    for row in nb.get("Logical_Router_Static_Route", []):
+        uid = ovn.as_uuid(row.get("_uuid"))
+        if uid == zero:
+            continue
+        output = ovn.as_str_list(row.get("output_port"))
+        static_by_uuid[uid] = {
+            "route_uuid": uid,
+            "nb_prefix": ovn.as_str(row.get("ip_prefix")),
+            "nb_nexthop": ovn.as_str(row.get("nexthop")),
+            "nb_policy": ovn.as_str(row.get("policy")) or "dst-ip",
+            "nb_output_port": output[0] if output else "",
+            "nb_route_table": ovn.as_str(row.get("route_table")),
+        }
+    port_by_name = {}
+    for ports in ports_by_lr.values():
+        for port in ports:
+            if port.get("nb_name"):
+                port_by_name[port["nb_name"]] = port
+    routes = []
+    for uid, ports in ports_by_lr.items():
+        if uid == zero:
+            continue
+        sb_row = _sb_of(by_nb, uid)
+        for port in ports:
+            for network in port.get("nb_networks") or []:
+                if not network:
+                    continue
+                routes.append({
+                    "lr_uuid": uid,
+                    "route_uuid": port["lrp_uuid"],
+                    "kind": "connected",
+                    "nb_prefix": network,
+                    "nb_nexthop": "",
+                    "nb_policy": "dst-ip",
+                    "nb_output_port": port.get("nb_name") or "",
+                    "nb_route_table": "",
+                    "sb_datapath_uuid": sb_row["sb_datapath_uuid"],
+                    "sb_tunnel_key": sb_row["sb_tunnel_key"],
+                    "sb_output_tunnel_key": port.get("sb_tunnel_key") or 0,
+                    "sb_chassis_uuid": port.get("sb_chassis_uuid") or zero,
+                    "updated_at": ts,
+                })
+    for row in nb.get("Logical_Router", []):
+        uid = ovn.as_uuid(row.get("_uuid"))
+        sb_row = _sb_of(by_nb, uid)
+        for sid in ovn.as_str_list(row.get("static_routes")):
+            rec = static_by_uuid.get(sid)
+            if not rec:
+                continue
+            port = port_by_name.get(rec["nb_output_port"], {})
+            routes.append({
+                "lr_uuid": uid,
+                "route_uuid": rec["route_uuid"],
+                "kind": "static",
+                "nb_prefix": rec["nb_prefix"],
+                "nb_nexthop": rec["nb_nexthop"],
+                "nb_policy": rec["nb_policy"],
+                "nb_output_port": rec["nb_output_port"],
+                "nb_route_table": rec["nb_route_table"],
+                "sb_datapath_uuid": sb_row["sb_datapath_uuid"],
+                "sb_tunnel_key": sb_row["sb_tunnel_key"],
+                "sb_output_tunnel_key": port.get("sb_tunnel_key") or 0,
+                "sb_chassis_uuid": port.get("sb_chassis_uuid") or zero,
+                "updated_at": ts,
+            })
+
     return {
         "ovn_switch": switches,
         "ovn_subnet": list(subnets.values()),
         "ovn_router": routers,
+        "ovn_route": routes,
         "ovn_l2gw": l2_rows,
     }
 

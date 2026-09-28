@@ -8,6 +8,8 @@ Join for a VM NIC:
 
 `ovn_l2gw` hangs off the switch (`ls_uuid`) for localnet, l2gateway, and geneve stretch.
 
+`ovn_route` is one connected or static route. Connected prefixes are the router port networks. Static prefixes are `Logical_Router_Static_Route`. This dump has no southbound Route table, so the SB columns are the router datapath and the output port binding.
+
 Server: `127.0.0.1:19000`, database `flow_ovn`. Every table is `ReplacingMergeTree(updated_at)`, `PARTITION BY log_bundle_id`. A missing UUID is the zero UUID.
 
 ```text

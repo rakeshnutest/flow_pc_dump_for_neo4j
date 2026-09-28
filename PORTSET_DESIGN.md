@@ -296,6 +296,8 @@ What the markdown verifies, in order:
 | TAP and Geneve capture commands | VM logical port on that host, and UDP 6081 toward the next Geneve IP |
 | Source outgoing ACLs and destination incoming ACLs | `ovn_acl`. Peer addresses are a separate IP-mapping table. |
 | Allow policy and deny policy | Highest matching row on each stage. An enforce drop denies. A monitor drop is reported and the verdict stays allowed. |
+| Routing table | `ovn_route` for every router on the path. Connected prefixes come from the router ports. Static prefixes come from `Logical_Router_Static_Route`. The longest prefix that contains this packet is marked. |
+| Scale-out next hop, NAT, no NAT, and PBR | `169.254.2.100` and `169.254.2.101` are the transit addresses of the two scale-out gateways. Outbound draws every matching default next hop and labels the gateway NAT or no NAT from `ovn_nat`. Inbound draws each gateway that routes the destination, and labels DNAT when a DNAT row matches. `ovn_pbr` is checked first: reroute replaces the next hop, drop stops the packet, allow uses the routing table. |
 
 The mermaid is three boxes when the path leaves the VPC: source VPC, external gateways, destination VPC. A host that is both a VM host and a redirect chassis is named once and called out as two roles.
 

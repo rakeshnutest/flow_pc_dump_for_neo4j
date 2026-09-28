@@ -419,6 +419,27 @@ ENGINE = ReplacingMergeTree(updated_at)
 PARTITION BY log_bundle_id
 ORDER BY (log_bundle_id, lr_uuid);
 
+CREATE TABLE IF NOT EXISTS flow_ovn.ovn_route
+(
+    log_bundle_id         UInt64,
+    lr_uuid               UUID,
+    route_uuid            UUID,
+    kind                  LowCardinality(String),
+    nb_prefix             String DEFAULT '',
+    nb_nexthop            String DEFAULT '',
+    nb_policy             LowCardinality(String) DEFAULT '',
+    nb_output_port        String DEFAULT '',
+    nb_route_table        String DEFAULT '',
+    sb_datapath_uuid      UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+    sb_tunnel_key         UInt32 DEFAULT 0,
+    sb_output_tunnel_key  UInt32 DEFAULT 0,
+    sb_chassis_uuid       UUID DEFAULT toUUID('00000000-0000-0000-0000-000000000000'),
+    updated_at            DateTime64(3) DEFAULT now64()
+)
+ENGINE = ReplacingMergeTree(updated_at)
+PARTITION BY log_bundle_id
+ORDER BY (log_bundle_id, lr_uuid, kind, nb_prefix, nb_nexthop, nb_output_port);
+
 CREATE TABLE IF NOT EXISTS flow_ovn.ovn_l2gw
 (
     log_bundle_id    UInt64,

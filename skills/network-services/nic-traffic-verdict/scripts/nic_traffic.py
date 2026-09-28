@@ -363,6 +363,18 @@ def same_rule(left: dict, right: dict, by_uuid: dict) -> bool:
     )
 
 
+def outside_nic(ip: str) -> dict:
+    return {
+        "vm_name": "outside",
+        "nic_uuid": "",
+        "ip": ip,
+        "subnet": "",
+        "vpc": "outside",
+        "subnet_uuid": "",
+        "outside": True,
+    }
+
+
 def resolve_nic(bid: int, token: str) -> dict:
     token = token.strip()
     if UUID_RE.match(token):
@@ -378,6 +390,23 @@ def resolve_nic(bid: int, token: str) -> dict:
         "WHERE log_bundle_id = %d AND (%s) "
         "FORMAT JSONEachRow" % (bid, where)
     )
+    if not found and IP_RE.match(token):
+        lsp = _q(
+            "SELECT name FROM flow_ovn.ovn_lsp FINAL "
+            "WHERE log_bundle_id = %d AND has(ip4, %s) AND type = '' "
+            "LIMIT 1 FORMAT JSONEachRow" % (bid, sql_str(token))
+        )
+        if lsp:
+            return {
+                "vm_name": "",
+                "nic_uuid": "",
+                "ip": token,
+                "subnet": "",
+                "vpc": "",
+                "subnet_uuid": "",
+                "outside": False,
+            }
+        return outside_nic(token)
     if not found:
         raise SystemExit("No VM NIC matches %s" % token)
     if len(found) > 1:
@@ -476,6 +505,168 @@ def _q(sql: str) -> list:
         return []
 
 
+def _prefix_len(prefix: str) -> int:
+    try:
+        return ipaddress.ip_network(prefix, strict=False).prefixlen
+    except ValueError:
+        return -1
+
+
+def _route_hit(prefix: str, ip: str) -> bool:
+    if not prefix or not ip:
+        return False
+    try:
+        return ipaddress.ip_address(ip) in ipaddress.ip_network(prefix, strict=False)
+    except ValueError:
+        return False
+
+
+def _is_scaleout(router: dict) -> bool:
+    return "gw-scale-out" in (router.get("nb_name") or "")
+
+
+def _transit_ip(router: dict) -> str:
+    for port in router.get("ports") or []:
+        if not isinstance(port, dict):
+            continue
+        nets = port.get("nb_networks") or []
+        if not isinstance(nets, list):
+            nets = [nets]
+        for net in nets:
+            ip = str(net).split("/")[0]
+            if ip.startswith("169.254."):
+                return ip
+    return ""
+
+
+def _pbr_applies(match: str, src_ip: str, dst_ip: str) -> bool:
+    text = (match or "").strip()
+    if not text:
+        return True
+    for part in text.split("&&"):
+        part = part.strip().replace(" ", "")
+        if part.startswith("ip4.src=="):
+            if not _route_hit(part[len("ip4.src=="):], src_ip):
+                return False
+        elif part.startswith("ip4.dst=="):
+            if not _route_hit(part[len("ip4.dst=="):], dst_ip):
+                return False
+        else:
+            return False
+    return True
+
+
+def _nat_spec(logical: str) -> str:
+    if not logical:
+        return ""
+    return logical if "/" in logical else logical + "/32"
+
+
+def _nat_applies(row: dict, src_ip: str, dst_ip: str, inbound: bool, dnat_external: str = "") -> bool:
+    kind = row.get("type") or ""
+    spec = _nat_spec(row.get("logical_ip") or "")
+    external = (row.get("external_ip") or "").split("/")[0]
+    if inbound:
+        if kind not in ("dnat", "dnat_and_snat"):
+            return False
+        if not dnat_external:
+            return False
+        return external == dnat_external and _route_hit(spec, dst_ip)
+    return kind in ("snat", "dnat_and_snat") and _route_hit(spec, src_ip)
+
+
+def _winning_pbr(rows: list):
+    hits = [row for row in rows if row.get("applies") == "yes"]
+    if not hits:
+        return None
+    return max(hits, key=lambda row: int(row.get("priority") or 0))
+
+
+def _forward_nexthops(router: dict) -> list:
+    pbr = router.get("pbr_hit")
+    if pbr and pbr.get("action") == "drop":
+        return []
+    if pbr and pbr.get("action") == "reroute":
+        hops = []
+        if pbr.get("nexthop"):
+            hops.append(pbr.get("nexthop"))
+        for hop in pbr.get("nexthops") or []:
+            if hop and hop not in hops:
+                hops.append(hop)
+        return hops
+    hops = []
+    for row in router.get("routes") or []:
+        hop = row.get("nb_nexthop") or ""
+        if row.get("matches") == "yes" and hop and hop not in hops:
+            hops.append(hop)
+    return hops
+
+
+def _nat_label(router: dict, inbound: bool) -> str:
+    hits = [row for row in (router.get("nat") or []) if row.get("applies") == "yes"]
+    if not hits:
+        return "no NAT"
+    if inbound:
+        row = hits[0]
+        return "DNAT %s to %s" % (row.get("external_ip") or "", row.get("logical_ip") or "")
+    best = max(_prefix_len(_nat_spec(row.get("logical_ip") or "")) for row in hits)
+    ips = []
+    for row in hits:
+        if _prefix_len(_nat_spec(row.get("logical_ip") or "")) != best:
+            continue
+        ip = row.get("external_ip") or ""
+        if ip and ip not in ips:
+            ips.append(ip)
+    return "NAT " + ", ".join(ips)
+
+
+def _dnat_logical(bid: int, ip: str) -> str:
+    found = _q(
+        "SELECT logical_ip FROM flow_ovn.ovn_nat FINAL "
+        "WHERE log_bundle_id = %d AND external_ip = %s AND type IN ('dnat', 'dnat_and_snat') "
+        "LIMIT 1 FORMAT JSONEachRow" % (bid, sql_str(ip))
+    )
+    if not found:
+        return ""
+    return (found[0].get("logical_ip") or "").split("/")[0]
+
+
+def _load_policy_nat(bid: int, routers: list, src_ip: str, dst_ip: str, inbound: bool, dnat_external: str = "") -> None:
+    ids = [item.get("lr_uuid") or "" for item in routers if item.get("lr_uuid")]
+    if not ids:
+        return
+    id_sql = ", ".join(sql_str(uid) for uid in ids)
+    pbr_rows = _q(
+        "SELECT toString(lr_uuid) AS lr_uuid, match, action, nexthop, nexthops, priority "
+        "FROM flow_ovn.ovn_pbr FINAL "
+        "WHERE log_bundle_id = %d AND toString(lr_uuid) IN (%s) "
+        "FORMAT JSONEachRow" % (bid, id_sql)
+    )
+    nat_rows = _q(
+        "SELECT toString(lr_uuid) AS lr_uuid, type, external_ip, logical_ip, logical_port "
+        "FROM flow_ovn.ovn_nat FINAL "
+        "WHERE log_bundle_id = %d AND toString(lr_uuid) IN (%s) "
+        "FORMAT JSONEachRow" % (bid, id_sql)
+    )
+    pbr_by = defaultdict(list)
+    for row in pbr_rows:
+        view = dict(row)
+        view["applies"] = "yes" if _pbr_applies(view.get("match") or "", src_ip, dst_ip) else "no"
+        pbr_by[view.get("lr_uuid") or ""].append(view)
+    nat_by = defaultdict(list)
+    for row in nat_rows:
+        view = dict(row)
+        view["applies"] = "yes" if _nat_applies(view, src_ip, dst_ip, inbound, dnat_external) else "no"
+        nat_by[view.get("lr_uuid") or ""].append(view)
+    for item in routers:
+        uid = item.get("lr_uuid") or ""
+        pbr = pbr_by.get(uid, [])
+        pbr.sort(key=lambda row: -int(row.get("priority") or 0))
+        item["pbr"] = pbr
+        item["pbr_hit"] = _winning_pbr(pbr)
+        item["nat"] = nat_by.get(uid, [])
+
+
 def hex24(value) -> str:
     try:
         return "0x%06x" % int(value or 0)
@@ -539,8 +730,29 @@ def redirect_chassis(bid: int, group_uuid: str) -> dict:
     return host
 
 
+def _blank_switch() -> dict:
+    return {
+        "nb": {"ls_uuid": "", "name": "", "requested_tnl_key": 0, "interconn": 0},
+        "sb": {"datapath_uuid": "", "tunnel_key": 0, "egress_tunnel_key": 0, "name": ""},
+    }
+
+
 def endpoint_path(bid: int, nic: dict) -> dict:
     """Switch, subnet, and the VM port binding for one NIC."""
+    if nic.get("outside"):
+        return {
+            "vm_name": "outside",
+            "nic_uuid": "",
+            "ip": (nic.get("ip") or "").split("/")[0],
+            "vpc": "outside",
+            "subnet_name": "",
+            "vlan": 0,
+            "host": {},
+            "subnet": {},
+            "outside": True,
+            "switch": _blank_switch(),
+            "port": {"lsp_uuid": "", "name": "", "mac": "", "port_number": 0, "up": 0, "sb_chassis_uuid": ""},
+        }
     nic_uuid = (nic.get("nic_uuid") or "").lower()
     ip = (nic.get("ip") or "").split("/")[0]
     subnet_uuid = (nic.get("subnet_uuid") or "").lower()
@@ -630,6 +842,8 @@ def endpoint_path(bid: int, nic: dict) -> dict:
             "up": port_up,
             "sb_chassis_uuid": chassis,
         },
+        "outside": False,
+        "dnat_external": nic.get("dnat_external") or "",
     }
 
 
@@ -681,6 +895,54 @@ def _walk(src_ls: str, dst_ls: str, ls_edges: list, lr_edges: list) -> list:
     return chain
 
 
+def _reachable(start_ls: str, ls_edges: list, lr_edges: list, blocked: set) -> tuple:
+    """Nodes reachable from a switch without crossing an external localnet."""
+    parent = {("switch", start_ls): None}
+    routers = []
+    queue = [("switch", start_ls)]
+    ls_to_lr = defaultdict(list)
+    lr_to_ls = defaultdict(list)
+    for edge in ls_edges:
+        ls_to_lr[edge["ls"]].append(edge["lr"])
+        lr_to_ls[edge["lr"]].append(edge["ls"])
+    lr_to_lr = defaultdict(list)
+    for edge in lr_edges:
+        via = edge.get("via_ls") or ""
+        if via in blocked:
+            continue
+        lr_to_lr[edge["a"]].append(edge["b"])
+        lr_to_lr[edge["b"]].append(edge["a"])
+    while queue:
+        kind, uid = queue.pop(0)
+        nxt = []
+        if kind == "switch":
+            nxt = [("router", lr) for lr in ls_to_lr.get(uid, [])]
+        else:
+            nxt = [("switch", ls) for ls in lr_to_ls.get(uid, []) if ls not in blocked]
+            nxt += [("router", other) for other in lr_to_lr.get(uid, [])]
+        for item in nxt:
+            if item not in parent and item[1]:
+                parent[item] = (kind, uid)
+                queue.append(item)
+                if item[0] == "router":
+                    routers.append(item[1])
+        if len(parent) > 4000:
+            break
+    return parent, routers
+
+
+def _rebuild(parent: dict, goal: tuple) -> list:
+    chain = []
+    cursor = goal
+    seen = set()
+    while cursor and cursor not in seen:
+        seen.add(cursor)
+        chain.append(cursor)
+        cursor = parent.get(cursor)
+    chain.reverse()
+    return chain
+
+
 def load_forwarding(bid: int, src: dict, dst: dict) -> dict:
     src_ep = endpoint_path(bid, src)
     dst_ep = endpoint_path(bid, dst)
@@ -702,8 +964,27 @@ def load_forwarding(bid: int, src: dict, dst: dict) -> dict:
             "FORMAT JSONEachRow" % bid
         )
     ]
-    chain = _walk(src_ls, dst_ls, ls_edges, lr_edges)
-    router_ids = [uid for kind, uid in chain if kind == "router" and uid]
+    src_out = bool(src_ep.get("outside")) or not src_ls
+    dst_out = bool(dst_ep.get("outside")) or not dst_ls
+    outside = src_out ^ dst_out
+    if outside:
+        blocked = {
+            item.get("ls")
+            for item in _q(
+                "SELECT toString(ls_uuid) AS ls FROM flow_ovn.ovn_l2gw FINAL "
+                "WHERE log_bundle_id = %d AND kind = 'localnet' FORMAT JSONEachRow" % bid
+            )
+            if item.get("ls")
+        }
+        anchor = dst_ls if src_out else src_ls
+        parent, reached = _reachable(anchor, ls_edges, lr_edges, blocked)
+        chain = [("switch", anchor)]
+        outside_routers = reached
+    else:
+        parent = {}
+        outside_routers = []
+        chain = _walk(src_ls, dst_ls, ls_edges, lr_edges)
+    router_ids = outside_routers if outside else [uid for kind, uid in chain if kind == "router" and uid]
     switch_ids = []
     for kind, uid in chain:
         if kind == "switch" and uid and uid not in switch_ids:
@@ -745,7 +1026,12 @@ def load_forwarding(bid: int, src: dict, dst: dict) -> dict:
                     }
                 else:
                     continue
-                if ext or ls in on_path:
+                nets = view.get("nb_networks") or []
+                if not isinstance(nets, list):
+                    nets = [nets]
+                transit = any(str(net).startswith("169.254.") for net in nets)
+                scale = "gw-scale-out" in str(view.get("nb_name") or "")
+                if ext or ls in on_path or transit or scale:
                     kept.append(view)
             item = dict(item)
             item["ports"] = kept
@@ -822,9 +1108,18 @@ def load_forwarding(bid: int, src: dict, dst: dict) -> dict:
         "external": switch_tunnel(ext_ls),
         "from_gateway": via_tunnel(gw_ids[-1], tenant_ids[-1]) if gw_ids and len(tenant_ids) > 1 else 0,
     }
-    same = bool(src_ls) and src_ls == dst_ls
+    if outside and gw_ids and tenant_ids:
+        if src_out:
+            tunnels["to_gateway"] = 0
+            tunnels["from_gateway"] = via_tunnel(gw_ids[0], tenant_ids[0])
+        else:
+            tunnels["to_gateway"] = via_tunnel(tenant_ids[0], gw_ids[0])
+            tunnels["from_gateway"] = 0
+    same = bool(src_ls) and src_ls == dst_ls and not outside
     external = bool(gateways) and not same
-    if same:
+    if outside:
+        path_class = "outside"
+    elif same:
         path_class = "same_switch"
     elif external:
         path_class = "external"
@@ -832,14 +1127,182 @@ def load_forwarding(bid: int, src: dict, dst: dict) -> dict:
         path_class = "routed"
     else:
         path_class = "unknown"
+    route_rows = []
+    if routers:
+        id_sql = ", ".join(sql_str(item.get("lr_uuid") or "") for item in routers if item.get("lr_uuid"))
+        if id_sql:
+            route_rows = _q(
+                "SELECT toString(lr_uuid) AS lr_uuid, kind, nb_prefix, nb_nexthop, nb_policy, "
+                "nb_output_port, sb_tunnel_key, sb_output_tunnel_key "
+                "FROM flow_ovn.ovn_route FINAL "
+                "WHERE log_bundle_id = %d AND toString(lr_uuid) IN (%s) "
+                "FORMAT JSONEachRow" % (bid, id_sql)
+            )
+    by_lr = defaultdict(list)
+    for row in route_rows:
+        by_lr[row.get("lr_uuid") or ""].append(row)
+    src_ip = src_ep.get("ip") or ""
+    dst_ip = dst_ep.get("ip") or ""
+    for item in routers:
+        rows_for = by_lr.get(item.get("lr_uuid") or "", [])
+        best = {}
+        for row in rows_for:
+            policy = row.get("nb_policy") or "dst-ip"
+            ip = src_ip if policy == "src-ip" else dst_ip
+            if _route_hit(row.get("nb_prefix") or "", ip):
+                best[policy] = max(best.get(policy, -1), _prefix_len(row.get("nb_prefix") or ""))
+        marked = []
+        for row in rows_for:
+            policy = row.get("nb_policy") or "dst-ip"
+            ip = src_ip if policy == "src-ip" else dst_ip
+            length = _prefix_len(row.get("nb_prefix") or "")
+            hit = _route_hit(row.get("nb_prefix") or "", ip) and length == best.get(policy, -1)
+            view = dict(row)
+            view["matches"] = "yes" if hit else "no"
+            marked.append(view)
+        marked.sort(key=lambda row: (-_prefix_len(row.get("nb_prefix") or ""), row.get("kind") or "", row.get("nb_prefix") or ""))
+        item["routes"] = marked
+    inbound = bool(src_out)
+    _load_policy_nat(bid, routers, src_ip, dst_ip, inbound, dst_ep.get("dnat_external") or "")
+    forwarding_note = ""
+    if outside:
+        anchor_ls = dst_ls if src_out else src_ls
+        tenants = []
+        for item in routers:
+            if _is_scaleout(item):
+                continue
+            touched = any(
+                isinstance(port, dict) and (port.get("nb_ls_uuid") or "") == anchor_ls
+                for port in (item.get("ports") or [])
+            )
+            if touched or not anchor_ls:
+                tenants.append(item)
+        if not tenants:
+            tenants = [item for item in routers if not _is_scaleout(item)]
+        loaded = {item.get("lr_uuid"): item for item in routers}
+        for gw in gateways:
+            src_item = loaded.get(gw.get("lr_uuid")) or {}
+            gw["nat"] = src_item.get("nat") or []
+            gw["pbr"] = src_item.get("pbr") or []
+            gw["pbr_hit"] = src_item.get("pbr_hit")
+            gw["routes"] = src_item.get("routes") or []
+        by_transit = {}
+        for gw in gateways:
+            ip = _transit_ip(gw)
+            if ip:
+                by_transit[ip] = gw
+        chosen = []
+        if src_out:
+            for gw in gateways:
+                pbr = gw.get("pbr_hit")
+                if pbr and pbr.get("action") == "drop":
+                    continue
+                dnats = [row for row in (gw.get("nat") or []) if row.get("applies") == "yes"]
+                routed = [
+                    row for row in (gw.get("routes") or [])
+                    if row.get("matches") == "yes" and row.get("nb_nexthop")
+                ]
+                if dnats or routed or (pbr and pbr.get("action") == "reroute"):
+                    chosen.append(gw)
+            dnat_ext = (dst_ep.get("dnat_external") or "").split("/")[0]
+            if dnat_ext:
+                owned = [
+                    gw for gw in chosen
+                    if any((row.get("external_ip") or "") == dnat_ext for row in (gw.get("nat") or []))
+                ]
+                if owned:
+                    chosen = owned
+        else:
+            hops = []
+            for tenant in tenants:
+                for hop in _forward_nexthops(tenant):
+                    if hop not in hops:
+                        hops.append(hop)
+            for hop in hops:
+                gw = by_transit.get(hop)
+                if gw and gw not in chosen:
+                    chosen.append(gw)
+        chosen.sort(key=_transit_ip)
+        for gw in chosen:
+            gw["nat_label"] = _nat_label(gw, src_out)
+            if src_out:
+                back = ""
+                pbr = gw.get("pbr_hit")
+                if pbr and pbr.get("action") == "reroute" and pbr.get("nexthop"):
+                    back = pbr.get("nexthop") or ""
+                if not back:
+                    for row in gw.get("routes") or []:
+                        if row.get("matches") == "yes" and row.get("nb_nexthop"):
+                            back = row.get("nb_nexthop") or ""
+                            break
+                gw["edge_inside"] = back or _transit_ip(gw)
+                gw["edge_outside"] = gw["nat_label"]
+            else:
+                gw["edge_inside"] = _transit_ip(gw)
+                gw["edge_outside"] = gw["nat_label"]
+                pbr = gw.get("pbr_hit")
+                if pbr and pbr.get("action") == "reroute" and pbr.get("nexthop"):
+                    gw["nat_label"] = "PBR reroute %s" % pbr.get("nexthop")
+                    gw["edge_outside"] = gw["nat_label"]
+                    gw["pbr_exit"] = pbr.get("nexthop")
+            if tenants:
+                gw["inside_tunnel"] = via_tunnel(tenants[0].get("lr_uuid") or "", gw.get("lr_uuid") or "")
+        if chosen:
+            gateways = chosen
+            if src_out:
+                tunnels["to_gateway"] = 0
+                tunnels["from_gateway"] = chosen[0].get("inside_tunnel") or 0
+            else:
+                tunnels["to_gateway"] = chosen[0].get("inside_tunnel") or 0
+                tunnels["from_gateway"] = 0
+            ext_ls = (chosen[0].get("external_port") or {}).get("nb_ls_uuid") or ""
+            if ext_ls:
+                tunnels["external"] = switch_tunnel(ext_ls)
+        keep = {item.get("lr_uuid") for item in tenants}
+        keep |= {item.get("lr_uuid") for item in gateways}
+        routers = [item for item in routers if item.get("lr_uuid") in keep]
+        bits = []
+        for gw in gateways:
+            nets = (gw.get("external_port") or {}).get("nb_networks") or []
+            bits.append("%s is %s on %s (%s)" % (
+                _transit_ip(gw) or "gateway",
+                gw.get("nat_label") or "no NAT",
+                gw.get("nb_name") or "",
+                ", ".join(nets) if isinstance(nets, list) else nets,
+            ))
+        pbr_bits = []
+        for tenant in tenants:
+            pbr = tenant.get("pbr_hit")
+            name = tenant.get("nb_name") or "the tenant router"
+            if not pbr:
+                pbr_bits.append("No PBR matches on %s, so the routing table is used." % name)
+            elif pbr.get("action") == "allow":
+                pbr_bits.append("PBR priority %s allow matches on %s, so the routing table is used." % (pbr.get("priority"), name))
+            elif pbr.get("action") == "reroute":
+                pbr_bits.append("PBR priority %s reroute on %s sends the packet to %s." % (pbr.get("priority"), name, pbr.get("nexthop") or ""))
+            elif pbr.get("action") == "drop":
+                pbr_bits.append("PBR priority %s drop stops the packet on %s." % (pbr.get("priority"), name))
+        for gw in gateways:
+            pbr = gw.get("pbr_hit")
+            if pbr and pbr.get("action") == "reroute":
+                pbr_bits.append("PBR priority %s reroute on %s sends the packet to %s." % (
+                    pbr.get("priority"), gw.get("nb_name") or "the gateway", pbr.get("nexthop") or ""))
+        if dst_ep.get("dnat_external"):
+            pbr_bits.append("Outside destination %s is DNAT to %s." % (dst_ep.get("dnat_external"), dst_ip))
+        if src_out:
+            direction = "Outside traffic enters through these gateways: " + "; ".join(bits) + "."
+        else:
+            direction = "Scale-out next hops on this path: " + "; ".join(bits) + "."
+        forwarding_note = " ".join(pbr_bits + ([direction] if bits else []))
     return {
         "class": path_class,
         "source": src_ep,
         "destination": dst_ep,
         "routers": routers,
-        "gateways": gateways if external or path_class == "external" else [],
+        "gateways": gateways if outside or external or path_class == "external" else [],
         "l2gw": l2_rows,
         "tunnels": tunnels,
+        "forwarding": forwarding_note,
         "loaded": bool(src_ep["switch"]["nb"].get("name") or dst_ep["switch"]["nb"].get("name")),
     }
 
@@ -925,6 +1388,12 @@ def _gw_label(router: dict) -> str:
     )
 
 
+def _outside_gw_label(router: dict) -> str:
+    nat = router.get("nat_label") or "no NAT"
+    transit = _transit_ip(router)
+    return "%s<br>%s<br>%s" % (_qmark(nat), _qmark(transit), _gw_label(router))
+
+
 def mermaid(path: dict, drop: dict = None) -> str:
     src = path["source"]
     dst = path["destination"]
@@ -935,11 +1404,64 @@ def mermaid(path: dict, drop: dict = None) -> str:
     dst_router = tenants[-1] if len(tenants) > 1 else {}
     if src.get("switch", {}).get("nb", {}).get("ls_uuid") == dst.get("switch", {}).get("nb", {}).get("ls_uuid"):
         dst_router = {}
+    if src.get("outside") and not dst.get("outside") and tenants:
+        dst_router = tenants[0]
+        src_router = {}
     lines = ["flowchart LR"]
     src_drop = drop if drop and drop.get("where") == "source" else None
     dst_drop = drop if drop and drop.get("where") == "destination" else None
-    lines.extend(_endpoint_box("SRC", src.get("vpc") or "source VPC", src, src_router, src_drop))
-    lines.extend(_endpoint_box("DST", dst.get("vpc") or "dest VPC", dst, dst_router if dst_router is not src_router else {}, dst_drop))
+    src_out = bool(src.get("outside"))
+    dst_out = bool(dst.get("outside"))
+    if not src_out:
+        lines.extend(_endpoint_box("SRC", src.get("vpc") or "source VPC", src, src_router, src_drop))
+    else:
+        lines.append('  OUT["outside<br>%s"]' % _qmark(src.get("ip") or ""))
+    if not dst_out:
+        lines.extend(_endpoint_box("DST", dst.get("vpc") or "dest VPC", dst, dst_router if dst_router is not src_router else {}, dst_drop))
+    else:
+        lines.append('  OUT["outside<br>%s"]' % _qmark(dst.get("ip") or ""))
+    if gateways and (src_out or dst_out):
+        lines.append('  subgraph GWX["external gateways"]')
+        lines.append("    direction TB")
+        for index, router in enumerate(gateways):
+            lines.append('    g%d["%s"]' % (index, _outside_gw_label(router)))
+        lines.append("  end")
+        tunnels = path.get("tunnels") or {}
+        ext_tnl = hex24(tunnels.get("external") or 0)
+        inside_node = "DST_r" if src_out else "SRC_r"
+        if src_out and not dst_router:
+            inside_node = "DST_s"
+        if not src_out and not src_router:
+            inside_node = "SRC_s"
+        for index, router in enumerate(gateways):
+            node = "g%d" % index
+            inside_tnl = hex24(router.get("inside_tunnel") or tunnels.get("from_gateway" if src_out else "to_gateway") or 0)
+            inside_edge = "%s<br>tunnel %s" % (router.get("edge_inside") or "", inside_tnl)
+            outside_edge = "%s<br>tunnel %s" % (router.get("edge_outside") or "", ext_tnl)
+            if src_out:
+                lines.append("  OUT -->|%s| %s" % (_qmark(outside_edge), node))
+                lines.append("  %s -->|%s| %s" % (node, _qmark(inside_edge), inside_node))
+            else:
+                lines.append("  %s -->|%s| %s" % (inside_node, _qmark(inside_edge), node))
+                hop = router.get("pbr_exit") or ""
+                target = None
+                if hop:
+                    for other_index, other in enumerate(gateways):
+                        if _transit_ip(other) == hop and other_index != index:
+                            target = other_index
+                            break
+                if target is not None:
+                    pbr_edge = "%s<br>tunnel %s" % (router.get("edge_outside") or "", inside_tnl)
+                    lines.append("  %s -->|%s| g%d" % (node, _qmark(pbr_edge), target))
+                else:
+                    lines.append("  %s -->|%s| OUT" % (node, _qmark(outside_edge)))
+        return "\n".join(lines)
+    if src_out or dst_out:
+        if not src_out:
+            lines.append("  SRC_s --> OUT")
+        elif not dst_out:
+            lines.append("  OUT --> DST_s")
+        return "\n".join(lines)
     if gateways:
         lines.append('  subgraph GWX["external gateways"]')
         lines.append("    direction TB")
@@ -988,6 +1510,15 @@ def main() -> None:
     bid = args.log_bundle_id or latest_bundle()
     src = resolve_nic(bid, args.src)
     dst = resolve_nic(bid, args.dst)
+    if dst.get("outside"):
+        logical = _dnat_logical(bid, (dst.get("ip") or "").split("/")[0])
+        if logical:
+            inner = resolve_nic(bid, logical)
+            if not inner.get("outside"):
+                inner["dnat_external"] = (dst.get("ip") or "").split("/")[0]
+                dst = inner
+    if src.get("outside") and dst.get("outside"):
+        raise SystemExit("Both addresses are outside this system")
     proto = {"tcp": 6, "udp": 17, "icmp": 1}[args.proto]
     portsets = load_portsets(bid)
     by_uuid = {item["port_set_uuid"]: item for item in portsets}
@@ -1001,8 +1532,8 @@ def main() -> None:
             if ip:
                 ip_index[ip].append(item["port_set_uuid"])
 
-    src_ids = nic_index.get(src["nic_uuid"].lower(), [])
-    dst_ids = nic_index.get(dst["nic_uuid"].lower(), [])
+    src_ids = nic_index.get(src["nic_uuid"].lower(), []) if src.get("nic_uuid") else []
+    dst_ids = nic_index.get(dst["nic_uuid"].lower(), []) if dst.get("nic_uuid") else []
     src_pgs = {pg_token(uid) for uid in src_ids}
     dst_pgs = {pg_token(uid) for uid in dst_ids}
     tokens = sorted(src_pgs | dst_pgs)
@@ -1251,6 +1782,16 @@ def main() -> None:
         return lines
 
     def side_block(title, endpoint):
+        if endpoint.get("outside"):
+            return [
+                "### %s" % title,
+                "",
+                "| field | value |",
+                "|---|---|",
+                "| where | outside this system |",
+                "| IP | %s |" % cell(endpoint.get("ip") or ""),
+                "",
+            ]
         sw = endpoint["switch"]
         port = endpoint["port"]
         sub = endpoint.get("subnet") or {}
@@ -1282,8 +1823,12 @@ def main() -> None:
         lines.append("TAP is the VM port on that host. Geneve is UDP 6081 on the host uplink. `eth0` is that uplink; use the bond on this host when the uplink is not eth0.")
         lines.append("")
         for title, endpoint in (("Source TAP", src_ep), ("Destination TAP", dst_ep)):
+            if endpoint.get("outside"):
+                continue
             host = (endpoint.get("host") or {}).get("hostname") or "the VM host"
             port = (endpoint.get("port") or {}).get("name") or ""
+            if not port:
+                continue
             lines.append("**%s on %s**" % (title, host))
             lines.append("")
             lines.append("```bash")
@@ -1384,6 +1929,100 @@ def main() -> None:
     if not forwarding["routers"]:
         md.append("| | | | | | |")
     md.append("")
+    md.append("## Routing tables")
+    md.append("")
+    md.append("Each router on the path. `matches` is the longest prefix that fits this packet. Connected routes come from the router port. Static routes come from `ovn_route`.")
+    md.append("")
+    any_route = False
+    for router in forwarding["routers"]:
+        routes = router.get("routes") or []
+        if not routes:
+            continue
+        any_route = True
+        md.append("### %s" % (router.get("nb_name") or router.get("lr_uuid") or "router"))
+        md.append("")
+        md.append("| kind | prefix | nexthop | policy | output port | matches |")
+        md.append("|---|---|---|---|---|---|")
+        for row in routes:
+            md.append("| %s | %s | %s | %s | %s | %s |" % (
+                cell(row.get("kind") or ""),
+                cell(row.get("nb_prefix") or ""),
+                cell(row.get("nb_nexthop") or ""),
+                cell(row.get("nb_policy") or ""),
+                cell(row.get("nb_output_port") or ""),
+                row.get("matches") or "no",
+            ))
+        md.append("")
+    if not any_route:
+        md.append("No routes are loaded for these routers.")
+        md.append("")
+    if forwarding.get("forwarding"):
+        md.append("## Forwarding")
+        md.append("")
+        md.append(forwarding.get("forwarding") or "")
+        md.append("")
+        md.append("169.254.2.100 and 169.254.2.101 are the transit addresses of the two scale-out gateways. The tenant default route points at both. NAT or no NAT is the translation on that gateway for this direction. PBR is checked before the routing table.")
+        md.append("")
+    pbr_routers = [router for router in forwarding["routers"] if router.get("pbr")]
+    nat_routers = [router for router in forwarding["routers"] if any(row.get("applies") == "yes" for row in (router.get("nat") or []))]
+    if pbr_routers or nat_routers or forwarding.get("class") == "outside":
+        md.append("## Policy based routing")
+        md.append("")
+        md.append("The highest matching row is the one that is used. `allow` keeps the routing table. `reroute` replaces the next hop. `drop` stops the packet.")
+        md.append("")
+        wrote_pbr = False
+        for router in forwarding["routers"]:
+            pbr_hits = [row for row in (router.get("pbr") or []) if row.get("applies") == "yes"]
+            if not pbr_hits:
+                continue
+            wrote_pbr = True
+            winner = router.get("pbr_hit") or {}
+            md.append("### %s" % (router.get("nb_name") or "router"))
+            md.append("")
+            md.append("| priority | action | nexthop | match | used |")
+            md.append("|---|---|---|---|---|")
+            for row in pbr_hits:
+                used = "yes" if row is winner or (
+                    int(row.get("priority") or 0) == int(winner.get("priority") or -1)
+                    and (row.get("action") or "") == (winner.get("action") or "")
+                    and (row.get("nexthop") or "") == (winner.get("nexthop") or "")
+                ) else "no"
+                md.append("| %s | %s | %s | %s | %s |" % (
+                    row.get("priority") if row.get("priority") is not None else "",
+                    cell(row.get("action") or ""),
+                    cell(row.get("nexthop") or ""),
+                    cell(row.get("match") or ""),
+                    used,
+                ))
+            md.append("")
+        if not wrote_pbr:
+            md.append("No PBR matches this packet. The routing table is used.")
+            md.append("")
+        md.append("## NAT")
+        md.append("")
+        md.append("Outbound uses the longest SNAT whose logical IP contains the source. Inbound DNAT applies when the outside destination is that rule's external IP. A gateway with no matching row is no NAT for this direction.")
+        md.append("")
+        wrote_nat = False
+        for router in forwarding["routers"]:
+            nat_hits = [row for row in (router.get("nat") or []) if row.get("applies") == "yes"]
+            if not nat_hits:
+                continue
+            wrote_nat = True
+            md.append("### %s" % (router.get("nb_name") or "router"))
+            md.append("")
+            md.append("| type | external ip | logical ip | applies |")
+            md.append("|---|---|---|---|")
+            for row in nat_hits:
+                md.append("| %s | %s | %s | %s |" % (
+                    cell(row.get("type") or ""),
+                    cell(row.get("external_ip") or ""),
+                    cell(row.get("logical_ip") or ""),
+                    row.get("applies") or "no",
+                ))
+            md.append("")
+        if not wrote_nat:
+            md.append("No NAT matches this direction.")
+            md.append("")
     md.append("## External gateways")
     md.append("")
     if forwarding["gateways"]:
@@ -1396,6 +2035,8 @@ def main() -> None:
             md.append("")
             md.append("| field | value |")
             md.append("|---|---|")
+            md.append("| transit | %s |" % cell(_transit_ip(gw)))
+            md.append("| NAT | %s |" % cell(gw.get("nat_label") or ""))
             md.append("| external | %s |" % cell(net or ", ".join(gw.get("nb_gw_external_ips") or [])))
             md.append("| external MAC | %s |" % cell(ext.get("nb_mac") or ""))
             md.append("| router tunnel | %s %s |" % (gw.get("sb_tunnel_key") or 0, hex24(gw.get("sb_tunnel_key") or 0)))
