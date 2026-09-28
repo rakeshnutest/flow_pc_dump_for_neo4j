@@ -1,8 +1,8 @@
 # Port-set creation and verification
 
-How a Flow port-set UUID is produced from a policy dump, how Atlas membership is joined to that UUID, and how the two ClickHouse trees decide match, leftover, and path impact.
+How a Flow port-set UUID is produced from a policy dump, how Atlas membership is joined to that UUID, how the two ClickHouse trees decide match, leftover, and path impact, and how two VM NICs plus one L4 port become an allow or deny verdict with the policy name on each side.
 
-Sources: `clickhouse_flow` (`ingest.py`, `compare.py`, `observe_leftovers.py`, `update_policy_port_sets.py`, `schema.sql`) and `clickhouse_ovn` (`dataplane.py`, `trace.py`). Identity is the port-set UUID. Names are display labels.
+Sources: `clickhouse_flow` (`ingest.py`, `compare.py`, `observe_leftovers.py`, `update_policy_port_sets.py`, `portset_traffic.py`, `schema.sql`), `clickhouse_ovn` (`dataplane.py`, `trace.py`), and `.cursor/skills/nic-traffic-verdict`. Identity is the port-set UUID. Names are display labels.
 
 ## What a port-set is
 
@@ -409,6 +409,57 @@ NB join keys the ingest writes into those edges:
 
 `trace.py` BFS uses `ovn_edge_ls_lr` and `ovn_edge_lr_lr` only. VIF LSPs hang off `ovn_lsp` where `type` is empty. NAT and localnet mark a router or switch as external. The port-set section of the path report is filled from `portset.jsonl`, using NIC UUIDs from `ovn_vm_nic` and port-group UUIDs parsed out of `ovn_acl.match`.
 
+## Traffic between two VM NICs
+
+`.cursor/skills/nic-traffic-verdict/scripts/nic_traffic.py` answers one forward packet: source VM NIC, destination VM NIC, and one L4 port. The answer always names the allow policy and the deny policy. TCP and UDP use the destination port. ICMP uses the type as `--port`.
+
+The script reads the ingested bundle.
+
+| Step | Source | What it contributes |
+|---|---|---|
+| Resolve the NIC | `flow_policy.vm_nic` | VM name and IP from a NIC uuid, an IP, or a VM name. A VM name that hits several NICs stops and lists the NIC uuids. |
+| Membership | `flow_policy.portset` | Every port-set whose `atlas_nics` or `computed_nics` contain that NIC. `rule_u_sg` on that row supplies `policy_name`, `policy_type`, and `policy_mode`. |
+| Rules | `flow_ovn.ovn_acl` | ACLs whose match names those port groups. |
+| Peer addresses | Northbound `Address_Set` under the bundle `dump_dir` | IPs for each `$address_set_…` the candidate ACLs mention. An empty address list stays empty. |
+
+Source port groups are the port-sets that contain the source NIC. Destination port groups are the port-sets that contain the destination NIC. The packet is source IP to destination IP.
+
+| Stage | OVN direction | Port group that must match |
+|---|---|---|
+| Out of the source | `from-lport` | `inport == @port_group_…` of a source port-set |
+| Into the destination | `to-lport` | `outport == @port_group_…` of a destination port-set |
+
+On each stage the highest priority ACL whose addresses and port fit the packet wins. `allow`, `allow-related`, and `allow-stateless` allow it. `drop` denies it. A drop on either stage is the verdict when that port-set's `policy_mode` is `enforce`. A drop whose `policy_mode` is `monitor` is reported, and the verdict stays allowed. A lower-priority rule that also matches is reported on its own line and marked as not applying.
+
+The policy name is `rule_u_sg.policy_name` on the port-set whose port group is in that ACL, together with `policy_type`, `policy_mode`, and the first `vm_category_names` entry. The peer is the port-set whose NIC addresses cover the address set on the other side of the match: `ip4.src` / `ip6.src` for traffic into the port-set, `ip4.dst` / `ip6.dst` for traffic out. When those addresses belong to no port-set, the peer is the IP list.
+
+The allow line is the highest allow that matches both NICs and the port. When no allow covers the port, the line names the allow policy that matches the two NICs and states that this port is outside it. The deny line is the highest drop that matches. Both lines are printed for every verdict. When no allow matches the two NICs at all, the allow line says so. When no drop matches, the deny line says so.
+
+Printed fields, in this order:
+
+| Line | Content |
+|---|---|
+| `Verdict` | `allowed` or `denied` |
+| `Source` | VM name and IP |
+| `Destination` | VM name and IP |
+| `Traffic` | `tcp/<port>`, `udp/<port>`, or `icmp/<type>` |
+| `Allow policy` | Policy name, type, mode, category, direction, priority, action, peer, and ports. A trailing sentence says when that allow does not apply or when the asked port is outside it. |
+| `Deny policy` | Same shape for the drop. A trailing sentence says when that drop does not apply. |
+| `NIC identity` | Source NIC uuid, then destination NIC uuid |
+
+The policy and peer text use the policy name and category. When the peer addresses belong to a port-set, the peer is that category and policy. When they belong to no port-set, the peer is the IP list. An address set whose OVN `addresses` list is empty is reported as having no addresses. The lines do not use `$address_set_…` or `@port_group_…` as the names.
+
+The skill that runs this is `.cursor/skills/nic-traffic-verdict/`. `SKILL.md` is the trigger. `scripts/nic_traffic.py` is the command.
+
+Checked on bundle `159166`.
+
+Inbound NIC `192.168.254.130` (`inbound:inbound5`, VM `VPC_California_SJ_Pheonix_Customer_25_inbound_1`) to AppType:Apache_Spark NIC `192.168.1.23` (VM `VPC_California_SJ_Pheonix_Customer_29_FNS-L1-2_5`), both in `Global_Application_Policy1` (app, enforce):
+
+- `tcp/5560` is allowed. Allow policy: into the destination, priority 1050 `allow-related`, peer `inbound:inbound5`, TCP and UDP ranges starting at `5558-5567`. Deny policy: the same policy, priority 1045 drop, peer any, all ports. The deny does not apply.
+- `tcp/80` is denied. Allow policy: the same priority 1050 allow from `inbound:inbound5`, and `tcp/80` is outside it. Deny policy: priority 1045 drop, peer any, all ports.
+
+Two AppType:Apache_Spark NICs, `192.168.1.23` to `192.168.1.16`, `tcp/80`: denied. Allow policy: none matches this pair. Deny policy: `Global_Application_Policy1` (app, enforce) on AppType:Apache_Spark, both directions, priority 1060 drop, peer AppType:Apache_Spark, all ports.
+
 ## End-to-end sequence
 
 ```text
@@ -432,8 +483,10 @@ one flow_policy.portset row per UUID
         │                     | atlas_without_computed | nic_set
         │                     PASS/FAIL scorecard
         ├─ observe_leftovers  reverse-hash and NIC-bug notes
-        └─ trace.py          path NICs vs leftover port-sets
-                              and vs OVN port_group / address_set
+        ├─ trace.py          path NICs vs leftover port-sets
+        │                     and vs OVN port_group / address_set
+        └─ nic_traffic.py    two VM NICs + L4 port
+                              allow policy and deny policy
 ```
 
 Commands:
@@ -443,4 +496,5 @@ python3 clickhouse_flow/ingest.py --dump_dir /path/to/dump --log_bundle_id 123
 python3 clickhouse_flow/compare.py --log_bundle_id 123
 python3 clickhouse_flow/observe_leftovers.py --log_bundle_id 123 --dump_dir /path/to/dump
 python3 clickhouse_ovn/trace.py --log_bundle_id 123 --src <vm|mac|lsp> --dst <vm|mac|lsp|external>
+python3 .cursor/skills/nic-traffic-verdict/scripts/nic_traffic.py --log_bundle_id 123 --src <nic-uuid-or-ip> --dst <nic-uuid-or-ip> --port 443 --proto tcp
 ```
