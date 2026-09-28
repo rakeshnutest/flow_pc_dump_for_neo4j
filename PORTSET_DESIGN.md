@@ -2,7 +2,7 @@
 
 How a Flow port-set UUID is produced from a policy dump, how Atlas membership is joined to that UUID, how the two ClickHouse trees decide match, leftover, and path impact, and how two VM NICs plus one L4 port become an allow or deny verdict with the policy name on each side.
 
-Sources: `clickhouse_flow` (`ingest.py`, `compare.py`, `observe_leftovers.py`, `update_policy_port_sets.py`, `portset_traffic.py`, `schema.sql`), `clickhouse_ovn` (`dataplane.py`, `trace.py`), and `skills/network-services/nic-traffic-verdict`. Identity is the port-set UUID. Names are display labels.
+Sources: `clickhouse_flow` (`ingest.py`, `compare.py`, `observe_leftovers.py`, `update_policy_port_sets.py`, `portset_traffic.py`, `schema.sql`), `clickhouse_ovn` (`dataplane.py`, `trace.py`), and `skills/network-services/nic-traffic-verdict`. The ClickHouse schema for both databases is `CLICKHOUSE_DESIGN.md`. Identity is the port-set UUID. Names are display labels.
 
 ## What a port-set is
 

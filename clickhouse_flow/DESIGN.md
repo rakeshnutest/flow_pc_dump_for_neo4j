@@ -30,6 +30,15 @@ on `computed_nics` and `atlas_nics`. Host comes from dump VM `host.ext_id`;
 cluster comes from `hosts.json` → `clusters.json`. `flow_policy.vm_nic`
 is the NIC lookup table.
 
+Allowed traffic is stored on the same row:
+
+- `traffic_in` — allow ACLs with `outport == @port_group_<uuid>` (into the port-set; peer is `ip.src`)
+- `traffic_out` — allow ACLs with `inport == @port_group_<uuid>` (out of the port-set; peer is `ip.dst`)
+
+Each element is `Tuple(priority Int32, action LowCardinality(String), peers Array(String), ports Array(String))`. Actions stored here are `allow`, `allow-related`, and `allow-stateless`. Drops stay on `flow_ovn.ovn_acl`. `peers` are the northbound `Address_Set` addresses when the dump has them. `portset_traffic.py` fills both columns during ingest. `compare.py` preserves them with `SELECT p.* REPLACE (...)`.
+
+The full schema of both databases is `CLICKHOUSE_DESIGN.md`.
+
 ## Workload Summary
 
 - workload: security policy construct vs Atlas port-set
