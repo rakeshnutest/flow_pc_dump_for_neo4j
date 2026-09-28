@@ -273,6 +273,16 @@ def peer_ips(match: str, side: str, address_sets: dict) -> list:
     return uniq
 
 
+def format_ips(ips: list) -> str:
+    def sort_key(ip: str):
+        parts = ip.split(".")
+        try:
+            return tuple(int(part) for part in parts)
+        except ValueError:
+            return (999999, ip)
+    return ", ".join(sorted(ips, key=sort_key))
+
+
 def name_peer(ips: list, by_uuid: dict, ip_index: dict, applied_uuid: str) -> str:
     if not ips:
         return "no addresses in the OVN dump"
@@ -604,8 +614,13 @@ def main() -> None:
             peer_list = peer_ips(match, peer_side(acl.get("direction") or ""), address_sets)
             if not peer_list and not AS_FIELD.findall(match) and not LIT_FIELD.findall(match):
                 peer = "any"
+                peer_ip_text = "any"
+            elif not peer_list:
+                peer = "no addresses in the OVN dump"
+                peer_ip_text = "no addresses in the OVN dump"
             else:
                 peer = name_peer(peer_list, by_uuid, ip_index, applied.get("port_set_uuid") or "")
+                peer_ip_text = format_ips(peer_list)
             applies = "yes" if acl_matches(acl, pkt, address_sets) else "no"
             marker = (
                 int(acl.get("priority") or 0),
@@ -614,6 +629,7 @@ def main() -> None:
                 policy_label(applied),
                 category_label(applied),
                 peer,
+                peer_ip_text,
                 l4_text(match),
                 applies,
             )
@@ -629,8 +645,8 @@ def main() -> None:
             print("(none)")
             print("")
             return
-        print("| priority | action | ip | policy | category | peer | ports | matches |")
-        print("|---|---|---|---|---|---|---|---|")
+        print("| priority | action | ip | policy | category | peer | peer IPs | ports | matches |")
+        print("|---|---|---|---|---|---|---|---|---|")
         for row in table:
             print("| %s |" % " | ".join(cell(item) for item in row))
         print("")

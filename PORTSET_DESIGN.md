@@ -441,9 +441,9 @@ Printed sections, in this order. Every port-set row and every ACL row is printed
 |---|---|
 | Endpoints | Source and destination VM name, IP, traffic, and the two NIC uuids |
 | Source port-sets | One row per port-set that contains the source NIC: policy, category, role, port-set uuid |
-| Source outgoing ACLs | Every `from-lport` ACL whose `inport` is a source port-set. Columns: priority, action, ip, policy, category, peer, ports, matches. |
+| Source outgoing ACLs | Every `from-lport` ACL whose `inport` is a source port-set. Columns: priority, action, ip, policy, category, peer, peer IPs, ports, matches. `peer IPs` lists every address in that peer category. |
 | Destination port-sets | One row per port-set that contains the destination NIC, same columns as the source list |
-| Destination incoming ACLs | Every `to-lport` ACL whose `outport` is a destination port-set. Same columns as the outgoing table. |
+| Destination incoming ACLs | Every `to-lport` ACL whose `outport` is a destination port-set. Same columns. `peer IPs` lists every address in that peer category, so a category name can be checked against the source IP. |
 | Conclusion | `Verdict`, then `Allow policy`, then `Deny policy` |
 
 The policy and peer text use the policy name and category. When the peer addresses belong to a port-set, the peer is that category and policy. When they belong to no port-set, the peer is the IP list. An address set whose OVN `addresses` list is empty is reported as having no addresses. The lines do not use `$address_set_…` or `@port_group_…` as the names.

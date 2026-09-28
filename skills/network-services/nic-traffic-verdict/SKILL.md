@@ -44,11 +44,11 @@ ClickHouse is `127.0.0.1:19000`, user `default`.
 
 ## STEP 2: Emit the script output in full
 
-Print these sections in order. Keep every row of each table.
+Print these sections in order. Keep every row. `peer IPs` is printed by default for every ACL: every address in that peer category, with none left out.
 
 1. Source and destination VM name, IP, and NIC uuid.
 2. **Source port-sets** — every port-set whose NIC list contains the source NIC.
-3. **Source outgoing ACLs** — every `from-lport` ACL whose `inport` is one of those source port-sets. Columns: priority, action, ip, policy, category, peer, ports, matches.
+3. **Source outgoing ACLs** — every `from-lport` ACL whose `inport` is one of those source port-sets. Columns: priority, action, ip, policy, category, peer, peer IPs, ports, matches. `peer IPs` is every address in that ACL's peer category.
 4. **Destination port-sets** — every port-set whose NIC list contains the destination NIC.
 5. **Destination incoming ACLs** — every `to-lport` ACL whose `outport` is one of those destination port-sets. Same columns.
 6. **Conclusion** — `Verdict`, `Allow policy`, and `Deny policy`.
