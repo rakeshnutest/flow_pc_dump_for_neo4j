@@ -102,7 +102,7 @@ Mermaid is **composite per direction** (Upstream = srcâ†’dst, Downstream = dstâ†
 
 ## Scripts
 
-The NIC verdict trigger, including path-table-only and verdict-only, is in [PORTSET_DESIGN.md](../PORTSET_DESIGN.md) under "How to trigger". `trace.py` is the older composite path. `nic_traffic.py` is the two-NIC verdict.
+`trace.py` walks the four shapes above and writes the composite mermaid. `nic_traffic.py` is the two-NIC traversal: VPC boxes, tunnel id on each hop, redirect-chassis host, and the drop cookie on the switch that enforces the ACL. What that check prints, and how to run ingest plus verdict together or one stage at a time, is in [PORTSET_DESIGN.md](../PORTSET_DESIGN.md) under "Path traversal" and "How to trigger".
 
 ```text
 python3 clickhouse_ovn/ingest.py --dump_dir /path/to/dump --log_bundle_id 159166

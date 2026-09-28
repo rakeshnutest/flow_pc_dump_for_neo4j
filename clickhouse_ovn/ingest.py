@@ -57,6 +57,7 @@ OVN_TABLES = (
     "ovn_switch",
     "ovn_subnet",
     "ovn_router",
+    "ovn_route",
     "ovn_l2gw",
 )
 RESET_SCHEMA_SQL = (
@@ -73,6 +74,7 @@ NB_TABLES = {
     "Logical_Router",
     "Logical_Router_Port",
     "Logical_Router_Policy",
+    "Logical_Router_Static_Route",
     "NAT",
     "Port_Group",
     "HA_Chassis_Group",
