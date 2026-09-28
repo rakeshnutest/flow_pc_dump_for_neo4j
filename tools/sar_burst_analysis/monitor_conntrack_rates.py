@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Monitor conntrack NEW/DESTROY event rates via netlink and log them to CSV.
+"""Monitor conntrack NEW (new-connection) rates via netlink and log them to CSV.
 
-Subscribes to NFNLGRP_CONNTRACK_NEW and NFNLGRP_CONNTRACK_DESTROY on
-NETLINK_NETFILTER, tallies events per second, and appends CSV rows. Optional
---print / --print-details emit rates (and parsed 5-tuples) to stdout.
+Subscribes to NFNLGRP_CONNTRACK_NEW only on NETLINK_NETFILTER, tallies new
+connections every second, and appends CSV rows. Optional --print /
+--print-details emit rates (and parsed 5-tuples) to stdout.
 
-CSV paths always include a host-IP suffix so allssh runs from multiple AHVs
+CSV paths always include a hostname suffix so allssh runs from multiple AHVs
 do not collide. Default directory is /tmp; override with --output-dir.
 """
 
@@ -19,7 +19,6 @@ import select
 import shutil
 import socket
 import struct
-import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -91,58 +90,17 @@ SO_RCVBUFFORCE = 33
 NETLINK_RECV_CHUNK = 1024 * 1024  # 1 MiB per recv call under burst
 
 
-def get_host_ip() -> str:
-    """Pick a stable host identifier for log/CSV path suffixes.
-
-    Order:
-      1. first non-loopback IPv4 from ``hostname -I``
-      2. else first non-loopback IPv6 from ``hostname -I`` (colons -> ``_``)
-      3. else UDP connect to 8.8.8.8:80 local address
-      4. else hostname with dots -> ``_``
-    """
-    try:
-        out = subprocess.check_output(["hostname", "-I"], text=True, stderr=subprocess.DEVNULL)
-    except (OSError, subprocess.CalledProcessError):
-        out = ""
-
-    ipv4: list[str] = []
-    ipv6: list[str] = []
-    for tok in out.split():
-        tok = tok.strip()
-        if not tok:
-            continue
-        if ":" in tok:
-            if not tok.startswith("::1") and tok != "::1":
-                ipv6.append(tok)
-        else:
-            if not tok.startswith("127."):
-                ipv4.append(tok)
-
-    if ipv4:
-        return ipv4[0]
-    if ipv6:
-        return ipv6[0].replace(":", "_")
-
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            s.connect(("8.8.8.8", 80))
-            local = s.getsockname()[0]
-            if local and not local.startswith("127."):
-                return local
-        finally:
-            s.close()
-    except OSError:
-        pass
-
-    return socket.gethostname().replace(".", "_")
+def get_hostname_tag() -> str:
+    """Return short hostname for CSV path suffixes (dots -> ``_``)."""
+    name = socket.gethostname().split(".", 1)[0].strip() or "unknown"
+    return name.replace(".", "_")
 
 
-def with_host_ip_suffix(path: str, host_ip: str) -> str:
-    """Ensure ``_<host_ip>`` appears immediately before the file extension."""
+def with_hostname_suffix(path: str, hostname: str) -> str:
+    """Ensure ``_<hostname>`` appears immediately before the file extension."""
     directory, base = os.path.split(path)
     root, ext = os.path.splitext(base)
-    suffix = f"_{host_ip}"
+    suffix = f"_{hostname}"
     if root.endswith(suffix):
         return path
     return os.path.join(directory, f"{root}{suffix}{ext}") if directory else f"{root}{suffix}{ext}"
@@ -257,15 +215,15 @@ def parse_ct_message(buf: bytes, offset: int, msglen: int) -> tuple[str, Optiona
 
 
 def open_netlink_socket(rcvbuf_bytes: int = DEFAULT_RCVBUF_BYTES) -> socket.socket:
-    """Bind a NETLINK_NETFILTER socket subscribed to NEW + DESTROY groups.
+    """Bind a NETLINK_NETFILTER socket subscribed to NEW (new connections) only.
 
-    Under high NEW/DESTROY CPS the kernel drops events into ENOBUFS if the
-    userspace receive buffer is too small. Request a large SO_RCVBUF, and as
-    root try SO_RCVBUFFORCE / raise net.core.rmem_max so the kernel actually
-    grants the size.
+    Under high NEW CPS the kernel drops events into ENOBUFS if the userspace
+    receive buffer is too small. Request a large SO_RCVBUF, and as root try
+    SO_RCVBUFFORCE / raise net.core.rmem_max so the kernel actually grants
+    the size.
     """
     sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_NETFILTER)
-    groups = (1 << (NFNLGRP_CONNTRACK_NEW - 1)) | (1 << (NFNLGRP_CONNTRACK_DESTROY - 1))
+    groups = 1 << (NFNLGRP_CONNTRACK_NEW - 1)
     sock.bind((0, groups))
 
     # Raise system max so SO_RCVBUF is not silently capped (best-effort).
@@ -306,35 +264,33 @@ def open_csv(path: str):
     fh = open(path, "a", buffering=1)
     if not exists:
         fh.write(
-            "timestamp_utc,new_per_sec,destroy_per_sec,"
-            "new_avg_per_sec,destroy_avg_per_sec,"
-            "new_total,destroy_total,enobuf_events\n"
+            "timestamp_utc,new_per_sec,new_avg_per_sec,new_total,enobuf_events\n"
         )
     return fh
 
 
-def resolve_output_path(output: str | None, output_dir: str, host_ip: str) -> str:
-    """Build CSV path under output_dir (default /tmp), always host-IP-suffixed.
+def resolve_output_path(output: str | None, output_dir: str, hostname: str) -> str:
+    """Build CSV path under output_dir (default /tmp), always hostname-suffixed.
 
-    If --output is a full file path, that path is used (still host-IP-suffixed).
-    Otherwise write conntrack_rates_<host_ip>.csv under --output-dir.
+    If --output is a full file path, that path is used (still hostname-suffixed).
+    Otherwise write conntrack_rates_<hostname>.csv under --output-dir.
     """
     if output:
-        path = with_host_ip_suffix(output, host_ip)
+        path = with_hostname_suffix(output, hostname)
     else:
-        path = os.path.join(output_dir, f"conntrack_rates_{host_ip}.csv")
+        path = os.path.join(output_dir, f"conntrack_rates_{hostname}.csv")
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
     return path
 
 
 def main() -> int:
-    host_ip = get_host_ip()
+    hostname = get_hostname_tag()
     parser = argparse.ArgumentParser(
         description=(
-            "Netlink conntrack NEW/DESTROY rate monitor. "
-            "Logs per-second rates to a host-IP-suffixed CSV "
-            "(directory defaults to /tmp; override with --output-dir)."
+            "Netlink conntrack NEW (new-connection) rate monitor. "
+            "Logs per-second NEW rate and lifetime NEW average "
+            "(new_total / seconds_since_start) to a hostname-suffixed CSV."
         )
     )
     parser.add_argument(
@@ -347,7 +303,7 @@ def main() -> int:
         default=None,
         help=(
             "Full CSV path (optional). Overrides --output-dir for location; "
-            "host IP is still inserted before the extension if missing"
+            "hostname is still inserted before the extension if missing"
         ),
     )
     parser.add_argument(
@@ -375,27 +331,18 @@ def main() -> int:
         help="Netlink socket receive buffer in MiB (default: 64). Raises rmem_max if possible.",
     )
     parser.add_argument(
-        "--avg-window",
-        type=float,
-        default=60.0,
-        help=(
-            "Also report a sliding-window average over this many seconds "
-            "(default: 60). Set 0 to disable window avg (lifetime avg still printed)."
-        ),
-    )
-    parser.add_argument(
         "--print",
         dest="do_print",
         action="store_true",
-        help="Print per-interval NEW/DESTROY rates to stdout",
+        help="Print per-interval NEW rates to stdout",
     )
     parser.add_argument(
         "--print-details",
         action="store_true",
-        help="Print each NEW/DESTROY 5-tuple (very verbose under load)",
+        help="Print each NEW 5-tuple (very verbose under load)",
     )
     args = parser.parse_args()
-    args.output = resolve_output_path(args.output, args.output_dir, host_ip)
+    args.output = resolve_output_path(args.output, args.output_dir, hostname)
 
     if args.interval <= 0:
         parser.error("--interval must be > 0")
@@ -403,8 +350,6 @@ def main() -> int:
         parser.error("--max-hours must be >= 0")
     if args.rcvbuf_mb <= 0:
         parser.error("--rcvbuf-mb must be > 0")
-    if args.avg_window < 0:
-        parser.error("--avg-window must be >= 0")
 
     if os.geteuid() != 0:
         print(
@@ -421,21 +366,17 @@ def main() -> int:
 
     csv_fh = open_csv(args.output)
     print(
-        f"conntrack rate monitor: host_ip={host_ip} output={args.output} "
+        f"conntrack rate monitor: hostname={hostname} output={args.output} "
         f"max_hours={args.max_hours} interval={args.interval} "
-        f"rcvbuf_mb={args.rcvbuf_mb} avg_window={args.avg_window}",
+        f"rcvbuf_mb={args.rcvbuf_mb}",
         file=sys.stderr,
     )
 
     new_count = 0
-    destroy_count = 0
     new_total = 0
-    destroy_total = 0
     enobuf_count = 0
     enobuf_total = 0
     interval = args.interval
-    # Sliding window of (mono_ts, new_events, destroy_events) per sample.
-    window: list[tuple[float, int, int]] = []
     start_mono = time.monotonic()
     next_sample = start_mono + interval
     deadline = None if args.max_hours == 0 else (start_mono + args.max_hours * 3600.0)
@@ -475,11 +416,6 @@ def main() -> int:
                             new_total += 1
                             if args.print_details and orig is not None:
                                 print(f"NEW     {format_flow(orig)}")
-                        elif event == "destroy":
-                            destroy_count += 1
-                            destroy_total += 1
-                            if args.print_details and orig is not None:
-                                print(f"DESTROY {format_flow(orig)}")
                         off += _align(msglen)
 
             now = time.monotonic()
@@ -487,48 +423,23 @@ def main() -> int:
                 # Catch up if we fell behind under load.
                 elapsed = now - (next_sample - interval)
                 scale = elapsed if elapsed > 0 else interval
+                # NEW connections in this second (normalized to per-sec).
                 new_rate = new_count / scale
-                destroy_rate = destroy_count / scale
-
+                # Simple average since start: total NEW / seconds running.
                 life_elapsed = max(now - start_mono, interval)
                 new_avg = new_total / life_elapsed
-                destroy_avg = destroy_total / life_elapsed
-
-                window.append((now, new_count, destroy_count))
-                if args.avg_window > 0:
-                    cutoff = now - args.avg_window
-                    while window and window[0][0] < cutoff:
-                        window.pop(0)
-                    win_new = sum(n for _, n, _ in window)
-                    win_destroy = sum(d for _, _, d in window)
-                    win_span = max(now - window[0][0], interval) if window else interval
-                    win_new_avg = win_new / win_span
-                    win_destroy_avg = win_destroy / win_span
-                else:
-                    win_new_avg = new_avg
-                    win_destroy_avg = destroy_avg
 
                 ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 csv_fh.write(
-                    f"{ts},{new_rate:.3f},{destroy_rate:.3f},"
-                    f"{new_avg:.3f},{destroy_avg:.3f},"
-                    f"{new_total},{destroy_total},{enobuf_total}\n"
+                    f"{ts},{new_rate:.3f},{new_avg:.3f},{new_total},{enobuf_total}\n"
                 )
                 if args.do_print or args.print_details:
                     extra = f"  enobuf={enobuf_count}" if enobuf_count else ""
-                    win_txt = ""
-                    if args.avg_window > 0:
-                        win_txt = (
-                            f"  win{int(args.avg_window)}s_new/s={win_new_avg:.1f}"
-                            f"  win{int(args.avg_window)}s_destroy/s={win_destroy_avg:.1f}"
-                        )
                     print(
                         f"{ts}  new/s={new_rate:.1f}  avg_new/s={new_avg:.1f}  "
-                        f"destroy/s={destroy_rate:.1f}  avg_destroy/s={destroy_avg:.1f}"
-                        f"{win_txt}  totals new={new_total} destroy={destroy_total}{extra}"
+                        f"new_total={new_total}{extra}"
                     )
                 new_count = 0
-                destroy_count = 0
                 enobuf_count = 0
                 next_sample += interval
                 while next_sample <= time.monotonic():

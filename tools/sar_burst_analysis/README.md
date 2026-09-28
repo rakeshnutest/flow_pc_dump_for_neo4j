@@ -65,20 +65,13 @@ python3 monitor_conntrack_rates.py --print
 Defaults:
 
 - CSV directory: `/tmp` (`--output-dir DIR` to change; creates DIR if needed)
-- CSV file: `<output-dir>/conntrack_rates_<host_ip>.csv`
+- CSV file: `<output-dir>/conntrack_rates_<hostname>.csv` (short hostname, e.g. `zadkiel04-1`)
 - `--max-hours 24` (use `0` for unlimited)
-- Optional `--output PATH` sets a full file path (still gets `_<host_ip>` before the extension)
+- Optional `--output PATH` sets a full file path (still gets `_<hostname>` before the extension)
 
 ```bash
 python3 monitor_conntrack_rates.py --print --output-dir /var/log/conntrack_rates
 ```
-
-Host IP selection order for the path suffix:
-
-1. first non-loopback IPv4 from `hostname -I`
-2. else first non-loopback IPv6 from `hostname -I` (colons → `_`)
-3. else UDP connect to `8.8.8.8:80` local address
-4. else hostname with dots → `_`
 
 Optional `--print-details` prints each NEW/DESTROY 5-tuple (very verbose under load).
 
