@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Monitor conntrack NEW (new-connection) rates via netlink and log them to CSV.
+"""Monitor conntrack NEW/DESTROY rates via netlink and log them to CSV.
 
-Subscribes to NFNLGRP_CONNTRACK_NEW only on NETLINK_NETFILTER, tallies new
-connections every second, and appends CSV rows. Optional --print /
---print-details emit rates (and parsed 5-tuples) to stdout.
+Subscribes to NFNLGRP_CONNTRACK_NEW and NFNLGRP_CONNTRACK_DESTROY on
+NETLINK_NETFILTER, tallies events every second, and appends CSV rows with
+per-second rates and lifetime averages. Optional --print / --print-details
+emit rates (and parsed 5-tuples) to stdout.
 
 CSV paths always include a hostname suffix so allssh runs from multiple AHVs
 do not collide. Default directory is /tmp; override with --output-dir.
@@ -215,15 +216,15 @@ def parse_ct_message(buf: bytes, offset: int, msglen: int) -> tuple[str, Optiona
 
 
 def open_netlink_socket(rcvbuf_bytes: int = DEFAULT_RCVBUF_BYTES) -> socket.socket:
-    """Bind a NETLINK_NETFILTER socket subscribed to NEW (new connections) only.
+    """Bind a NETLINK_NETFILTER socket subscribed to NEW + DESTROY groups.
 
-    Under high NEW CPS the kernel drops events into ENOBUFS if the userspace
-    receive buffer is too small. Request a large SO_RCVBUF, and as root try
-    SO_RCVBUFFORCE / raise net.core.rmem_max so the kernel actually grants
-    the size.
+    Under high NEW/DESTROY CPS the kernel drops events into ENOBUFS if the
+    userspace receive buffer is too small. Request a large SO_RCVBUF, and as
+    root try SO_RCVBUFFORCE / raise net.core.rmem_max so the kernel actually
+    grants the size.
     """
     sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_NETFILTER)
-    groups = 1 << (NFNLGRP_CONNTRACK_NEW - 1)
+    groups = (1 << (NFNLGRP_CONNTRACK_NEW - 1)) | (1 << (NFNLGRP_CONNTRACK_DESTROY - 1))
     sock.bind((0, groups))
 
     # Raise system max so SO_RCVBUF is not silently capped (best-effort).
@@ -265,7 +266,8 @@ def open_csv(path: str):
     fh = open(path, "a", buffering=1)
     if not exists:
         fh.write(
-            "timestamp_utc,new_per_sec,new_avg_per_sec,new_total,enobuf_events\n"
+            "timestamp_utc,new_per_sec,destroy_per_sec,"
+            "avg_new_per_sec,avg_destroy_per_sec\n"
         )
     return fh
 
@@ -289,9 +291,9 @@ def main() -> int:
     hostname = get_hostname_tag()
     parser = argparse.ArgumentParser(
         description=(
-            "Netlink conntrack NEW (new-connection) rate monitor. "
-            "Logs per-second NEW rate and lifetime NEW average "
-            "(new_total / seconds_since_start) to a hostname-suffixed CSV."
+            "Netlink conntrack NEW/DESTROY rate monitor. "
+            "Logs per-second rates and lifetime averages "
+            "(total / seconds_since_start) to a hostname-suffixed CSV."
         )
     )
     parser.add_argument(
@@ -335,12 +337,12 @@ def main() -> int:
         "--print",
         dest="do_print",
         action="store_true",
-        help="Print per-interval NEW rates to stdout",
+        help="Print per-interval NEW/DESTROY rates to stdout",
     )
     parser.add_argument(
         "--print-details",
         action="store_true",
-        help="Print each NEW 5-tuple (very verbose under load)",
+        help="Print each NEW/DESTROY 5-tuple (very verbose under load)",
     )
     args = parser.parse_args()
     args.output = resolve_output_path(args.output, args.output_dir, hostname)
@@ -375,9 +377,10 @@ def main() -> int:
         )
 
     new_count = 0
+    destroy_count = 0
     new_total = 0
+    destroy_total = 0
     enobuf_count = 0
-    enobuf_total = 0
     interval = args.interval
     start_mono = time.monotonic()
     next_sample = start_mono + interval
@@ -402,7 +405,6 @@ def main() -> int:
                     # keep running instead of aborting under CPS bursts.
                     if getattr(exc, "errno", None) == errno.ENOBUFS:
                         enobuf_count += 1
-                        enobuf_total += 1
                     else:
                         print(f"error: netlink recv failed: {exc}", file=sys.stderr)
                         break
@@ -418,6 +420,11 @@ def main() -> int:
                             new_total += 1
                             if args.print_details and orig is not None:
                                 print(f"NEW     {format_flow(orig)}")
+                        elif event == "destroy":
+                            destroy_count += 1
+                            destroy_total += 1
+                            if args.print_details and orig is not None:
+                                print(f"DESTROY {format_flow(orig)}")
                         off += _align(msglen)
 
             now = time.monotonic()
@@ -425,23 +432,27 @@ def main() -> int:
                 # Catch up if we fell behind under load.
                 elapsed = now - (next_sample - interval)
                 scale = elapsed if elapsed > 0 else interval
-                # NEW connections in this second (normalized to per-sec).
                 new_rate = new_count / scale
-                # Simple average since start: total NEW / seconds running.
+                destroy_rate = destroy_count / scale
+                # Lifetime averages since start.
                 life_elapsed = max(now - start_mono, interval)
-                new_avg = new_total / life_elapsed
+                avg_new = new_total / life_elapsed
+                avg_destroy = destroy_total / life_elapsed
 
                 ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 csv_fh.write(
-                    f"{ts},{new_rate:.3f},{new_avg:.3f},{new_total},{enobuf_total}\n"
+                    f"{ts},{new_rate:.3f},{destroy_rate:.3f},"
+                    f"{avg_new:.3f},{avg_destroy:.3f}\n"
                 )
                 if args.do_print or args.print_details:
                     extra = f"  enobuf={enobuf_count}" if enobuf_count else ""
                     print(
-                        f"{ts}  new/s={new_rate:.1f}  avg_new/s={new_avg:.1f}  "
-                        f"new_total={new_total}{extra}"
+                        f"{ts}  new/s={new_rate:.1f}  destroy/s={destroy_rate:.1f}  "
+                        f"avg_new/s={avg_new:.1f}  avg_destroy/s={avg_destroy:.1f}"
+                        f"{extra}"
                     )
                 new_count = 0
+                destroy_count = 0
                 enobuf_count = 0
                 next_sample += interval
                 while next_sample <= time.monotonic():
