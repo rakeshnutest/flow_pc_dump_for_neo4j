@@ -1,0 +1,289 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "description": "Independent CVM ping dashboard from sysstats ping_gateway / ping_all / ping_remotes (latency ms + unreachable drops). Not tied to SAR role/iface filters.",
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Ping latency (ms)",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "influx-sar"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "influx-sar"
+          },
+          "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"ping\")\n  |> filter(fn: (r) => r.host =~ /${ping_host:regex}/)\n  |> filter(fn: (r) => r.ping_kind =~ /${ping_kind:regex}/)\n  |> filter(fn: (r) => r.target =~ /${ping_target:regex}/)\n  |> filter(fn: (r) => r._field == \"latency_ms\")\n  |> filter(fn: (r) => r._value >= 0.0)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Ping drops (unreachable count)",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 10
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "influx-sar"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "sum",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "influx-sar"
+          },
+          "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"ping\")\n  |> filter(fn: (r) => r.host =~ /${ping_host:regex}/)\n  |> filter(fn: (r) => r.ping_kind =~ /${ping_kind:regex}/)\n  |> filter(fn: (r) => r.target =~ /${ping_target:regex}/)\n  |> filter(fn: (r) => r._field == \"drop\")\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> yield(name: \"sum\")"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Gateway ping latency only (ping_kind=gateway)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "influx-sar"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "influx-sar"
+          },
+          "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"ping\")\n  |> filter(fn: (r) => r.host =~ /${ping_host:regex}/)\n  |> filter(fn: (r) => r.ping_kind == \"gateway\")\n  |> filter(fn: (r) => r._field == \"latency_ms\")\n  |> filter(fn: (r) => r._value >= 0.0)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Gateway / all unreachable drops",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 20
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "influx-sar"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "influxdb",
+            "uid": "influx-sar"
+          },
+          "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"ping\")\n  |> filter(fn: (r) => r.host =~ /${ping_host:regex}/)\n  |> filter(fn: (r) => r.ping_kind =~ /gateway|all/)\n  |> filter(fn: (r) => r._field == \"drop\")\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> yield(name: \"sum\")"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": [
+    "ping",
+    "nutanix",
+    "cvm",
+    "latency"
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "ping_host",
+        "type": "query",
+        "label": "CVM host",
+        "datasource": {
+          "type": "influxdb",
+          "uid": "influx-sar"
+        },
+        "definition": "import \"influxdata/influxdb/schema\"\nschema.tagValues(bucket: \"sar\", tag: \"host\", predicate: (r) => r._measurement == \"ping\")",
+        "query": "import \"influxdata/influxdb/schema\"\nschema.tagValues(bucket: \"sar\", tag: \"host\", predicate: (r) => r._measurement == \"ping\")",
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": [
+            "$__all"
+          ],
+          "selected": true
+        },
+        "refresh": 2,
+        "sort": 1
+      },
+      {
+        "name": "ping_kind",
+        "type": "custom",
+        "label": "Ping kind",
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "query": "gateway,all,remotes",
+        "options": [
+          {
+            "text": "gateway",
+            "value": "gateway",
+            "selected": true
+          },
+          {
+            "text": "all",
+            "value": "all",
+            "selected": true
+          },
+          {
+            "text": "remotes",
+            "value": "remotes",
+            "selected": true
+          }
+        ],
+        "current": {
+          "text": "All",
+          "value": [
+            "$__all"
+          ],
+          "selected": true
+        }
+      },
+      {
+        "name": "ping_target",
+        "type": "query",
+        "label": "Ping target",
+        "datasource": {
+          "type": "influxdb",
+          "uid": "influx-sar"
+        },
+        "definition": "import \"influxdata/influxdb/schema\"\nschema.tagValues(bucket: \"sar\", tag: \"target\", predicate: (r) => r._measurement == \"ping\")",
+        "query": "import \"influxdata/influxdb/schema\"\nschema.tagValues(bucket: \"sar\", tag: \"target\", predicate: (r) => r._measurement == \"ping\")",
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": [
+            "$__all"
+          ],
+          "selected": true
+        },
+        "refresh": 2,
+        "sort": 1
+      }
+    ]
+  },
+  "time": {
+    "from": "2026-08-25T00:00:00.000Z",
+    "to": "2026-09-07T23:59:59.000Z"
+  },
+  "timezone": "utc",
+  "title": "SAR \u2014 Ping latency / drops (independent)",
+  "uid": "sar-ping",
+  "version": 2,
+  "timepicker": {
+    "refresh_intervals": [
+      "5s",
+      "10s",
+      "30s",
+      "1m",
+      "5m",
+      "15m",
+      "30m",
+      "1h",
+      "2h",
+      "1d"
+    ],
+    "time_options": [
+      "5m",
+      "15m",
+      "1h",
+      "6h",
+      "12h",
+      "24h",
+      "2d",
+      "7d",
+      "30d",
+      "90d"
+    ]
+  }
+}

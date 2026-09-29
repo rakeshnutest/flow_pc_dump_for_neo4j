@@ -14,9 +14,12 @@ from typing import Iterable, List, Optional, Tuple
 import urllib.request
 
 LINUX_RE = re.compile(
-    r"^Linux\s+\S+\s+\(([^)]+)\)\s+(\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4})"
+    r"^Linux\s+\S+\s+\(([^)]+)\)\s+(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})"
 )
-TIME_RE = re.compile(r"^(\d{2}:\d{2}:\d{2})")
+# 24h "HH:MM:SS" or 12h "HH:MM:SS AM/PM"
+TIME_RE = re.compile(
+    r"^(\d{1,2}:\d{2}:\d{2})(?:\s+(AM|PM))?", re.IGNORECASE
+)
 
 INFLUX_URL = os.environ.get("INFLUX_URL", "http://influxdb:8086").rstrip("/")
 INFLUX_TOKEN = os.environ.get("INFLUX_TOKEN", "sar-admin-token-change-me")
@@ -42,7 +45,7 @@ def wait_influx(timeout: int = 120) -> None:
 
 
 def parse_date(s: str) -> Optional[datetime]:
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
         try:
             return datetime.strptime(s, fmt)
         except ValueError:
@@ -53,7 +56,17 @@ def parse_date(s: str) -> Optional[datetime]:
 def classify(cols: List[str]) -> Optional[Tuple[str, str, List[str]]]:
     low = [c.lower() for c in cols]
     if "cpu" in low and ("%usr" in low or "%user" in low):
-        return "sar_cpu", "cpu", cols[1:]
+        # Normalize metric names so CVM (%usr/%sys) and AHV (%user/%system) share fields
+        metrics = []
+        for c in cols[1:]:
+            cl = c.lower()
+            if cl == "%user":
+                metrics.append("%usr")
+            elif cl == "%system":
+                metrics.append("%sys")
+            else:
+                metrics.append(c)
+        return "sar_cpu", "cpu", metrics
     if "iface" in low and "rxpck/s" in low:
         return "sar_net_dev", "iface", cols[1:]
     if "iface" in low and "rxerr/s" in low:
@@ -69,6 +82,36 @@ def classify(cols: List[str]) -> Optional[Tuple[str, str, List[str]]]:
     if "pgpgin/s" in low:
         return "sar_paging", "host", cols[:]
     return None
+
+
+def parse_row_time(parts: List[str]) -> Optional[Tuple[str, List[str]]]:
+    """Return (HH:MM:SS 24h, remaining tokens) or None."""
+    if not parts:
+        return None
+    m = TIME_RE.match(parts[0])
+    if not m:
+        return None
+    # Case A: "12:00:10" "AM" "all" ...
+    if len(parts) > 1 and parts[1].upper() in ("AM", "PM"):
+        ampm = parts[1].upper()
+        rest = parts[2:]
+        hh, mm, ss = map(int, parts[0].split(":"))
+    # Case B: TIME_RE captured AM/PM on same token (unlikely with split)
+    elif m.group(2):
+        ampm = m.group(2).upper()
+        rest = parts[1:]
+        hh, mm, ss = map(int, m.group(1).split(":"))
+    else:
+        # plain 24h
+        return parts[0], parts[1:]
+
+    if ampm == "AM":
+        if hh == 12:
+            hh = 0
+    else:  # PM
+        if hh != 12:
+            hh += 12
+    return f"{hh:02d}:{mm:02d}:{ss:02d}", rest
 
 
 def esc_tag(v: str) -> str:
@@ -91,16 +134,38 @@ def to_float(tok: str) -> Optional[float]:
         return None
 
 
+def role_from_source(source: str, text: str) -> str:
+    """Prefer # SAR_ROLE header, then filename markers, else cvm."""
+    for raw in text.splitlines()[:20]:
+        if raw.startswith("# SAR_ROLE"):
+            parts = raw.split()
+            if len(parts) >= 3:
+                return parts[2].strip().lower()
+    base = Path(source).name.lower()
+    if "__ahv__" in base or base.startswith("ahv-"):
+        return "ahv"
+    if "__cvm__" in base or "-cvm" in base:
+        return "cvm"
+    return "cvm"
+
+
 def lines_from_text(text: str, source: str) -> Iterable[str]:
     hostname = "unknown"
     day: Optional[datetime] = None
     section: Optional[str] = None
     key_field = "host"
     metrics: List[str] = []
+    role = role_from_source(source, text)
 
     for raw in text.splitlines():
         line = raw.rstrip()
-        if not line or line.startswith("Average") or line.startswith("#"):
+        if not line or line.startswith("Average"):
+            continue
+        if line.startswith("#"):
+            if line.startswith("# SAR_ROLE"):
+                parts = line.split()
+                if len(parts) >= 3:
+                    role = parts[2].strip().lower()
             continue
 
         m = LINUX_RE.match(line)
@@ -112,14 +177,14 @@ def lines_from_text(text: str, source: str) -> Iterable[str]:
             continue
 
         parts = line.split()
-        if not TIME_RE.match(parts[0]):
+        parsed = parse_row_time(parts)
+        if parsed is None:
             classified = classify(parts)
             if classified:
                 section, key_field, metrics = classified
             continue
 
-        tstr = parts[0]
-        rest = parts[1:]
+        tstr, rest = parsed
         classified = classify(rest)
         if classified:
             section, key_field, metrics = classified
@@ -157,10 +222,65 @@ def lines_from_text(text: str, source: str) -> Iterable[str]:
         if not fields:
             continue
 
-        tags = f"host={esc_tag(hostname)},source={esc_tag(source)}"
+        tags = (
+            f"host={esc_tag(hostname)},role={esc_tag(role)},"
+            f"source={esc_tag(source)}"
+        )
         if key_field != "host":
             tags += f",{key_field}={esc_tag(key)}"
         yield f"{section},{tags} {','.join(fields)} {ns}"
+
+
+PING_TS_RE = re.compile(r"^#TIMESTAMP\s+(\d+)\s*:")
+PING_LINE_RE = re.compile(r"^\s*(\S+)\s*:\s*(.+?)\s*$")
+PING_MS_RE = re.compile(r"^([\d.]+)\s*ms$", re.IGNORECASE)
+
+
+def lines_from_ping(
+    text: str,
+    source: str,
+    host: str,
+    role: str = "cvm",
+    kind: str = "unknown",
+) -> Iterable[str]:
+    """Parse Nutanix sysstats ping_{gateway,all,remotes}.INFO text."""
+    epoch: Optional[int] = None
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line:
+            continue
+        m = PING_TS_RE.match(line)
+        if m:
+            epoch = int(m.group(1))
+            continue
+        if line.startswith("#"):
+            continue
+        # section banners / column headers
+        low = line.lower()
+        if "ip :" in low or "latency" in low or line.startswith("remote_"):
+            continue
+        if epoch is None:
+            continue
+        lm = PING_LINE_RE.match(line)
+        if not lm:
+            continue
+        target = lm.group(1).strip()
+        val = lm.group(2).strip()
+        if not target or target.upper() == "IP":
+            continue
+        ns = int(epoch) * 1_000_000_000
+        tags = (
+            f"host={esc_tag(host)},role={esc_tag(role)},"
+            f"ping_kind={esc_tag(kind)},target={esc_tag(target)},"
+            f"source={esc_tag(source)}"
+        )
+        if val.lower() == "unreachable":
+            yield f"ping,{tags} latency_ms=-1,drop=1i {ns}"
+            continue
+        mm = PING_MS_RE.match(val)
+        if not mm:
+            continue
+        yield f"ping,{tags} latency_ms={mm.group(1)},drop=0i {ns}"
 
 
 def write_batch(lines: List[str]) -> None:
@@ -186,7 +306,12 @@ def write_batch(lines: List[str]) -> None:
 
 
 def ingest_dir(root: Path) -> None:
-    files = sorted(root.glob("*__sar*.txt")) + sorted(root.glob("sar*.txt"))
+    # Ping first so latency/drops are available even if SAR ingest is huge
+    files = (
+        sorted(root.glob("*__ping_*.txt"))
+        + sorted(root.glob("*__sar*.txt"))
+        + sorted(root.glob("sar*.txt"))
+    )
     # de-dupe while preserving order
     seen = set()
     uniq = []
@@ -197,16 +322,46 @@ def ingest_dir(root: Path) -> None:
         uniq.append(f)
     files = uniq
     if not files:
-        files = sorted(root.rglob("*__sar*.txt")) + sorted(root.rglob("sar*.txt"))
-    print(f"Found {len(files)} SAR files under {root}", flush=True)
+        files = (
+            sorted(root.rglob("*__sar*.txt"))
+            + sorted(root.rglob("sar*.txt"))
+            + sorted(root.rglob("*__ping_*.txt"))
+        )
+    print(f"Found {len(files)} SAR/ping files under {root}", flush=True)
     hosts = set()
     total = 0
     batch: List[str] = []
     for path in files:
         text = path.read_text(errors="ignore")
         n = 0
-        for lp in lines_from_text(text, path.name):
-            # lp starts with measurement,tags ...
+        if "__ping_" in path.name.lower() or path.name.lower().startswith("ping_"):
+            host = "unknown"
+            role = "cvm"
+            kind = "unknown"
+            for raw in text.splitlines()[:30]:
+                if raw.startswith("# PING_HOST"):
+                    parts = raw.split(None, 2)
+                    if len(parts) >= 3:
+                        host = parts[2].strip()
+                elif raw.startswith("# PING_KIND"):
+                    parts = raw.split()
+                    if len(parts) >= 3:
+                        kind = parts[2].strip().lower()
+                elif raw.startswith("# SAR_ROLE"):
+                    parts = raw.split()
+                    if len(parts) >= 3:
+                        role = parts[2].strip().lower()
+            if host == "unknown" and "__" in path.name:
+                host = path.name.split("__", 1)[0]
+            if kind == "unknown":
+                m = re.search(r"ping_(gateway|all|remotes)", path.name, re.I)
+                if m:
+                    kind = m.group(1).lower()
+            point_iter = lines_from_ping(text, path.name, host=host, role=role, kind=kind)
+        else:
+            point_iter = lines_from_text(text, path.name)
+
+        for lp in point_iter:
             if "host=" in lp:
                 try:
                     hosts.add(lp.split("host=", 1)[1].split(",", 1)[0].split(" ", 1)[0])

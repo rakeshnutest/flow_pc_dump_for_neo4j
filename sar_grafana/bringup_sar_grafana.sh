@@ -10,8 +10,11 @@ if [[ $# -lt 1 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 Usage:
   ./bringup_sar_grafana.sh <zip-or-dir> [zip-or-dir ...] [grafana_port]
 
-Converts SAR from ALL given PE zips/dirs (multiple CVMs/hosts), starts Docker
-on 0.0.0.0, picks the next free Grafana port, and prints eth0:port.
+Converts CVM + AHV SAR from ALL given PE zips/dirs, starts Docker on 0.0.0.0,
+picks the next free Grafana port, and prints eth0:port.
+
+  CVM: cvm_logs/kernel/var/sarNN
+  AHV: ahv/<ip>/files/var/log/sa/saNN  (needs local 'sar' / sysstat)
 
 Examples:
   ./bringup_sar_grafana.sh ./PE-10.3.89.176.zip ./PE-10.3.89.177.zip ./PE-10.3.89.178.zip
@@ -59,6 +62,9 @@ need docker
 need python3
 need xz
 need ss
+if ! command -v sar >/dev/null 2>&1; then
+  echo "WARNING: 'sar' (sysstat) not found — AHV binary saNN files will be skipped" >&2
+fi
 
 if ! docker compose version >/dev/null 2>&1; then
   echo "ERROR: docker compose v2 is required" >&2
@@ -118,6 +124,9 @@ printf '   - %s\n' "${INPUTS[@]}"
 
 echo "==> Converting SAR for ALL hosts into data/preload/"
 mkdir -p data/preload
+# Prefer home/cache over /tmp (often a small tmpfs) for AHV sa binary conversion.
+export TMPDIR="${TMPDIR:-${HOME}/.cache/sar_grafana_tmp}"
+mkdir -p "${TMPDIR}"
 python3 "${ROOT}/convert_ntnx_sar.py" --clean -o "${ROOT}/data/preload" "${INPUTS[@]}"
 
 HOST_COUNT="$(find data/preload -maxdepth 1 -type f -name '*__sar*.txt' | sed 's/__sar.*//' | sort -u | wc -l | tr -d ' ')"
@@ -129,8 +138,8 @@ export GRAFANA_BIND="0.0.0.0:${GRAFANA_PORT}"
 echo "==> Starting Docker stack (Grafana on 0.0.0.0:${GRAFANA_PORT})"
 docker compose up -d --build
 
-echo "==> Waiting for ingest to finish"
-for i in $(seq 1 120); do
+echo "==> Waiting for ingest to finish (AHV binaries can take several minutes)"
+for i in $(seq 1 360); do
   id="$(docker compose ps -aq ingest 2>/dev/null | head -1 || true)"
   if [[ -n "${id}" ]]; then
     status="$(docker inspect -f '{{.State.Status}}' "${id}" 2>/dev/null || echo missing)"
@@ -162,31 +171,51 @@ done
 DATA_FROM="$(python3 - <<'PY2'
 from pathlib import Path
 import re
+from datetime import datetime
 dates=[]
 for f in Path("data/preload").glob("*sar*.txt"):
-    head=f.read_text(errors="ignore")[:400]
-    m=re.search(r"\)\s+(\d{4}-\d{2}-\d{2})", head)
-    if m: dates.append(m.group(1))
-print((min(dates)+"T00:00:00.000Z") if dates else "now-90d")
+    head=f.read_text(errors="ignore")[:800]
+    for m in re.finditer(r"\)\s+(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})", head):
+        s=m.group(1)
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
+            try:
+                dates.append(datetime.strptime(s, fmt).date())
+                break
+            except ValueError:
+                pass
+print((min(dates).isoformat()+"T00:00:00.000Z") if dates else "now-90d")
 PY2
 )"
 DATA_TO="$(python3 - <<'PY2'
 from pathlib import Path
 import re
+from datetime import datetime
 dates=[]
 for f in Path("data/preload").glob("*sar*.txt"):
-    head=f.read_text(errors="ignore")[:400]
-    m=re.search(r"\)\s+(\d{4}-\d{2}-\d{2})", head)
-    if m: dates.append(m.group(1))
-print((max(dates)+"T23:59:59.000Z") if dates else "now")
+    head=f.read_text(errors="ignore")[:800]
+    for m in re.finditer(r"\)\s+(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})", head):
+        s=m.group(1)
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
+            try:
+                dates.append(datetime.strptime(s, fmt).date())
+                break
+            except ValueError:
+                pass
+print((max(dates).isoformat()+"T23:59:59.000Z") if dates else "now")
 PY2
 )"
 HOSTS="$(python3 - <<'PY2'
 from pathlib import Path
-import re
 hosts=set()
 for f in Path("data/preload").glob("*__sar*.txt"):
-    hosts.add(f.name.split("__sar")[0])
+    # ntnx-x__cvm__sar05.txt or host__ahv__sar05.txt or legacy host__sar05.txt
+    name=f.name
+    if "__ahv__" in name:
+        hosts.add(name.split("__ahv__")[0] + " (ahv)")
+    elif "__cvm__" in name:
+        hosts.add(name.split("__cvm__")[0] + " (cvm)")
+    else:
+        hosts.add(name.split("__sar")[0])
 print(", ".join(sorted(hosts)) if hosts else "(none)")
 PY2
 )"
@@ -209,7 +238,7 @@ cat <<EOF
  Hosts:      ${HOSTS}
  Data window:${DATA_FROM} -> ${DATA_TO}
 
- Use Grafana filter: Host / CVM
+ Filters: Role (CVM/AHV), Host / CVM / AHV, Interface, Rx/Tx, errors, Disk
 
  Stop with:
    cd ${ROOT} && docker compose down
