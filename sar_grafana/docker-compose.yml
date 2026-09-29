@@ -1,0 +1,60 @@
+services:
+  influxdb:
+    image: influxdb:2.7
+    # Keep Influx internal to the compose network by default (Grafana is the UI).
+    expose:
+      - "8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUX_PASSWORD:-saradmin123}
+      DOCKER_INFLUXDB_INIT_ORG: sar
+      DOCKER_INFLUXDB_INIT_BUCKET: sar
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUX_TOKEN:-sar-admin-token-change-me}
+      DOCKER_INFLUXDB_INIT_RETENTION: 0
+    volumes:
+      - influx-data:/var/lib/influxdb2
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  ingest:
+    build: ./ingest
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    environment:
+      INFLUX_URL: http://influxdb:8086
+      INFLUX_TOKEN: ${INFLUX_TOKEN:-sar-admin-token-change-me}
+      INFLUX_ORG: sar
+      INFLUX_BUCKET: sar
+      SAR_DIR: /sar
+      WRITE_BATCH: "5000"
+    volumes:
+      - ./data/preload:/sar:ro
+    restart: "on-failure"
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    ports:
+      - "${GRAFANA_BIND:-0.0.0.0:3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-saradmin123}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    restart: unless-stopped
+
+volumes:
+  influx-data:
+  grafana-data:

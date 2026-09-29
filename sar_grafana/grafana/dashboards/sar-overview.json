@@ -1,0 +1,233 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "description": "SAR dashboards with filters for time/date, host/CVM, interface, Rx/Tx packets, errors/drops, and disk.",
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "CPU % (all) — filtered by host/CVM",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influx-sar" },
+      "fieldConfig": {
+        "defaults": { "unit": "percent", "min": 0, "max": 100 },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influx-sar" },
+          "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"sar_cpu\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r.cpu == \"all\")\n  |> filter(fn: (r) => r._field == \"pct_usr\" or r._field == \"pct_sys\" or r._field == \"pct_iowait\" or r._field == \"pct_idle\" or r._field == \"pct_soft\" or r._field == \"pct_irq\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Load average — filtered by host/CVM",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influx-sar" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influx-sar" },
+          "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"sar_load\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r._field == \"ldavg_1\" or r._field == \"ldavg_5\" or r._field == \"ldavg_15\" or r._field == \"blocked\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Memory used % — filtered by host/CVM",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "influxdb", "uid": "influx-sar" },
+      "fieldConfig": {
+        "defaults": { "unit": "percent", "min": 0 },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influx-sar" },
+          "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"sar_mem\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r._field == \"pct_memused\" or r._field == \"pct_commit\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Memory KB (free / used / cached / avail)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "influxdb", "uid": "influx-sar" },
+      "fieldConfig": {
+        "defaults": { "unit": "deckbytes" },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influx-sar" },
+          "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"sar_mem\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r._field == \"kbmemfree\" or r._field == \"kbmemused\" or r._field == \"kbcached\" or r._field == \"kbavail\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Network packets — Rx/Tx (filter iface + packet metrics)",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "influxdb", "uid": "influx-sar" },
+      "fieldConfig": {
+        "defaults": { "unit": "pps" },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influx-sar" },
+          "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"sar_net_dev\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r.iface =~ /${iface:regex}/)\n  |> filter(fn: (r) => r._field =~ /${packet_metric:regex}/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Network throughput — Rx/Tx kB/s (filter iface + kB metrics)",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "influxdb", "uid": "influx-sar" },
+      "fieldConfig": {
+        "defaults": { "unit": "KBs" },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influx-sar" },
+          "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"sar_net_dev\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r.iface =~ /${iface:regex}/)\n  |> filter(fn: (r) => r._field =~ /${kb_metric:regex}/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Network errors / drops — rxerr txerr rxdrop txdrop coll (filter iface + error metrics)",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 25 },
+      "datasource": { "type": "influxdb", "uid": "influx-sar" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influx-sar" },
+          "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"sar_net_edev\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r.iface =~ /${iface:regex}/)\n  |> filter(fn: (r) => r._field =~ /${error_metric:regex}/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Disk I/O — tps / await / util / rkB / wkB (filter disk)",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 34 },
+      "datasource": { "type": "influxdb", "uid": "influx-sar" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influx-sar" },
+          "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"sar_disk\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r.dev =~ /${disk:regex}/)\n  |> filter(fn: (r) => r._field == \"tps\" or r._field == \"await\" or r._field == \"pct_util\" or r._field == \"rkB_s\" or r._field == \"wkB_s\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["sar", "sysstat", "nutanix", "cvm"],
+  "templating": {
+    "list": [
+      {
+        "name": "host",
+        "type": "query",
+        "label": "Host / CVM",
+        "datasource": { "type": "influxdb", "uid": "influx-sar" },
+        "definition": "import \"influxdata/influxdb/schema\"\nschema.tagValues(bucket: \"sar\", tag: \"host\")",
+        "query": "import \"influxdata/influxdb/schema\"\nschema.tagValues(bucket: \"sar\", tag: \"host\")",
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": { "text": "All", "value": ["$__all"], "selected": true },
+        "refresh": 2,
+        "sort": 1
+      },
+      {
+        "name": "iface",
+        "type": "query",
+        "label": "Interface",
+        "datasource": { "type": "influxdb", "uid": "influx-sar" },
+        "definition": "import \"influxdata/influxdb/schema\"\nschema.tagValues(bucket: \"sar\", tag: \"iface\")",
+        "query": "import \"influxdata/influxdb/schema\"\nschema.tagValues(bucket: \"sar\", tag: \"iface\")",
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": { "text": "All", "value": ["$__all"], "selected": true },
+        "refresh": 2,
+        "sort": 1
+      },
+      {
+        "name": "packet_metric",
+        "type": "custom",
+        "label": "Packet metrics (Rx/Tx)",
+        "multi": true,
+        "includeAll": true,
+        "allValue": "rxpck_s|txpck_s",
+        "query": "rxpck_s,txpck_s",
+        "options": [
+          { "text": "rxpck_s", "value": "rxpck_s", "selected": true },
+          { "text": "txpck_s", "value": "txpck_s", "selected": true }
+        ],
+        "current": { "text": "All", "value": ["$__all"], "selected": true }
+      },
+      {
+        "name": "kb_metric",
+        "type": "custom",
+        "label": "kB metrics (Rx/Tx)",
+        "multi": true,
+        "includeAll": true,
+        "allValue": "rxkB_s|txkB_s",
+        "query": "rxkB_s,txkB_s",
+        "options": [
+          { "text": "rxkB_s", "value": "rxkB_s", "selected": true },
+          { "text": "txkB_s", "value": "txkB_s", "selected": true }
+        ],
+        "current": { "text": "All", "value": ["$__all"], "selected": true }
+      },
+      {
+        "name": "error_metric",
+        "type": "custom",
+        "label": "Error / drop metrics",
+        "multi": true,
+        "includeAll": true,
+        "allValue": "rxerr_s|txerr_s|rxdrop_s|txdrop_s|coll_s",
+        "query": "rxerr_s,txerr_s,rxdrop_s,txdrop_s,coll_s",
+        "options": [
+          { "text": "rxerr_s", "value": "rxerr_s", "selected": true },
+          { "text": "txerr_s", "value": "txerr_s", "selected": true },
+          { "text": "rxdrop_s", "value": "rxdrop_s", "selected": true },
+          { "text": "txdrop_s", "value": "txdrop_s", "selected": true },
+          { "text": "coll_s", "value": "coll_s", "selected": true }
+        ],
+        "current": { "text": "All", "value": ["$__all"], "selected": true }
+      },
+      {
+        "name": "disk",
+        "type": "query",
+        "label": "Disk",
+        "datasource": { "type": "influxdb", "uid": "influx-sar" },
+        "definition": "import \"influxdata/influxdb/schema\"\nschema.tagValues(bucket: \"sar\", tag: \"dev\")",
+        "query": "import \"influxdata/influxdb/schema\"\nschema.tagValues(bucket: \"sar\", tag: \"dev\")",
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": { "text": "All", "value": ["$__all"], "selected": true },
+        "refresh": 2,
+        "sort": 1
+      }
+    ]
+  },
+  "time": { "from": "now-7d", "to": "now" },
+  "timezone": "browser",
+  "title": "SAR — CPU / Memory / Network / Disk",
+  "uid": "sar-overview",
+  "version": 2
+}
