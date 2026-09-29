@@ -313,7 +313,7 @@ def main() -> int:
         "--max-hours",
         type=float,
         default=24.0,
-        help="Stop after this many hours (default: 24). Use 0 for unlimited.",
+        help="Stop after this many hours (default: 24, maximum: 24).",
     )
     parser.add_argument(
         "--interval",
@@ -349,8 +349,8 @@ def main() -> int:
 
     if args.interval <= 0:
         parser.error("--interval must be > 0")
-    if args.max_hours < 0:
-        parser.error("--max-hours must be >= 0")
+    if args.max_hours <= 0 or args.max_hours > 24.0:
+        parser.error("--max-hours must be > 0 and <= 24")
     if args.rcvbuf_mb <= 0:
         parser.error("--rcvbuf-mb must be > 0")
 
@@ -384,17 +384,15 @@ def main() -> int:
     interval = args.interval
     start_mono = time.monotonic()
     next_sample = start_mono + interval
-    deadline = None if args.max_hours == 0 else (start_mono + args.max_hours * 3600.0)
+    deadline = start_mono + args.max_hours * 3600.0
 
     try:
         while True:
-            if deadline is not None and time.monotonic() >= deadline:
+            if time.monotonic() >= deadline:
                 print("max-hours reached; exiting", file=sys.stderr)
                 break
 
-            timeout = max(0.0, next_sample - time.monotonic())
-            if deadline is not None:
-                timeout = min(timeout, max(0.0, deadline - time.monotonic()))
+            timeout = max(0.0, min(next_sample - time.monotonic(), deadline - time.monotonic()))
 
             readable, _, _ = select.select([nl], [], [], timeout)
             if readable:
