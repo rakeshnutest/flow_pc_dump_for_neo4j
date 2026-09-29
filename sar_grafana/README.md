@@ -4,8 +4,10 @@ Docker stack that turns Nutanix PE log-bundle SAR data into a **Grafana** dashbo
 
 Supports:
 - Multi-day SAR (zoom with Grafana time/date picker)
-- Filters: **Host/CVM**, **Interface**, **Rx/Tx packets**, **Rx/Tx kB**, **errors/drops**, **Disk**
-- Panels: CPU, load, memory, network packets, network throughput, network errors, disk I/O
+- **CVM** (`cvm_logs/kernel/var/sarNN`) and **AHV** (`ahv/<ip>/files/var/log/sa/saNN` binary → `sar`)
+- **CVM ping** (`cvm_logs/sysstats/ping_{gateway,all,remotes}.INFO*`) — latency (ms) and unreachable drops
+- Filters: **Role (CVM/AHV)**, **Host / CVM / AHV**, **Interface**, **Rx/Tx packets**, **Rx/Tx kB**, **errors/drops**, **Disk**, **Ping kind**, **Ping target**
+- Panels: CPU, load, memory, network packets, network throughput, network errors, disk I/O, **ping latency**, **ping drops**
 
 ## Open the dashboard (where data is usually available)
 
@@ -23,7 +25,7 @@ Or rolling window:
 http://10.111.60.97:3000/d/sar-overview?from=now-90d&to=now
 ```
 
-Use the **Host / CVM** filter to select among all ingested CVMs.
+Use the **Role (CVM / AHV)** and **Host / CVM / AHV** filters to select among all ingested hosts.
 
 Do **not** use Grafana "Previous fiscal quarter" unless your SAR files fall in that quarter.
 SAR from Diamond PE zips is usually a recent multi-week window.
@@ -42,7 +44,7 @@ Pass **all PE zips** (or a folder containing them):
 ./bringup_sar_grafana.sh /path/to/2657578/2026-09-07/
 ```
 
-Files are stored as `<hostname>__sarNN.txt` so hosts never overwrite each other.
+Files are stored as `<hostname>__<role>__sarNN.txt` (legacy `<hostname>__sarNN.txt` still works).
 
 ## Quick links (after bring-up)
 
@@ -59,17 +61,30 @@ Anonymous Grafana **Viewer** is enabled by default.
 At the top of the dashboard:
 
 1. **Time range** (top-right) — filter by date/time across all ingested days  
-2. **Host / CVM** — e.g. `ntnx-…-cvm`  
-3. **Interface** — `eth0`, `eth1`, …  
-4. **Packet metrics (Rx/Tx)** — `rxpck_s`, `txpck_s`  
-5. **kB metrics (Rx/Tx)** — `rxkB_s`, `txkB_s`  
-6. **Error / drop metrics** — `rxerr_s`, `txerr_s`, `rxdrop_s`, `txdrop_s`, `coll_s`  
-7. **Disk** — block devices from SAR
+2. **Role (CVM / AHV)** — show CVM, AHV, or both  
+3. **Host / CVM / AHV** — e.g. `ntnx-…-cvm` or AHV hostname  
+4. **Interface** — `eth0`, `eth1`, …  
+5. **Packet metrics (Rx/Tx)** — `rxpck_s`, `txpck_s`  
+6. **kB metrics (Rx/Tx)** — `rxkB_s`, `txkB_s`  
+7. **Error / drop metrics** — `rxerr_s`, `txerr_s`, `rxdrop_s`, `txdrop_s`, `coll_s`  
+8. **Disk** — block devices from SAR
+
+### Independent ping dashboard
+
+Ping latency / unreachable drops are on a **separate** dashboard (not tied to SAR role/iface filters):
+
+```text
+http://10.111.60.97:3000/d/sar-ping?from=2026-08-25T00:00:00.000Z&to=2026-09-07T23:59:59.000Z
+```
+
+Filters there: **CVM host**, **Ping kind** (`gateway` / `all` / `remotes`), **Ping target**.
 
 ## Prerequisites
 
 - Docker Engine + Docker Compose v2
-- Diamond / NTNX PE `.zip` (or already-extracted `cvm_logs/kernel/var/sar*`)
+- Diamond / NTNX PE `.zip` (or already-extracted trees)
+- `sysstat` (`sar`) on the host when PE zips include **AHV** binary `saNN` files
+- `xz` for compressed CVM `sarNN` files
 
 ## 1. Prepare SAR text files (from PE zip)
 
