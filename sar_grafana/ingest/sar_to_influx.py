@@ -186,16 +186,32 @@ def write_batch(lines: List[str]) -> None:
 
 
 def ingest_dir(root: Path) -> None:
-    files = sorted(root.glob("sar*.txt"))
+    files = sorted(root.glob("*__sar*.txt")) + sorted(root.glob("sar*.txt"))
+    # de-dupe while preserving order
+    seen = set()
+    uniq = []
+    for f in files:
+        if f.resolve() in seen:
+            continue
+        seen.add(f.resolve())
+        uniq.append(f)
+    files = uniq
     if not files:
-        files = sorted(root.rglob("sar*.txt"))
+        files = sorted(root.rglob("*__sar*.txt")) + sorted(root.rglob("sar*.txt"))
     print(f"Found {len(files)} SAR files under {root}", flush=True)
+    hosts = set()
     total = 0
     batch: List[str] = []
     for path in files:
         text = path.read_text(errors="ignore")
         n = 0
         for lp in lines_from_text(text, path.name):
+            # lp starts with measurement,tags ...
+            if "host=" in lp:
+                try:
+                    hosts.add(lp.split("host=", 1)[1].split(",", 1)[0].split(" ", 1)[0])
+                except Exception:
+                    pass
             batch.append(lp)
             n += 1
             if len(batch) >= BATCH:
@@ -206,7 +222,10 @@ def ingest_dir(root: Path) -> None:
     if batch:
         write_batch(batch)
         total += len(batch)
-    print(f"Ingested {total} points into bucket={INFLUX_BUCKET}", flush=True)
+    print(
+        f"Ingested {total} points into bucket={INFLUX_BUCKET}; hosts={sorted(hosts)}",
+        flush=True,
+    )
 
 
 def main() -> int:

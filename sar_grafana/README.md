@@ -7,6 +7,43 @@ Supports:
 - Filters: **Host/CVM**, **Interface**, **Rx/Tx packets**, **Rx/Tx kB**, **errors/drops**, **Disk**
 - Panels: CPU, load, memory, network packets, network throughput, network errors, disk I/O
 
+## Open the dashboard (where data is usually available)
+
+After bring-up, use the **data-window link** printed by the script.
+
+For the current host stack, open:
+
+```text
+http://10.111.60.97:3000/d/sar-overview?from=2026-08-09T00:00:00.000Z&to=2026-09-06T23:59:59.000Z
+```
+
+Or rolling window:
+
+```text
+http://10.111.60.97:3000/d/sar-overview?from=now-90d&to=now
+```
+
+Use the **Host / CVM** filter to select among all ingested CVMs.
+
+Do **not** use Grafana "Previous fiscal quarter" unless your SAR files fall in that quarter.
+SAR from Diamond PE zips is usually a recent multi-week window.
+
+## Multi-host bring-up
+
+Pass **all PE zips** (or a folder containing them):
+
+```bash
+./bringup_sar_grafana.sh \
+  ./2657578-...-PE-10.3.89.176-CW.zip \
+  ./2657578-...-PE-10.3.89.177.zip \
+  ./2657578-...-PE-10.3.89.178.zip
+
+# or every zip in a Diamond date folder:
+./bringup_sar_grafana.sh /path/to/2657578/2026-09-07/
+```
+
+Files are stored as `<hostname>__sarNN.txt` so hosts never overwrite each other.
+
 ## Quick links (after bring-up)
 
 | Service | URL |

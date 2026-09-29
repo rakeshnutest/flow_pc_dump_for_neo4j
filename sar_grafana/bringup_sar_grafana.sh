@@ -1,34 +1,58 @@
 #!/usr/bin/env bash
-# Bring up SAR Grafana stack from a Diamond/NTNX PE zip.
-# Usage: ./bringup_sar_grafana.sh /path/to/PE.zip [grafana_port]
+# Bring up SAR Grafana stack from one or more Diamond/NTNX PE zips (multi-host).
+# Usage:
+#   ./bringup_sar_grafana.sh <zip|dir> [zip|dir ...] [grafana_port]
+#   ./bringup_sar_grafana.sh /path/to/dir-with-many-pe-zips
 set -euo pipefail
 
-ZIP="${1:-}"
-REQ_PORT="${2:-}"
-
-if [[ -z "${ZIP}" || "${ZIP}" == "-h" || "${ZIP}" == "--help" ]]; then
+if [[ $# -lt 1 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   cat <<'EOF'
-Usage: ./bringup_sar_grafana.sh <ntnx-or-diamond.zip> [grafana_port]
+Usage:
+  ./bringup_sar_grafana.sh <zip-or-dir> [zip-or-dir ...] [grafana_port]
 
-What it does:
-  1) Converts CVM SAR day files from the zip into data/preload/sarNN.txt
-  2) Starts Docker Compose (Grafana + InfluxDB + ingest) listening on 0.0.0.0
-  3) Prints eth0 IP and Grafana port to open
+Converts SAR from ALL given PE zips/dirs (multiple CVMs/hosts), starts Docker
+on 0.0.0.0, picks the next free Grafana port, and prints eth0:port.
 
 Examples:
-  ./bringup_sar_grafana.sh ./2657578-PE-10.3.89.176.zip
+  ./bringup_sar_grafana.sh ./PE-10.3.89.176.zip ./PE-10.3.89.177.zip ./PE-10.3.89.178.zip
+  ./bringup_sar_grafana.sh /path/to/2026-09-07/          # all *.zip in that folder
   ./bringup_sar_grafana.sh ./bundle.zip 3100
 EOF
   exit 1
 fi
 
-if [[ ! -f "${ZIP}" ]]; then
-  echo "ERROR: zip not found: ${ZIP}" >&2
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${ROOT}"
+
+# Last numeric arg (if any) is optional Grafana port; everything else is inputs.
+ARGS=("$@")
+REQ_PORT=""
+if [[ "${ARGS[-1]}" =~ ^[0-9]+$ ]]; then
+  REQ_PORT="${ARGS[-1]}"
+  unset 'ARGS[-1]'
+fi
+if [[ ${#ARGS[@]} -lt 1 ]]; then
+  echo "ERROR: provide at least one zip or directory" >&2
   exit 1
 fi
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "${ROOT}"
+# Expand directories to *.zip inside them (plus the dir itself for extracted trees)
+INPUTS=()
+for item in "${ARGS[@]}"; do
+  if [[ -d "${item}" ]]; then
+    mapfile -t zips < <(find "${item}" -maxdepth 1 -type f -name '*.zip' | sort)
+    if [[ ${#zips[@]} -gt 0 ]]; then
+      INPUTS+=("${zips[@]}")
+    else
+      INPUTS+=("${item}")
+    fi
+  elif [[ -f "${item}" ]]; then
+    INPUTS+=("${item}")
+  else
+    echo "ERROR: not found: ${item}" >&2
+    exit 1
+  fi
+done
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing required command: $1" >&2; exit 1; }; }
 need docker
@@ -43,34 +67,32 @@ fi
 
 port_free() {
   local p="$1"
-  ! ss -ltn | awk '{print $4}' | grep -Eq "[:.]${p}$"
+  ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${p}$"
 }
 
 pick_port() {
+  local base="${SAR_PORT_BASE:-3000}"
+  local max="${SAR_PORT_MAX:-3999}"
+  local p start
   if [[ -n "${REQ_PORT}" ]]; then
-    if ! port_free "${REQ_PORT}"; then
-      echo "ERROR: requested port ${REQ_PORT} is already in use" >&2
-      exit 1
-    fi
-    echo "${REQ_PORT}"
-    return
+    start="${REQ_PORT}"
+  else
+    start="${base}"
   fi
-  local p
-  for p in 3000 3100 3200 3300 3400 3500 3600 3700 3800 3900; do
+  for p in $(seq "${start}" "${max}"); do
     if port_free "${p}"; then
       echo "${p}"
       return
     fi
   done
-  # fall back to a high ephemeral-ish range
-  for p in $(seq 4000 4100); do
-    if port_free "${p}"; then
-      echo "${p}"
-      return
-    fi
-  done
-  echo "ERROR: could not find a free Grafana port" >&2
+  echo "ERROR: no free port in ${start}-${max}" >&2
   exit 1
+}
+
+stop_existing_stack() {
+  echo "==> Stopping any previous stack in ${ROOT} (and removing volumes for clean ingest)"
+  docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+  docker ps -aq --filter name=grafana-stack --filter name=sar-zip-viewer --filter name=sar_grafana 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1 || true
 }
 
 eth0_ip() {
@@ -85,68 +107,30 @@ eth0_ip() {
   echo "${ip}"
 }
 
+stop_existing_stack
 GRAFANA_PORT="$(pick_port)"
 ETH0_IP="$(eth0_ip)"
 
 echo "==> Using Grafana port ${GRAFANA_PORT} on 0.0.0.0"
 echo "==> eth0 IP: ${ETH0_IP}"
+echo "==> Inputs (${#INPUTS[@]}):"
+printf '   - %s\n' "${INPUTS[@]}"
 
-echo "==> Converting SAR from zip: ${ZIP}"
+echo "==> Converting SAR for ALL hosts into data/preload/"
 mkdir -p data/preload
-# clear previous preload texts so this zip is the source of truth
-find data/preload -maxdepth 1 -type f -name 'sar*.txt' -delete
+python3 "${ROOT}/convert_ntnx_sar.py" --clean -o "${ROOT}/data/preload" "${INPUTS[@]}"
 
-python3 - "${ZIP}" "${ROOT}/data/preload" <<'PY'
-import subprocess, sys, zipfile
-from pathlib import Path
+HOST_COUNT="$(find data/preload -maxdepth 1 -type f -name '*__sar*.txt' | sed 's/__sar.*//' | sort -u | wc -l | tr -d ' ')"
+FILE_COUNT="$(find data/preload -maxdepth 1 -type f -name '*__sar*.txt' | wc -l | tr -d ' ')"
+echo "==> Preload ready: ${FILE_COUNT} day files, ${HOST_COUNT} host(s)"
 
-zip_path = Path(sys.argv[1])
-out = Path(sys.argv[2])
-out.mkdir(parents=True, exist_ok=True)
-
-def decode(raw: bytes) -> str:
-    if raw[:6] == b"\xfd7zXZ\x00":
-        raw = subprocess.check_output(["xz", "-dc", "--stdout"], input=raw)
-    if b"\x00" in raw[:512]:
-        return ""
-    return raw.decode("utf-8", errors="ignore")
-
-kept = 0
-with zipfile.ZipFile(zip_path) as zf:
-    names = sorted(zf.namelist())
-    candidates = []
-    for name in names:
-        base = Path(name).name
-        norm = name.replace("\\", "/")
-        if not (base.startswith("sar") and len(base) >= 5 and base[3:5].isdigit()):
-            continue
-        candidates.append((name, base, norm))
-
-    kernel = [c for c in candidates if "kernel/var/" in c[2]]
-    selected = kernel if kernel else candidates
-
-    for name, base, norm in selected:
-        text = decode(zf.read(name))
-        if "CPU" not in text and "%usr" not in text and "IFACE" not in text:
-            continue
-        dest = out / f"{base}.txt"
-        dest.write_text(text)
-        kept += 1
-        print(f"  wrote {dest.name} ({len(text)} bytes) from {name}")
-
-if kept == 0:
-    raise SystemExit("No usable SAR day files found in zip (expected cvm_logs/kernel/var/sarNN)")
-print(f"Converted {kept} SAR day file(s)")
-PY
-
-# Prefer not publishing Influx on host; Grafana is the UI users open.
 export GRAFANA_BIND="0.0.0.0:${GRAFANA_PORT}"
 
 echo "==> Starting Docker stack (Grafana on 0.0.0.0:${GRAFANA_PORT})"
 docker compose up -d --build
 
 echo "==> Waiting for ingest to finish"
-for i in $(seq 1 90); do
+for i in $(seq 1 120); do
   id="$(docker compose ps -aq ingest 2>/dev/null | head -1 || true)"
   if [[ -n "${id}" ]]; then
     status="$(docker inspect -f '{{.State.Status}}' "${id}" 2>/dev/null || echo missing)"
@@ -154,21 +138,20 @@ for i in $(seq 1 90); do
     if [[ "${status}" == "exited" ]]; then
       if [[ "${code}" == "0" ]]; then
         echo "Ingest completed successfully"
-        docker compose logs --tail 20 ingest || true
+        docker compose logs --tail 40 ingest || true
         break
       fi
       echo "ERROR: ingest exited with code ${code}" >&2
-      docker compose logs --tail 80 ingest >&2 || true
+      docker compose logs --tail 120 ingest >&2 || true
       exit 1
     fi
   fi
-  if [[ "${i}" -eq 90 ]]; then
+  if [[ "${i}" -eq 120 ]]; then
     echo "WARNING: timed out waiting for ingest; check: docker compose logs ingest" >&2
   fi
   sleep 2
 done
 
-# Ensure Grafana answers
 for i in $(seq 1 30); do
   if curl -fsS "http://127.0.0.1:${GRAFANA_PORT}/api/health" >/dev/null 2>&1; then
     break
@@ -176,22 +159,57 @@ for i in $(seq 1 30); do
   sleep 1
 done
 
-DASHBOARD_URL="http://${ETH0_IP}:${GRAFANA_PORT}/d/sar-overview"
-LOCAL_URL="http://127.0.0.1:${GRAFANA_PORT}/d/sar-overview"
+DATA_FROM="$(python3 - <<'PY2'
+from pathlib import Path
+import re
+dates=[]
+for f in Path("data/preload").glob("*sar*.txt"):
+    head=f.read_text(errors="ignore")[:400]
+    m=re.search(r"\)\s+(\d{4}-\d{2}-\d{2})", head)
+    if m: dates.append(m.group(1))
+print((min(dates)+"T00:00:00.000Z") if dates else "now-90d")
+PY2
+)"
+DATA_TO="$(python3 - <<'PY2'
+from pathlib import Path
+import re
+dates=[]
+for f in Path("data/preload").glob("*sar*.txt"):
+    head=f.read_text(errors="ignore")[:400]
+    m=re.search(r"\)\s+(\d{4}-\d{2}-\d{2})", head)
+    if m: dates.append(m.group(1))
+print((max(dates)+"T23:59:59.000Z") if dates else "now")
+PY2
+)"
+HOSTS="$(python3 - <<'PY2'
+from pathlib import Path
+import re
+hosts=set()
+for f in Path("data/preload").glob("*__sar*.txt"):
+    hosts.add(f.name.split("__sar")[0])
+print(", ".join(sorted(hosts)) if hosts else "(none)")
+PY2
+)"
+
+DASHBOARD_URL="http://${ETH0_IP}:${GRAFANA_PORT}/d/sar-overview?from=${DATA_FROM}&to=${DATA_TO}"
+LOCAL_URL="http://127.0.0.1:${GRAFANA_PORT}/d/sar-overview?from=${DATA_FROM}&to=${DATA_TO}"
+DASHBOARD_URL_REL="http://${ETH0_IP}:${GRAFANA_PORT}/d/sar-overview?from=now-90d&to=now"
 
 cat <<EOF
 
 ============================================
- SAR Grafana is up
+ SAR Grafana is up (multi-host)
 ============================================
  Listen:     0.0.0.0:${GRAFANA_PORT}
  eth0 open:  ${ETH0_IP}:${GRAFANA_PORT}
  Dashboard:  ${DASHBOARD_URL}
  Local:      ${LOCAL_URL}
+ Alt (90d):  ${DASHBOARD_URL_REL}
  Login:      admin / saradmin123
+ Hosts:      ${HOSTS}
+ Data window:${DATA_FROM} -> ${DATA_TO}
 
- Filters: Host/CVM, Interface, Rx/Tx packets,
-          Rx/Tx kB, errors/drops, Disk, time range
+ Use Grafana filter: Host / CVM
 
  Stop with:
    cd ${ROOT} && docker compose down
