@@ -1,0 +1,6 @@
+data/preload/*.txt
+data/preload/**/*.txt
+!data/preload/.gitkeep
+.env
+*.zip
+__pycache__/

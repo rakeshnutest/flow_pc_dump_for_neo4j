@@ -1,0 +1,15 @@
+apiVersion: 1
+datasources:
+  - name: InfluxDB-SAR
+    type: influxdb
+    access: proxy
+    uid: influx-sar
+    url: http://influxdb:8086
+    isDefault: true
+    jsonData:
+      version: Flux
+      organization: sar
+      defaultBucket: sar
+      tlsSkipVerify: true
+    secureJsonData:
+      token: sar-admin-token-change-me
