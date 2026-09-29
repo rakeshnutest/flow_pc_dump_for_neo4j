@@ -177,8 +177,40 @@ for i in $(seq 1 30); do
   sleep 1
 done
 
-DASHBOARD_URL="http://${ETH0_IP}:${GRAFANA_PORT}/d/sar-overview"
-LOCAL_URL="http://127.0.0.1:${GRAFANA_PORT}/d/sar-overview"
+# Derive absolute data window from converted SAR headers (best link for users)
+DATA_FROM="$(python3 - <<'PY2'
+from pathlib import Path
+import re
+dates=[]
+for f in sorted(Path("data/preload").glob("sar*.txt")):
+    head=f.read_text(errors="ignore")[:400]
+    m=re.search(r"\)\s+(\d{4}-\d{2}-\d{2})", head)
+    if m: dates.append(m.group(1))
+if dates:
+    print(min(dates)+"T00:00:00.000Z")
+else:
+    print("now-90d")
+PY2
+)"
+DATA_TO="$(python3 - <<'PY2'
+from pathlib import Path
+import re
+dates=[]
+for f in sorted(Path("data/preload").glob("sar*.txt")):
+    head=f.read_text(errors="ignore")[:400]
+    m=re.search(r"\)\s+(\d{4}-\d{2}-\d{2})", head)
+    if m: dates.append(m.group(1))
+if dates:
+    # include end of last day
+    print(max(dates)+"T23:59:59.000Z")
+else:
+    print("now")
+PY2
+)"
+
+DASHBOARD_URL="http://${ETH0_IP}:${GRAFANA_PORT}/d/sar-overview?from=${DATA_FROM}&to=${DATA_TO}"
+LOCAL_URL="http://127.0.0.1:${GRAFANA_PORT}/d/sar-overview?from=${DATA_FROM}&to=${DATA_TO}"
+DASHBOARD_URL_REL="http://${ETH0_IP}:${GRAFANA_PORT}/d/sar-overview?from=now-90d&to=now"
 
 cat <<EOF
 
@@ -189,7 +221,9 @@ cat <<EOF
  eth0 open:  ${ETH0_IP}:${GRAFANA_PORT}
  Dashboard:  ${DASHBOARD_URL}
  Local:      ${LOCAL_URL}
+ Alt (90d):  ${DASHBOARD_URL_REL}
  Login:      admin / saradmin123
+ Data window:${DATA_FROM} -> ${DATA_TO}
 
  Filters: Host/CVM, Interface, Rx/Tx packets,
           Rx/Tx kB, errors/drops, Disk, time range
