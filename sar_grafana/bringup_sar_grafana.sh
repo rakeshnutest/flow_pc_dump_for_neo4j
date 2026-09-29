@@ -43,34 +43,33 @@ fi
 
 port_free() {
   local p="$1"
-  ! ss -ltn | awk '{print $4}' | grep -Eq "[:.]${p}$"
+  ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${p}$"
 }
 
+# Always choose the next free port starting from BASE (default 3000).
 pick_port() {
+  local base="${SAR_PORT_BASE:-3000}"
+  local max="${SAR_PORT_MAX:-3999}"
+  local p start
   if [[ -n "${REQ_PORT}" ]]; then
-    if ! port_free "${REQ_PORT}"; then
-      echo "ERROR: requested port ${REQ_PORT} is already in use" >&2
-      exit 1
-    fi
-    echo "${REQ_PORT}"
-    return
+    start="${REQ_PORT}"
+  else
+    start="${base}"
   fi
-  local p
-  for p in 3000 3100 3200 3300 3400 3500 3600 3700 3800 3900; do
+  for p in $(seq "${start}" "${max}"); do
     if port_free "${p}"; then
       echo "${p}"
       return
     fi
   done
-  # fall back to a high ephemeral-ish range
-  for p in $(seq 4000 4100); do
-    if port_free "${p}"; then
-      echo "${p}"
-      return
-    fi
-  done
-  echo "ERROR: could not find a free Grafana port" >&2
+  echo "ERROR: no free port in ${start}-${max}" >&2
   exit 1
+}
+
+stop_existing_stack() {
+  echo "==> Stopping any previous stack in ${ROOT} (and removing volumes for clean ingest)"
+  docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+  docker ps -aq --filter name=grafana-stack --filter name=sar-zip-viewer --filter name=sar_grafana 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1 || true
 }
 
 eth0_ip() {
@@ -84,6 +83,8 @@ eth0_ip() {
   fi
   echo "${ip}"
 }
+
+stop_existing_stack
 
 GRAFANA_PORT="$(pick_port)"
 ETH0_IP="$(eth0_ip)"
