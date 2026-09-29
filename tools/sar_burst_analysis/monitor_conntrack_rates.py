@@ -292,8 +292,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Netlink conntrack NEW/DESTROY rate monitor. "
-            "Logs per-second rates and lifetime averages "
-            "(total / seconds_since_start) to a hostname-suffixed CSV."
+            "Logs integer per-second NEW/DESTROY counts and lifetime averages "
+            "to a hostname-suffixed CSV."
         )
     )
     parser.add_argument(
@@ -429,25 +429,24 @@ def main() -> int:
 
             now = time.monotonic()
             if now >= next_sample:
-                # Catch up if we fell behind under load.
-                elapsed = now - (next_sample - interval)
-                scale = elapsed if elapsed > 0 else interval
-                new_rate = new_count / scale
-                destroy_rate = destroy_count / scale
-                # Lifetime averages since start.
+                # Per-second columns are raw event counts in this sample interval
+                # (integers), not floating-point rates.
+                new_per_sec = int(new_count)
+                destroy_per_sec = int(destroy_count)
+                # Lifetime averages since start (events / seconds).
                 life_elapsed = max(now - start_mono, interval)
                 avg_new = new_total / life_elapsed
                 avg_destroy = destroy_total / life_elapsed
 
                 ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 csv_fh.write(
-                    f"{ts},{new_rate:.3f},{destroy_rate:.3f},"
+                    f"{ts},{new_per_sec},{destroy_per_sec},"
                     f"{avg_new:.3f},{avg_destroy:.3f}\n"
                 )
                 if args.do_print or args.print_details:
                     extra = f"  enobuf={enobuf_count}" if enobuf_count else ""
                     print(
-                        f"{ts}  new/s={new_rate:.1f}  destroy/s={destroy_rate:.1f}  "
+                        f"{ts}  new/s={new_per_sec}  destroy/s={destroy_per_sec}  "
                         f"avg_new/s={avg_new:.1f}  avg_destroy/s={avg_destroy:.1f}"
                         f"{extra}"
                     )
