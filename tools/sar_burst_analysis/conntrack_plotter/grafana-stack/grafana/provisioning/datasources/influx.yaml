@@ -1,0 +1,15 @@
+apiVersion: 1
+datasources:
+  - name: InfluxDB-Conntrack
+    type: influxdb
+    access: proxy
+    uid: influx-conntrack
+    url: http://influxdb:8086
+    isDefault: true
+    jsonData:
+      version: Flux
+      organization: conntrack
+      defaultBucket: conntrack
+      tlsSkipVerify: true
+    secureJsonData:
+      token: conntrack-admin-token

@@ -12,6 +12,7 @@ synthetic UDP flow bursts to stress IPFIX / conntrack (new 5-tuple per packet).
 | `analyze_udp_conntrack_pattern.sh` | AHV OVS conntrack dump: protocol mix, top UDP ports, NetBIOS 137 zones, diurnal estimate |
 | `monitor_conntrack_rates.py` | Netlink NEW/DESTROY rate CSV logger (`--output-dir`, host-IP suffix; default 24h) |
 | `deploy_conntrack_monitor_all_hosts.sh` | From CVM: generate starter, short `hostssh` + scp to all `hostips`, start under `/root/number_of_cps` |
+| `conntrack_plotter/` | Docker dashboard: map + plot `time,new,destroy,avg_new,avg_destroy` for all host CSVs |
 | `simulate_ipfix_flow_burst.py` | High-CPS UDP to one dest; new socket/sport each packet |
 | `simulate_netbios_multidst.py` | NetBIOS-ish UDP cycling multiple dests (default UDP/137) |
 
@@ -74,6 +75,21 @@ python3 monitor_conntrack_rates.py --print --output-dir /var/log/conntrack_rates
 ```
 
 Optional `--print-details` prints each NEW/DESTROY 5-tuple (very verbose under load).
+
+### Plot all host CSVs (Grafana board)
+
+```bash
+# on CVM — collect CSVs
+bash collect_conntrack_csvs.sh ./conntrack_csv_bundle
+
+# laptop — folder in, every CSV = one Grafana line (legend = filename)
+cd conntrack_plotter
+./bringup_conntrack.sh /path/to/conntrack_csv_bundle
+# open printed URL (admin / conntrack123)
+# panels: new/s, destroy/s, avg_new/s, avg_destroy/s
+```
+
+Optional Plotly UI: `./bringup_conntrack_plot.sh /path/to/bundle 8088`.
 
 ## Correlate with AHV IPFIX exporter-cmd
 

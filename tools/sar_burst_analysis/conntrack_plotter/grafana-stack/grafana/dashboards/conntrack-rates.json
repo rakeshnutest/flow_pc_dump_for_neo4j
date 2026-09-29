@@ -1,0 +1,260 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "description": "Conntrack NEW/DESTROY rates from monitor_conntrack_rates.py CSVs (all AHV hosts).",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Hosts in view",
+      "id": 1,
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influx-conntrack" },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influx-conntrack" },
+          "query": "import \"influxdata/influxdb/schema\"\nschema.tagValues(bucket: \"conntrack\", tag: \"host\")\n  |> filter(fn: (r) => r._value =~ /${host:regex}/)\n  |> count()"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Peak new / s (selected)",
+      "id": 2,
+      "gridPos": { "h": 4, "w": 5, "x": 4, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influx-conntrack" },
+      "fieldConfig": {
+        "defaults": { "unit": "cps", "decimals": 0 },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["max"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influx-conntrack" },
+          "query": "from(bucket: \"conntrack\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"conntrack_rates\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r._field == \"new_per_sec\")\n  |> max()\n  |> group()\n  |> max(column: \"_value\")"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Peak destroy / s (selected)",
+      "id": 3,
+      "gridPos": { "h": 4, "w": 5, "x": 9, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influx-conntrack" },
+      "fieldConfig": {
+        "defaults": { "unit": "cps", "decimals": 0 },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["max"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influx-conntrack" },
+          "query": "from(bucket: \"conntrack\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"conntrack_rates\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r._field == \"destroy_per_sec\")\n  |> max()\n  |> group()\n  |> max(column: \"_value\")"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Latest avg_new / s (max host)",
+      "id": 4,
+      "gridPos": { "h": 4, "w": 5, "x": 14, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influx-conntrack" },
+      "fieldConfig": {
+        "defaults": { "unit": "cps", "decimals": 1 },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influx-conntrack" },
+          "query": "from(bucket: \"conntrack\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"conntrack_rates\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r._field == \"avg_new_per_sec\")\n  |> last()\n  |> group()\n  |> max(column: \"_value\")"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "new / s (new_per_sec)",
+      "id": 10,
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 4 },
+      "datasource": { "type": "influxdb", "uid": "influx-conntrack" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max", "lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influx-conntrack" },
+          "query": "from(bucket: \"conntrack\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"conntrack_rates\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r._field == \"new_per_sec\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "destroy / s (destroy_per_sec)",
+      "id": 11,
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 13 },
+      "datasource": { "type": "influxdb", "uid": "influx-conntrack" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max", "lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influx-conntrack" },
+          "query": "from(bucket: \"conntrack\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"conntrack_rates\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r._field == \"destroy_per_sec\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "avg_new / s (lifetime average)",
+      "id": 12,
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 22 },
+      "datasource": { "type": "influxdb", "uid": "influx-conntrack" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "calcs": ["lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influx-conntrack" },
+          "query": "from(bucket: \"conntrack\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"conntrack_rates\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r._field == \"avg_new_per_sec\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "avg_destroy / s (lifetime average)",
+      "id": 13,
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 22 },
+      "datasource": { "type": "influxdb", "uid": "influx-conntrack" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "calcs": ["lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influx-conntrack" },
+          "query": "from(bucket: \"conntrack\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"conntrack_rates\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r._field == \"avg_destroy_per_sec\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
+        }
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["conntrack", "cps", "ahv"],
+  "templating": {
+    "list": [
+      {
+        "name": "host",
+        "type": "query",
+        "label": "File (line)",
+        "datasource": { "type": "influxdb", "uid": "influx-conntrack" },
+        "definition": "import \"influxdata/influxdb/schema\"\nschema.tagValues(bucket: \"conntrack\", tag: \"host\")",
+        "query": "import \"influxdata/influxdb/schema\"\nschema.tagValues(bucket: \"conntrack\", tag: \"host\")",
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": ["$__all"],
+          "selected": true
+        },
+        "refresh": 2,
+        "sort": 1
+      }
+    ]
+  },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "title": "Conntrack NEW / DESTROY rates",
+  "uid": "conntrack-rates",
+  "version": 1
+}
