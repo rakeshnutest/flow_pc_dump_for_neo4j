@@ -90,7 +90,30 @@ data/preload/sar02.txt
 
 Each file is normal `sar -A` style text (CPU, memory, IFACE rx/tx/errors, disk, …).
 
-## 2. Bring up Docker
+## 2. Bring up with one script (recommended)
+
+```bash
+cd sar_grafana
+chmod +x bringup_sar_grafana.sh
+./bringup_sar_grafana.sh /path/to/PE.zip
+# optional explicit port:
+# ./bringup_sar_grafana.sh /path/to/PE.zip 3100
+```
+
+The script:
+1. Extracts/converts SAR day files from the zip into `data/preload/`
+2. Starts Docker on **0.0.0.0**
+3. Prints **eth0 IP:port** and dashboard URL
+
+Example output:
+
+```text
+ Listen:     0.0.0.0:3100
+ eth0 open:  10.111.60.97:3100
+ Dashboard:  http://10.111.60.97:3100/d/sar-overview
+```
+
+## 3. Manual Docker bring-up
 
 ```bash
 cd sar_grafana
