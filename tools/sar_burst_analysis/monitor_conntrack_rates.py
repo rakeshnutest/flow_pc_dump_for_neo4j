@@ -8,9 +8,9 @@ emit rates (and parsed 5-tuples) to stdout.
 
 CSV paths always include a hostname suffix so allssh runs from multiple AHVs
 do not collide. Default directory is /tmp; override with --output-dir.
-"""
 
-from __future__ import annotations
+Compatible with Python 3.6+ (AHV host python3).
+"""
 
 import argparse
 import errno
@@ -23,7 +23,7 @@ import struct
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Dict, Optional, Tuple
 
 # --- netlink / nfnetlink / ctnetlink constants (linux/netfilter) ---
 NETLINK_NETFILTER = 12
@@ -128,9 +128,10 @@ def _align(n: int) -> int:
     return (n + 3) & ~3
 
 
-def parse_nlattrs(buf: bytes, offset: int, end: int) -> dict[int, bytes]:
+def parse_nlattrs(buf, offset, end):
+    # type: (bytes, int, int) -> Dict[int, bytes]
     """Parse a flat list of netlink attributes into {type: raw_value}."""
-    attrs: dict[int, bytes] = {}
+    attrs = {}  # type: Dict[int, bytes]
     while offset + 4 <= end:
         alen, atype = struct.unpack_from("=HH", buf, offset)
         if alen < 4 or offset + alen > end:
@@ -140,9 +141,10 @@ def parse_nlattrs(buf: bytes, offset: int, end: int) -> dict[int, bytes]:
     return attrs
 
 
-def _parse_tuple(raw: bytes) -> dict[str, Any]:
+def _parse_tuple(raw):
+    # type: (bytes) -> Dict[str, Any]
     """Parse a nested CTA_TUPLE_* attribute into a flow dict."""
-    info: dict[str, Any] = {}
+    info = {}  # type: Dict[str, Any]
     nested = parse_nlattrs(raw, 0, len(raw))
     ip_raw = nested.get(CTA_TUPLE_IP)
     if ip_raw:
@@ -175,7 +177,8 @@ def _parse_tuple(raw: bytes) -> dict[str, Any]:
     return info
 
 
-def format_flow(tup: dict[str, Any]) -> str:
+def format_flow(tup):
+    # type: (Dict[str, Any]) -> str
     proto = tup.get("proto", "?")
     src = tup.get("src", "?")
     dst = tup.get("dst", "?")
@@ -189,7 +192,8 @@ def format_flow(tup: dict[str, Any]) -> str:
     return f"{proto} {src} -> {dst}"
 
 
-def parse_ct_message(buf: bytes, offset: int, msglen: int) -> tuple[str, Optional[dict[str, Any]]]:
+def parse_ct_message(buf, offset, msglen):
+    # type: (bytes, int, int) -> Tuple[str, Optional[Dict[str, Any]]]
     """Return (event_name, orig_tuple_or_None) for one nlmsg."""
     # nlmsghdr: length(4) type(2) flags(2) seq(4) pid(4) = 16
     if msglen < 16:
@@ -272,7 +276,8 @@ def open_csv(path: str):
     return fh
 
 
-def resolve_output_path(output: str | None, output_dir: str, hostname: str) -> str:
+def resolve_output_path(output, output_dir, hostname):
+    # type: (Optional[str], str, str) -> str
     """Build CSV path under output_dir (default /tmp), always hostname-suffixed.
 
     If --output is a full file path, that path is used (still hostname-suffixed).
