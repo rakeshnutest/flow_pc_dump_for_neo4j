@@ -1,0 +1,17 @@
+services:
+  conntrack-plot:
+    build: .
+    image: conntrack-rates-plotter:latest
+    ports:
+      - "${CONNTRACK_PLOT_BIND:-0.0.0.0:8088}:8080"
+    environment:
+      DATA_DIR: /data
+      OUT_DIR: /out
+      MAPPING_PATH: /data/mapping.json
+      MAX_POINTS: "${MAX_POINTS:-4000}"
+      PORT: "8080"
+    volumes:
+      # Drop all conntrack_rates_<host>.csv here (60–90 files)
+      - ${DATA_DIR:-./sample_data}:/data:ro
+      - ${OUT_DIR:-./out}:/out
+    restart: unless-stopped

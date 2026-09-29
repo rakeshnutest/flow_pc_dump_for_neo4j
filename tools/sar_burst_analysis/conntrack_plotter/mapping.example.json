@@ -1,0 +1,7 @@
+{
+  "hosts": {
+    "zadkiel04-1": "conntrack_rates_zadkiel04-1.csv",
+    "flashfire01-2": "conntrack_rates_flashfire01-2.csv",
+    "spymaster01-3": "conntrack_rates_spymaster01-3.csv"
+  }
+}
