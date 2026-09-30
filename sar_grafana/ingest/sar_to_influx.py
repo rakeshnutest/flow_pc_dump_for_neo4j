@@ -222,10 +222,9 @@ def lines_from_text(text: str, source: str) -> Iterable[str]:
         if not fields:
             continue
 
-        tags = (
-            f"host={esc_tag(hostname)},role={esc_tag(role)},"
-            f"source={esc_tag(source)}"
-        )
+        # Identity tags only — do NOT tag by bundle/filename (`source`).
+        # Same host+role+key+timestamp across PE zips → one series (Influx upsert).
+        tags = f"host={esc_tag(hostname)},role={esc_tag(role)}"
         if key_field != "host":
             tags += f",{key_field}={esc_tag(key)}"
         yield f"{section},{tags} {','.join(fields)} {ns}"
@@ -244,6 +243,7 @@ def lines_from_ping(
     kind: str = "unknown",
 ) -> Iterable[str]:
     """Parse Nutanix sysstats ping_{gateway,all,remotes}.INFO text."""
+    del source  # filename is not part of series identity
     epoch: Optional[int] = None
     for raw in text.splitlines():
         line = raw.rstrip()
@@ -271,8 +271,7 @@ def lines_from_ping(
         ns = int(epoch) * 1_000_000_000
         tags = (
             f"host={esc_tag(host)},role={esc_tag(role)},"
-            f"ping_kind={esc_tag(kind)},target={esc_tag(target)},"
-            f"source={esc_tag(source)}"
+            f"ping_kind={esc_tag(kind)},target={esc_tag(target)}"
         )
         if val.lower() == "unreachable":
             yield f"ping,{tags} latency_ms=-1,drop=1i {ns}"
@@ -281,6 +280,22 @@ def lines_from_ping(
         if not mm:
             continue
         yield f"ping,{tags} latency_ms={mm.group(1)},drop=0i {ns}"
+
+
+def point_identity(lp: str) -> str:
+    """Stable key: measurement + tags + timestamp (ignore field values).
+
+    Used so the same sample repeated across PE bundles / re-ingests is written
+    once. InfluxDB also upserts on this key when tags match.
+    """
+    try:
+        meta, _fields_and_ts = lp.split(" ", 1)
+        # line protocol: meas,tags fieldset timestamp
+        parts = lp.rsplit(" ", 1)
+        ts = parts[-1] if len(parts) == 2 else ""
+        return f"{meta}|{ts}"
+    except Exception:
+        return lp
 
 
 def write_batch(lines: List[str]) -> None:
@@ -312,13 +327,14 @@ def ingest_dir(root: Path) -> None:
         + sorted(root.glob("*__sar*.txt"))
         + sorted(root.glob("sar*.txt"))
     )
-    # de-dupe while preserving order
-    seen = set()
+    # de-dupe file paths while preserving order
+    seen_files: set = set()
     uniq = []
     for f in files:
-        if f.resolve() in seen:
+        key = f.resolve()
+        if key in seen_files:
             continue
-        seen.add(f.resolve())
+        seen_files.add(key)
         uniq.append(f)
     files = uniq
     if not files:
@@ -330,10 +346,14 @@ def ingest_dir(root: Path) -> None:
     print(f"Found {len(files)} SAR/ping files under {root}", flush=True)
     hosts = set()
     total = 0
+    skipped_dup = 0
     batch: List[str] = []
+    # Cross-file / cross-bundle uniqueness for this ingest run
+    seen_points: set = set()
     for path in files:
         text = path.read_text(errors="ignore")
         n = 0
+        n_dup = 0
         if "__ping_" in path.name.lower() or path.name.lower().startswith("ping_"):
             host = "unknown"
             role = "cvm"
@@ -362,6 +382,12 @@ def ingest_dir(root: Path) -> None:
             point_iter = lines_from_text(text, path.name)
 
         for lp in point_iter:
+            ident = point_identity(lp)
+            if ident in seen_points:
+                n_dup += 1
+                skipped_dup += 1
+                continue
+            seen_points.add(ident)
             if "host=" in lp:
                 try:
                     hosts.add(lp.split("host=", 1)[1].split(",", 1)[0].split(" ", 1)[0])
@@ -373,12 +399,16 @@ def ingest_dir(root: Path) -> None:
                 write_batch(batch)
                 total += len(batch)
                 batch = []
-        print(f"  parsed {path.name}: {n} points", flush=True)
+        msg = f"  parsed {path.name}: {n} points"
+        if n_dup:
+            msg += f" (skipped {n_dup} duplicate samples)"
+        print(msg, flush=True)
     if batch:
         write_batch(batch)
         total += len(batch)
     print(
-        f"Ingested {total} points into bucket={INFLUX_BUCKET}; hosts={sorted(hosts)}",
+        f"Ingested {total} unique points into bucket={INFLUX_BUCKET}; "
+        f"skipped_duplicates={skipped_dup}; hosts={sorted(hosts)}",
         flush=True,
     )
 
