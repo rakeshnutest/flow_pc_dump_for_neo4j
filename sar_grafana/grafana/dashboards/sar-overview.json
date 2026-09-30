@@ -30,6 +30,11 @@
       "options": {
         "mode": "markdown",
         "content": "**Time: 2026-08-09 \u2192 2026-09-07 (UTC).** [Open fixed range](/d/sar-overview?from=2026-08-09T00:00:00.000Z&to=2026-09-07T23:59:59.000Z&var-host=All&var-iface=All)\n\n**Left = CVM (~29 SAR days).** **Right = AHV (Sep 5\u20137 only in PE zip).** Load/CPU/Net are split so AHV high values do not hide CVM series."
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        }
       }
     },
     {
@@ -49,7 +54,8 @@
       "fieldConfig": {
         "defaults": {
           "unit": "percent",
-          "min": 0
+          "min": 0,
+          "custom": {}
         },
         "overrides": []
       },
@@ -62,7 +68,8 @@
           },
           "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"sar_cpu\")\n  |> filter(fn: (r) => r.role == \"cvm\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r.cpu == \"all\")\n  |> filter(fn: (r) => r._field == \"pct_usr\" or r._field == \"pct_sys\" or r._field == \"pct_iowait\" or r._field == \"pct_idle\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
         }
-      ]
+      ],
+      "options": {}
     },
     {
       "type": "timeseries",
@@ -81,7 +88,8 @@
       "fieldConfig": {
         "defaults": {
           "unit": "percent",
-          "min": 0
+          "min": 0,
+          "custom": {}
         },
         "overrides": []
       },
@@ -94,7 +102,8 @@
           },
           "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"sar_cpu\")\n  |> filter(fn: (r) => r.role == \"ahv\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r.cpu == \"all\")\n  |> filter(fn: (r) => r._field == \"pct_usr\" or r._field == \"pct_sys\" or r._field == \"pct_iowait\" or r._field == \"pct_idle\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
         }
-      ]
+      ],
+      "options": {}
     },
     {
       "type": "timeseries",
@@ -111,7 +120,9 @@
       },
       "maxDataPoints": 3000,
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "custom": {}
+        },
         "overrides": []
       },
       "targets": [
@@ -123,7 +134,8 @@
           },
           "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"sar_load\")\n  |> filter(fn: (r) => r.role == \"cvm\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r._field == \"ldavg_1\" or r._field == \"ldavg_5\" or r._field == \"ldavg_15\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
         }
-      ]
+      ],
+      "options": {}
     },
     {
       "type": "timeseries",
@@ -140,7 +152,9 @@
       },
       "maxDataPoints": 3000,
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "custom": {}
+        },
         "overrides": []
       },
       "targets": [
@@ -152,7 +166,8 @@
           },
           "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"sar_load\")\n  |> filter(fn: (r) => r.role == \"ahv\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r._field == \"ldavg_1\" or r._field == \"ldavg_5\" or r._field == \"ldavg_15\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
         }
-      ]
+      ],
+      "options": {}
     },
     {
       "type": "timeseries",
@@ -169,7 +184,9 @@
       },
       "maxDataPoints": 3000,
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "custom": {}
+        },
         "overrides": []
       },
       "targets": [
@@ -181,7 +198,8 @@
           },
           "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"sar_load\")\n  |> filter(fn: (r) => r.role == \"cvm\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r._field == \"runq_sz\" or r._field == \"blocked\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
         }
-      ]
+      ],
+      "options": {}
     },
     {
       "type": "timeseries",
@@ -198,7 +216,9 @@
       },
       "maxDataPoints": 3000,
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "custom": {}
+        },
         "overrides": []
       },
       "targets": [
@@ -210,7 +230,8 @@
           },
           "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"sar_load\")\n  |> filter(fn: (r) => r.role == \"ahv\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r._field == \"runq_sz\" or r._field == \"blocked\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
         }
-      ]
+      ],
+      "options": {}
     },
     {
       "type": "timeseries",
@@ -229,7 +250,8 @@
       "fieldConfig": {
         "defaults": {
           "unit": "percent",
-          "min": 0
+          "min": 0,
+          "custom": {}
         },
         "overrides": []
       },
@@ -242,7 +264,8 @@
           },
           "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"sar_mem\")\n  |> filter(fn: (r) => r.role == \"cvm\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r._field == \"pct_memused\" or r._field == \"pct_commit\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
         }
-      ]
+      ],
+      "options": {}
     },
     {
       "type": "timeseries",
@@ -261,7 +284,8 @@
       "fieldConfig": {
         "defaults": {
           "unit": "percent",
-          "min": 0
+          "min": 0,
+          "custom": {}
         },
         "overrides": []
       },
@@ -274,11 +298,12 @@
           },
           "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"sar_mem\")\n  |> filter(fn: (r) => r.role == \"ahv\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r._field == \"pct_memused\" or r._field == \"pct_commit\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
         }
-      ]
+      ],
+      "options": {}
     },
     {
       "type": "timeseries",
-      "title": "CVM Network Rx/Tx packets \u2014 full ~29 days (eth*)",
+      "title": "CVM Network Rx/Tx packets \u2014 full ~29 days (all ifaces incl. taps)",
       "gridPos": {
         "h": 9,
         "w": 12,
@@ -289,11 +314,12 @@
         "type": "influxdb",
         "uid": "influx-sar"
       },
-      "maxDataPoints": 3000,
+      "maxDataPoints": 2000,
       "fieldConfig": {
         "defaults": {
           "unit": "pps",
-          "min": 0
+          "min": 0,
+          "custom": {}
         },
         "overrides": []
       },
@@ -306,11 +332,12 @@
           },
           "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"sar_net_dev\")\n  |> filter(fn: (r) => r.role == \"cvm\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r.iface =~ /${iface:regex}/)\n  |> filter(fn: (r) => r._field == \"rxpck_s\" or r._field == \"txpck_s\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
         }
-      ]
+      ],
+      "options": {}
     },
     {
       "type": "timeseries",
-      "title": "AHV Network Rx/Tx packets \u2014 Sep 5\u20137 (eth*)",
+      "title": "AHV Network Rx/Tx packets \u2014 Sep 5\u20137 (all ifaces incl. taps)",
       "gridPos": {
         "h": 9,
         "w": 12,
@@ -321,11 +348,12 @@
         "type": "influxdb",
         "uid": "influx-sar"
       },
-      "maxDataPoints": 3000,
+      "maxDataPoints": 2000,
       "fieldConfig": {
         "defaults": {
           "unit": "pps",
-          "min": 0
+          "min": 0,
+          "custom": {}
         },
         "overrides": []
       },
@@ -338,11 +366,12 @@
           },
           "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"sar_net_dev\")\n  |> filter(fn: (r) => r.role == \"ahv\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r.iface =~ /${iface:regex}/)\n  |> filter(fn: (r) => r._field == \"rxpck_s\" or r._field == \"txpck_s\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
         }
-      ]
+      ],
+      "options": {}
     },
     {
       "type": "timeseries",
-      "title": "CVM Network Rx/Tx kB/s \u2014 full ~29 days (eth*)",
+      "title": "CVM Network Rx/Tx kB/s \u2014 full ~29 days (all ifaces incl. taps)",
       "gridPos": {
         "h": 9,
         "w": 12,
@@ -353,11 +382,12 @@
         "type": "influxdb",
         "uid": "influx-sar"
       },
-      "maxDataPoints": 3000,
+      "maxDataPoints": 2000,
       "fieldConfig": {
         "defaults": {
           "unit": "KBs",
-          "min": 0
+          "min": 0,
+          "custom": {}
         },
         "overrides": []
       },
@@ -370,11 +400,12 @@
           },
           "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"sar_net_dev\")\n  |> filter(fn: (r) => r.role == \"cvm\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r.iface =~ /${iface:regex}/)\n  |> filter(fn: (r) => r._field == \"rxkB_s\" or r._field == \"txkB_s\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
         }
-      ]
+      ],
+      "options": {}
     },
     {
       "type": "timeseries",
-      "title": "AHV Network Rx/Tx kB/s \u2014 Sep 5\u20137 (eth*)",
+      "title": "AHV Network Rx/Tx kB/s \u2014 Sep 5\u20137 (all ifaces incl. taps)",
       "gridPos": {
         "h": 9,
         "w": 12,
@@ -385,11 +416,12 @@
         "type": "influxdb",
         "uid": "influx-sar"
       },
-      "maxDataPoints": 3000,
+      "maxDataPoints": 2000,
       "fieldConfig": {
         "defaults": {
           "unit": "KBs",
-          "min": 0
+          "min": 0,
+          "custom": {}
         },
         "overrides": []
       },
@@ -402,11 +434,12 @@
           },
           "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"sar_net_dev\")\n  |> filter(fn: (r) => r.role == \"ahv\")\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r.iface =~ /${iface:regex}/)\n  |> filter(fn: (r) => r._field == \"rxkB_s\" or r._field == \"txkB_s\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
         }
-      ]
+      ],
+      "options": {}
     },
     {
       "type": "timeseries",
-      "title": "Network errors/drops \u2014 CVM+AHV (eth*)",
+      "title": "Network errors/drops \u2014 CVM+AHV (all ifaces incl. taps)",
       "gridPos": {
         "h": 8,
         "w": 24,
@@ -417,9 +450,11 @@
         "type": "influxdb",
         "uid": "influx-sar"
       },
-      "maxDataPoints": 3000,
+      "maxDataPoints": 2000,
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "custom": {}
+        },
         "overrides": []
       },
       "targets": [
@@ -431,7 +466,8 @@
           },
           "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"sar_net_edev\")\n  |> filter(fn: (r) => r.role =~ /${role:regex}/)\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r.iface =~ /${iface:regex}/)\n  |> filter(fn: (r) => r._field == \"rxerr_s\" or r._field == \"txerr_s\" or r._field == \"rxdrop_s\" or r._field == \"txdrop_s\" or r._field == \"coll_s\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
         }
-      ]
+      ],
+      "options": {}
     },
     {
       "type": "timeseries",
@@ -448,7 +484,9 @@
       },
       "maxDataPoints": 3000,
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "custom": {}
+        },
         "overrides": []
       },
       "targets": [
@@ -460,7 +498,8 @@
           },
           "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"sar_disk\")\n  |> filter(fn: (r) => r.role =~ /${role:regex}/)\n  |> filter(fn: (r) => r.host =~ /${host:regex}/)\n  |> filter(fn: (r) => r.dev =~ /${disk:regex}/)\n  |> filter(fn: (r) => r._field == \"tps\" or r._field == \"await\" or r._field == \"pct_util\" or r._field == \"rkB_s\" or r._field == \"wkB_s\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
         }
-      ]
+      ],
+      "options": {}
     },
     {
       "type": "text",
@@ -473,7 +512,12 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "**CVM:** 29 day files Aug 9\u2192Sep 6 (`sar07`/`sar08` absent in zip). **AHV:** only `sa05\u201307` = Sep 5\u20137.\n\nInterface **All** = `eth*`. Pick host to focus one CVM/AHV."
+        "content": "**CVM:** 29 day files Aug 9\u2192Sep 6 (`sar07`/`sar08` absent in zip). **AHV:** only `sa05\u201307` = Sep 5\u20137.\n\nInterface **All** includes eth* and all taps. Pick host to focus one CVM/AHV."
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {}
+        }
       }
     },
     {
@@ -492,7 +536,8 @@
       "fieldConfig": {
         "defaults": {
           "unit": "ms",
-          "min": 0
+          "min": 0,
+          "custom": {}
         },
         "overrides": []
       },
@@ -505,7 +550,8 @@
           },
           "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"ping\")\n  |> filter(fn: (r) => r.host =~ /${ping_host:regex}/)\n  |> filter(fn: (r) => r.ping_kind =~ /${ping_kind:regex}/)\n  |> filter(fn: (r) => r.target =~ /${ping_target:regex}/)\n  |> filter(fn: (r) => r._field == \"latency_ms\")\n  |> filter(fn: (r) => r._value >= 0.0)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> yield(name: \"mean\")"
         }
-      ]
+      ],
+      "options": {}
     },
     {
       "type": "timeseries",
@@ -523,7 +569,8 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "min": 0
+          "min": 0,
+          "custom": {}
         },
         "overrides": []
       },
@@ -536,7 +583,8 @@
           },
           "query": "from(bucket: \"sar\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"ping\")\n  |> filter(fn: (r) => r.host =~ /${ping_host:regex}/)\n  |> filter(fn: (r) => r.ping_kind =~ /${ping_kind:regex}/)\n  |> filter(fn: (r) => r.target =~ /${ping_target:regex}/)\n  |> filter(fn: (r) => r._field == \"drop\")\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> yield(name: \"sum\")"
         }
-      ]
+      ],
+      "options": {}
     }
   ],
   "schemaVersion": 39,
@@ -612,9 +660,10 @@
         "query": "import \"influxdata/influxdb/schema\"\nschema.tagValues(bucket: \"sar\", tag: \"iface\")",
         "multi": true,
         "includeAll": true,
-        "allValue": "^eth[0-9]+$",
         "current": {
-          "text": "All",
+          "text": [
+            "All"
+          ],
           "value": [
             "$__all"
           ],
@@ -828,7 +877,7 @@
     ]
   },
   "time": {
-    "from": "2026-08-09T00:00:00.000Z",
+    "from": "2026-08-01T00:00:00.000Z",
     "to": "2026-09-07T23:59:59.000Z"
   },
   "timezone": "utc",
