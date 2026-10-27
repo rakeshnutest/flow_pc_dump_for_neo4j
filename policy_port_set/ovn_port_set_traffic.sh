@@ -55,6 +55,10 @@ Three arguments, source NIC, destination NIC, and destination port:
     SOURCE ROWS   outgoing ACLs of the sender
     DEST ROWS     incoming ACLs of the receiver
     VERDICT       allowed or denied
+  Logic for each direction:
+    source NIC outbound rules only
+    destination NIC inbound rules only
+    a drop on either side denies the packet
   Each row shows the port group, MATCH, and the service ports.
   --proto defaults to tcp. udp and icmp are also accepted.
 
@@ -661,6 +665,8 @@ print_verdict_block() {
     echo "  $flow    ${PROTO}/${DST_PORT}"
     echo "  from $from_nic  IP ${from_ip:-unknown}"
     echo "  to   $to_nic  IP ${to_ip:-unknown}"
+    echo "  logic: source NIC outbound rules only; destination NIC inbound rules only"
+    echo "  a drop on either side denies the packet"
     echo ""
     print_built_table
     echo ""
@@ -702,11 +708,21 @@ print_conclusion() {
         [ "$src" = "$DST_NIC" ] && continue
         src_ip=$(nic_ip "$src")
         flow="$src -> $DST_NIC"
+        echo "  LOGIC  $flow"
+        echo "  source NIC outbound rules only"
+        echo "  destination NIC inbound rules only"
+        echo "  a drop on either side denies the packet"
+        echo ""
         : > "$WORK/summary.tsv"
         print_side_rows "SOURCE ROWS" "$src" outbound "$dst_ip" "DESTINATION" "$flow"
         print_side_rows "DEST ROWS" "$DST_NIC" inbound "$src_ip" "SOURCE" "$flow"
         print_verdict_block "$src" "$src_ip" "$DST_NIC" "$dst_ip" "$flow"
         flow="$DST_NIC -> $src"
+        echo "  LOGIC  $flow"
+        echo "  source NIC outbound rules only"
+        echo "  destination NIC inbound rules only"
+        echo "  a drop on either side denies the packet"
+        echo ""
         : > "$WORK/summary.tsv"
         print_side_rows "SOURCE ROWS" "$DST_NIC" outbound "$src_ip" "DESTINATION" "$flow"
         print_side_rows "DEST ROWS" "$src" inbound "$dst_ip" "SOURCE" "$flow"
