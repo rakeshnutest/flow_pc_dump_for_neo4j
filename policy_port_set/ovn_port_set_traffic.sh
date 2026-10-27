@@ -6,9 +6,12 @@
 # `mspctl cluster kubeconfig flow`. Inside the anc-ovn pod the same file
 # talks to the local Northbound socket.
 #
-#   bash ovn_port_set_traffic.sh <nic-uuid> [nic-uuid ...]
+#   bash ovn_port_set_traffic.sh <src-nic-uuid>
+#   bash ovn_port_set_traffic.sh <src-nic-uuid> <dst-nic-uuid> <dst-port> [--proto tcp|udp]
 #
 # The NIC UUID is the id in the logical switch port name port_<uuid>.
+# One NIC prints its port sets and ACLs. Source, destination, and port
+# also decide allow or deny for both directions.
 
 if [ -z "${BASH_VERSION:-}" ]; then
     echo "ERROR: run with bash" >&2
@@ -23,19 +26,58 @@ SMSP_UUID=""
 KUBECONFIG_FILE=""
 OVN_NS=""
 OVN_POD=""
+DST_NIC=""
+DST_PORT=""
+PROTO="tcp"
 
 die() {
     echo "ERROR: $*" >&2
     exit 1
 }
 
-usage() {
-    cat >&2 <<EOF
-Usage: $(basename "$0") <nic-uuid> [nic-uuid ...]
+help_text() {
+    cat <<EOF
+Usage:
+  $(basename "$0") <src-nic-uuid>
+  $(basename "$0") <src-nic-uuid> <dst-nic-uuid> <dst-port>
+  $(basename "$0") -h
 
-Find every port set that contains the NIC, then print inbound and outbound ACLs.
-Works on CMSP and SMSP when run on the Prism Central VM.
+Run this on the Prism Central VM. It works on CMSP and SMSP. The script
+finds kubectl and the anc-ovn pod, then reads OVN port sets and ACLs.
+
+One argument, the source NIC:
+  Prints the NIC, its port sets, and a LEGEND of each port group and its IPs.
+  Then the inbound and outbound ACL rows, including the port group and the
+  service ports.
+
+Three arguments, source NIC, destination NIC, and destination port:
+  Prints the same LEGEND, then for both directions:
+    SOURCE ROWS   outgoing ACLs of the sender
+    DEST ROWS     incoming ACLs of the receiver
+    VERDICT       allowed or denied
+  Logic for each direction:
+    source NIC outbound rules only
+    destination NIC inbound rules only
+    a drop on either side denies the packet
+  Each row shows the port group, MATCH, and the service ports.
+  --proto defaults to tcp. udp and icmp are also accepted.
+
+Other forms:
+  --dst <dst-nic-uuid> --port <dst-port>    same as the three arguments
+  --proto tcp|udp|icmp
+  -h, --help                                 this help
+
+Examples:
+  bash $(basename "$0") fa9b2b43-76c3-4456-958a-b7e31fbd64c8
+  bash $(basename "$0") fa9b2b43-76c3-4456-958a-b7e31fbd64c8 \\
+      017ce39e-a535-401f-9149-63ab2b831a5b 22
+  bash $(basename "$0") fa9b2b43-76c3-4456-958a-b7e31fbd64c8 \\
+      017ce39e-a535-401f-9149-63ab2b831a5b 22 --proto udp
 EOF
+}
+
+usage() {
+    help_text >&2
     exit 2
 }
 
@@ -69,21 +111,23 @@ pg_to_uuid() {
 }
 
 declare -A AS_CACHE=()
+declare -A LSP_IPS=()
 
-shorten_ips() {
-    local ips="$1" n short
-    case "$ips" in
-        *,*)
-            n=$(printf '%s' "$ips" | awk -F, '{print NF}')
-            short=$(printf '%s' "$ips" | cut -d, -f1-6)
-            if [ "$n" -gt 6 ]; then
-                printf '%s,... (%s addresses)' "$short" "$n"
-            else
-                printf '%s' "$ips"
-            fi
-            ;;
-        *) printf '%s' "$ips" ;;
-    esac
+# Turn an OVN address-set or port-address blob into a comma-separated IP list.
+format_ip_list() {
+    # Pull every IPv4 or IPv4 CIDR out of an address set, port address, or
+    # neutron:cidrs string. MAC addresses are ignored.
+    printf '%s' "$1" | awk '
+    {
+        s = $0
+        out = ""
+        while (match(s, /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?/)) {
+            tok = substr(s, RSTART, RLENGTH)
+            out = out (out ? ", " : "") tok
+            s = substr(s, RSTART + RLENGTH)
+        }
+        print out
+    }'
 }
 
 resolve_addr_set() {
@@ -95,15 +139,25 @@ resolve_addr_set() {
                 printf '%s' "${AS_CACHE[$as_name]}"
                 return
             fi
-            ips=$(ovn get address_set "$as_name" addresses 2>/dev/null | tr -d '\[\]"{} \n\r' || true)
+            ips=$(ovn get address_set "$as_name" addresses 2>/dev/null || true)
+            ips=$(format_ip_list "$ips")
             if [ -z "$ips" ]; then
                 ips="$val"
             fi
-            ips=$(shorten_ips "$ips")
             AS_CACHE[$as_name]="$ips"
             printf '%s' "$ips"
             ;;
-        *) printf '%s' "$val" ;;
+        @port_group_*)
+            printf '%s' "$(resolve_port_group "${val#@}")"
+            ;;
+        *)
+            ips=$(format_ip_list "$val")
+            if [ -n "$ips" ]; then
+                printf '%s' "$ips"
+            else
+                printf '%s' "$val"
+            fi
+            ;;
     esac
 }
 
@@ -121,38 +175,58 @@ join_lines() {
     printf '%s' "$out"
 }
 
+remember_lsp_ips() {
+    local ids=("$@") pending=() u line uuid ips i=0 chunk=()
+    for u in "${ids[@]}"; do
+        u=$(trim "$u")
+        [ -n "$u" ] || continue
+        if [ -z "${LSP_IPS[$u]+x}" ]; then
+            pending+=("$u")
+        fi
+    done
+    while [ "$i" -lt "${#pending[@]}" ]; do
+        chunk=()
+        while [ "$i" -lt "${#pending[@]}" ] && [ "${#chunk[@]}" -lt 40 ]; do
+            chunk+=("${pending[$i]}")
+            i=$((i + 1))
+        done
+        [ "${#chunk[@]}" -eq 0 ] && continue
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            uuid=$(trim "${line%%,*}")
+            [ -n "$uuid" ] || continue
+            ips=$(format_ip_list "${line#*,}")
+            LSP_IPS[$uuid]="$ips"
+        done < <(ovn --format=csv --data=bare --no-heading --columns=_uuid,addresses,port_security,external_ids list Logical_Switch_Port "${chunk[@]}" 2>/dev/null || true)
+        for u in "${chunk[@]}"; do
+            [ -n "${LSP_IPS[$u]+x}" ] || LSP_IPS[$u]=""
+        done
+    done
+}
+
 resolve_port_group() {
-    local pg_name="$1" raw uuids=() u chunk=() names="" part i
-    raw=$(ovn get port_group "$pg_name" ports 2>/dev/null | tr -d '\[\]"' || true)
+    local pg_name="$1" raw uuids=() u ip out=""
+    raw=$(ovn get port_group "$pg_name" ports 2>/dev/null | tr -d '[]"' || true)
     raw="${raw//,/ }"
     # shellcheck disable=SC2206
     uuids=($raw)
     if [ "${#uuids[@]}" -eq 0 ]; then
-        printf '@%s' "$pg_name"
+        printf '%s' ""
         return
     fi
-    i=0
-    while [ "$i" -lt "${#uuids[@]}" ]; do
-        chunk=()
-        while [ "$i" -lt "${#uuids[@]}" ] && [ "${#chunk[@]}" -lt 40 ]; do
-            u=$(trim "${uuids[$i]}")
-            if [ -n "$u" ]; then
-                chunk+=("$u")
-            fi
-            i=$((i + 1))
-        done
-        if [ "${#chunk[@]}" -eq 0 ]; then
-            continue
+    remember_lsp_ips "${uuids[@]}"
+    for u in "${uuids[@]}"; do
+        u=$(trim "$u")
+        [ -n "$u" ] || continue
+        ip="${LSP_IPS[$u]}"
+        [ -n "$ip" ] || continue
+        if [ -z "$out" ]; then
+            out="$ip"
+        else
+            out="$out, $ip"
         fi
-        part=$(ovn --data=bare --no-heading --columns=name list Logical_Switch_Port "${chunk[@]}" 2>/dev/null || true)
-        names="${names}${part}"$'\n'
     done
-    names=$(printf '%s\n' "$names" | join_lines)
-    if [ -n "$names" ]; then
-        printf '%s' "$names"
-    else
-        printf '@%s' "$pg_name"
-    fi
+    printf '%s' "$out"
 }
 
 find_lsps() {
@@ -299,12 +373,18 @@ peer_of() {
     local match_rule="$1" side="$2" item peer=""
     while IFS= read -r item; do
         [ -n "$item" ] || continue
-        peer="${peer}$(resolve_addr_set "$item"),"
+        item=$(resolve_addr_set "$item")
+        [ -n "$item" ] || continue
+        if [ -z "$peer" ]; then
+            peer="$item"
+        else
+            peer="$peer, $item"
+        fi
     done < <(printf '%s\n' "$match_rule" | grep -oE "ip[46][.]${side} == [^ )]+" | sed -E "s/^ip[46][.]${side} == //" || true)
     if [ -z "$peer" ]; then
         printf '%s' "ANY (0.0.0.0/0)"
     else
-        printf '%s' "${peer%,}"
+        printf '%s' "$peer"
     fi
 }
 
@@ -319,58 +399,458 @@ ports_of() {
 }
 
 print_acl_table() {
-    local title="$1" kind="$2" peer_hdr="$3" rows="$4"
-    local filtered prio action sg_name match_rule pg display_name peer ports
+    local title="$1" kind="$2" peer_hdr="$3"
+    local id prio dir action pg match_rule peer ports side shown=0
     echo "$title"
-    printf "%-5s | %-14s | %-35s | %-55s | %s\n" "PRIO" "ACTION" "SECURITY GROUP / PORT GROUP" "$peer_hdr" "ON PORTS"
-    printf "%-5s-|-%-14s-|-%-35s-|-%-55s-|-%s\n" "-----" "--------------" "-----------------------------------" "-------------------------------------------------------" "------------------------------"
-    if [ "$kind" = "in" ]; then
-        filtered=$(printf '%s\n' "$rows" | grep "outport == @" || true)
+    printf "%-4s | %-5s | %-14s | %-36s | %s | %s\n" "ID" "PRIO" "ACTION" "PORT GROUP" "$peer_hdr" "ON PORTS"
+    printf "%-4s-|-%-5s-|-%-14s-|-%-36s-|-%s-|-%s\n" "----" "-----" "--------------" "------------------------------------" "------------------------------" "--------"
+    if [ "$kind" = "inbound" ]; then
+        side="src"
     else
-        filtered=$(printf '%s\n' "$rows" | grep "inport == @" || true)
+        side="dst"
     fi
-    if [ -n "$filtered" ]; then
-        filtered=$(printf '%s\n' "$filtered" | sort -nr)
-    fi
-    if [ -z "$filtered" ]; then
+    while IFS=$'\x1f' read -r id prio dir action pg match_rule; do
+        [ "$dir" = "$kind" ] || continue
+        [ -n "$match_rule" ] || continue
+        shown=1
+        peer=$(peer_of "$match_rule" "$side")
+        ports=$(ports_of "$match_rule")
+        printf "%-4s | %-5s | %-14s | %-36s | %s | %s\n" "$id" "$prio" "$action" "$pg" "$peer" "$ports"
+    done < "$WORK/rules.tsv"
+    if [ "$shown" -eq 0 ]; then
         echo "(no ACLs)"
-        if [ -n "$rows" ]; then
-            log "no $kind rows matched; sample=$(printf '%s\n' "$rows" | head -n 1 | cut -c1-240)"
-        fi
+    fi
+}
+
+ip_to_int() {
+    local a b c d
+    IFS=. read -r a b c d <<< "${1%%/*}"
+    case "$a$b$c$d" in
+        *[!0-9]*) printf '%s' "" ;;
+        *) printf '%s' $(( (a << 24) + (b << 16) + (c << 8) + d )) ;;
+    esac
+}
+
+cidr_has() {
+    local cidr="$1" ip="$2" base bits ipi basei mask
+    cidr=$(trim "$cidr")
+    ip=$(trim "${ip%%/*}")
+    [ -n "$cidr" ] && [ -n "$ip" ] || return 1
+    base="${cidr%/*}"
+    if [ "$cidr" = "$base" ]; then
+        [ "$ip" = "$base" ]
         return
     fi
-    while IFS=$'\x1f' read -r prio action sg_name match_rule; do
+    bits="${cidr#*/}"
+    case "$bits" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$bits" -le 32 ] || return 1
+    ipi=$(ip_to_int "$ip")
+    basei=$(ip_to_int "$base")
+    [ -n "$ipi" ] && [ -n "$basei" ] || return 1
+    if [ "$bits" -eq 0 ]; then
+        return 0
+    fi
+    mask=$(( (0xffffffff << (32 - bits)) & 0xffffffff ))
+    [ $((ipi & mask)) -eq $((basei & mask)) ]
+}
+
+ip_in_peer() {
+    local peer="$1" ips="$2" tok ip
+    case "$peer" in
+        ANY*) return 0 ;;
+    esac
+    [ -n "$ips" ] || return 1
+    local IFS=','
+    local -a toks iplist
+    read -ra toks <<< "$peer"
+    read -ra iplist <<< "$ips"
+    IFS=$' \t\n'
+    for tok in "${toks[@]}"; do
+        tok=$(trim "$tok")
+        [ -n "$tok" ] || continue
+        for ip in "${iplist[@]}"; do
+            if cidr_has "$tok" "$ip"; then
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+port_matches() {
+    printf '%s' "$1" | awk -v proto="$2" -v port="$3" '
+    {
+        m = $0
+        if (m !~ /(tcp|udp|icmp)/) { print "yes"; exit }
+        if (proto == "icmp") {
+            if (m !~ /icmp/) { print "no"; exit }
+            if (m !~ /icmp[46]?\.type/) { print "yes"; exit }
+        } else if (m !~ proto) {
+            print "no"; exit
+        } else if (m !~ (proto "\\.dst")) {
+            print "yes"; exit
+        }
+        n = split(m, parts, /\|\|/)
+        for (i = 1; i <= n; i++) {
+            part = parts[i]
+            if (proto == "icmp") {
+                if (part !~ /icmp/) continue
+                tmp = part
+                seen = 0
+                while (match(tmp, /icmp[46]?\.type == [0-9]+/)) {
+                    seen = 1
+                    num = substr(tmp, RSTART, RLENGTH)
+                    sub(/.*== /, "", num)
+                    if (num + 0 == port + 0) { print "yes"; exit }
+                    tmp = substr(tmp, RSTART + RLENGTH)
+                }
+                if (!seen) { print "yes"; exit }
+                continue
+            }
+            if (part !~ proto) continue
+            if (part !~ (proto "\\.dst")) { print "yes"; exit }
+            tmp = part
+            while (match(tmp, proto "\\.dst == [0-9]+")) {
+                num = substr(tmp, RSTART, RLENGTH)
+                sub(/.*== /, "", num)
+                if (num + 0 == port + 0) { print "yes"; exit }
+                tmp = substr(tmp, RSTART + RLENGTH)
+            }
+            tmp = part
+            while (match(tmp, proto "\\.dst == \\{[0-9, ]+\\}")) {
+                brace = substr(tmp, RSTART, RLENGTH)
+                if (brace ~ ("[^0-9]" port "[^0-9]") || brace ~ ("\\{" port "[,}]")) { print "yes"; exit }
+                tmp = substr(tmp, RSTART + RLENGTH)
+            }
+            lo = ""
+            hi = ""
+            if (match(part, proto "\\.dst >= [0-9]+")) {
+                lo = substr(part, RSTART, RLENGTH)
+                sub(/.*>= /, "", lo)
+            }
+            if (match(part, proto "\\.dst <= [0-9]+")) {
+                hi = substr(part, RSTART, RLENGTH)
+                sub(/.*<= /, "", hi)
+            }
+            if (lo != "" && hi != "" && port + 0 >= lo + 0 && port + 0 <= hi + 0) { print "yes"; exit }
+            if (lo != "" && hi == "" && port + 0 >= lo + 0) { print "yes"; exit }
+            if (hi != "" && lo == "" && port + 0 <= hi + 0) { print "yes"; exit }
+        }
+        print "no"
+    }'
+}
+
+nic_ip() {
+    local nic="$1" lsp mac ips ip
+    lsp=$(find_lsps "$nic" | head -n 1)
+    lsp=$(trim "$lsp")
+    [ -n "$lsp" ] || return 0
+    remember_lsp_ips "$lsp"
+    ips="${LSP_IPS[$lsp]}"
+    if [ -n "$ips" ]; then
+        printf '%s' "$ips"
+        return 0
+    fi
+    mac=$(ovn get Logical_Switch_Port "$lsp" addresses 2>/dev/null | grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | head -n 1 || true)
+    if [ -n "$mac" ] && [ -S /var/run/ovn/ovnsb_db.sock ] && command -v ovn-sbctl >/dev/null 2>&1; then
+        ip=$(COLUMNS=1000000 ovn-sbctl --db=unix:/var/run/ovn/ovnsb_db.sock --data=bare --no-heading --columns=ip find MAC_Binding mac="$mac" 2>/dev/null || true)
+        ip=$(format_ip_list "$ip")
+        printf '%s' "$ip"
+    fi
+}
+
+pgs_of_nic() {
+    local nic="$1"
+    awk -v n="$nic" '$1 == n { printf "%s ", $2 }' "$WORK/nicmap"
+}
+
+winning_rule() {
+    local nic="$1" dir="$2" other_ips="$3"
+    local side id prio d action pg match peer pgs
+    pgs=" $(pgs_of_nic "$nic")"
+    if [ "$dir" = "inbound" ]; then
+        side="src"
+    else
+        side="dst"
+    fi
+    while IFS=$'\x1f' read -r id prio d action pg match; do
+        [ "$d" = "$dir" ] || continue
+        case "$pgs" in
+            *" $pg "*) ;;
+            *) continue ;;
+        esac
+        peer=$(peer_of "$match" "$side")
+        ip_in_peer "$peer" "$other_ips" || continue
+        [ "$(port_matches "$match" "$PROTO" "$DST_PORT")" = "yes" ] || continue
+        printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\n' "$id" "$prio" "$action" "$pg" "$peer"
+        return 0
+    done < "$WORK/rules.tsv"
+    return 1
+}
+
+action_word() {
+    case "$1" in
+        drop) printf '%s' "denied" ;;
+        allow|allow-related|allow-stateless) printf '%s' "allowed" ;;
+        "") printf '%s' "allowed" ;;
+        *) printf '%s' "allowed" ;;
+    esac
+}
+
+print_side_rows() {
+    local title="$1" nic="$2" dir="$3" other_ips="$4" peer_hdr="$5" flow="$6"
+    local side id prio d action pg match_rule peer ports hit shown=0 pgs
+    pgs=" $(pgs_of_nic "$nic")"
+    if [ "$dir" = "inbound" ]; then
+        side="src"
+    else
+        side="dst"
+    fi
+    echo "======================================================================================================================================"
+    echo " $title"
+    echo "======================================================================================================================================"
+    echo "  $flow"
+    echo "  NIC $nic    ${dir}    peer IP ${other_ips:-unknown}    ${PROTO}/${DST_PORT}"
+    printf "%-4s | %-5s | %-14s | %-36s | %-5s | %s | %s\n" "ID" "PRIO" "ACTION" "PORT GROUP" "MATCH" "$peer_hdr" "ON PORTS"
+    printf "%-4s-|-%-5s-|-%-14s-|-%-36s-|-%-5s-|-%s-|-%s\n" "----" "-----" "--------------" "------------------------------------" "-----" "------------------------------" "--------"
+    while IFS=$'\x1f' read -r id prio d action pg match_rule; do
+        [ "$d" = "$dir" ] || continue
+        case "$pgs" in
+            *" $pg "*) ;;
+            *) continue ;;
+        esac
         [ -n "$match_rule" ] || continue
-        if [ "$kind" = "in" ]; then
-            pg=$(printf '%s\n' "$match_rule" | grep -oE 'outport == @[^ )]+' | head -n 1 | sed 's/^outport == @//' || true)
-        else
-            pg=$(printf '%s\n' "$match_rule" | grep -oE 'inport == @[^ )]+' | head -n 1 | sed 's/^inport == @//' || true)
-        fi
-        if [ -n "$sg_name" ]; then
-            display_name="SG: $sg_name"
-        else
-            display_name="@${pg:-unknown}"
-        fi
-        if [ "$kind" = "in" ]; then
-            peer=$(peer_of "$match_rule" "src")
-        else
-            peer=$(peer_of "$match_rule" "dst")
-        fi
+        shown=1
+        peer=$(peer_of "$match_rule" "$side")
         ports=$(ports_of "$match_rule")
-        printf "%-5s | %-14s | %-35s | %-55s | %s\n" "$prio" "$action" "$display_name" "$peer" "$ports"
+        hit="no"
+        if ip_in_peer "$peer" "$other_ips" && [ "$(port_matches "$match_rule" "$PROTO" "$DST_PORT")" = "yes" ]; then
+            hit="yes"
+        fi
+        printf "%-4s | %-5s | %-14s | %-36s | %-5s | %s | %s\n" "$id" "$prio" "$action" "$pg" "$hit" "$peer" "$ports"
+        if [ "$title" = "DEST ROWS" ]; then
+            printf 'Dest rows\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' "$id" "$prio" "$action" "$pg" "$hit" "$ports" >> "$WORK/summary.tsv"
+        else
+            printf 'Source rows\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' "$id" "$prio" "$action" "$pg" "$hit" "$ports" >> "$WORK/summary.tsv"
+        fi
+    done < "$WORK/rules.tsv"
+    if [ "$shown" -eq 0 ]; then
+        echo "(no ACLs)"
+    fi
+    echo ""
+}
+
+print_built_table() {
+    local section id prio action pg hit ports
+    echo "  SECTION     | ID   | PRIO  | ACTION         | PORT GROUP                           | MATCH | SERVICE PORTS"
+    echo "  ------------|------|-------|----------------|--------------------------------------|-------|--------------"
+    if [ ! -s "$WORK/summary.tsv" ]; then
+        echo "  (no rows)"
+        return
+    fi
+    while IFS=$'\x1f' read -r section id prio action pg hit ports; do
+        [ -n "$id" ] || continue
+        printf "  %-11s | %-4s | %-5s | %-14s | %-36s | %-5s | %s\n" "$section" "$id" "$prio" "$action" "$pg" "$hit" "${ports:-ALL}"
+    done < "$WORK/summary.tsv"
+}
+
+print_verdict_block() {
+    local from_nic="$1" from_ip="$2" to_nic="$3" to_ip="$4" flow="$5"
+    local out_row in_row out_id out_prio out_act out_pg in_id in_prio in_act in_pg out_v in_v verdict out_ports in_ports
+    echo "======================================================================================================================================"
+    echo " VERDICT"
+    echo "======================================================================================================================================"
+    echo "  $flow    ${PROTO}/${DST_PORT}"
+    echo "  from $from_nic  IP ${from_ip:-unknown}"
+    echo "  to   $to_nic  IP ${to_ip:-unknown}"
+    echo "  logic: source NIC outbound rules only; destination NIC inbound rules only"
+    echo "  a drop on either side denies the packet"
+    echo ""
+    print_built_table
+    echo ""
+    if out_row=$(winning_rule "$from_nic" outbound "$to_ip"); then
+        IFS=$'\x1f' read -r out_id out_prio out_act out_pg _peer <<< "$out_row"
+        out_ports=$(awk -F $'\x1f' -v id="$out_id" '$2 == id { print $7; exit }' "$WORK/summary.tsv")
+        echo "  source row: ID $out_id  PRIO $out_prio  $out_act  PORT GROUP $out_pg  SERVICE PORTS ${out_ports:-ALL}"
+    else
+        out_act=""
+        echo "  source row: no matching ACL (default allow)"
+    fi
+    if in_row=$(winning_rule "$to_nic" inbound "$from_ip"); then
+        IFS=$'\x1f' read -r in_id in_prio in_act in_pg _peer <<< "$in_row"
+        in_ports=$(awk -F $'\x1f' -v id="$in_id" '$2 == id { print $7; exit }' "$WORK/summary.tsv")
+        echo "  dest row:   ID $in_id  PRIO $in_prio  $in_act  PORT GROUP $in_pg  SERVICE PORTS ${in_ports:-ALL}"
+    else
+        in_act=""
+        echo "  dest row:   no matching ACL (default allow)"
+    fi
+    out_v=$(action_word "$out_act")
+    in_v=$(action_word "$in_act")
+    if [ "$out_v" = "denied" ] || [ "$in_v" = "denied" ]; then
+        verdict="denied"
+    else
+        verdict="allowed"
+    fi
+    echo "  verdict: $verdict"
+    if [ -z "$from_ip" ] || [ -z "$to_ip" ]; then
+        echo "  note: a NIC has no IPv4 in OVN, so only rules with no peer address were applied"
+    fi
+    echo ""
+}
+
+print_conclusion() {
+    local src src_ip dst_ip flow
+    [ -n "$DST_NIC" ] && [ -n "$DST_PORT" ] || return 0
+    dst_ip=$(nic_ip "$DST_NIC")
+    for src in "$@"; do
+        [ "$src" = "$DST_NIC" ] && continue
+        src_ip=$(nic_ip "$src")
+        flow="$src -> $DST_NIC"
+        echo "  LOGIC  $flow"
+        echo "  source NIC outbound rules only"
+        echo "  destination NIC inbound rules only"
+        echo "  a drop on either side denies the packet"
+        echo ""
+        : > "$WORK/summary.tsv"
+        print_side_rows "SOURCE ROWS" "$src" outbound "$dst_ip" "DESTINATION" "$flow"
+        print_side_rows "DEST ROWS" "$DST_NIC" inbound "$src_ip" "SOURCE" "$flow"
+        print_verdict_block "$src" "$src_ip" "$DST_NIC" "$dst_ip" "$flow"
+        flow="$DST_NIC -> $src"
+        echo "  LOGIC  $flow"
+        echo "  source NIC outbound rules only"
+        echo "  destination NIC inbound rules only"
+        echo "  a drop on either side denies the packet"
+        echo ""
+        : > "$WORK/summary.tsv"
+        print_side_rows "SOURCE ROWS" "$DST_NIC" outbound "$src_ip" "DESTINATION" "$flow"
+        print_side_rows "DEST ROWS" "$src" inbound "$dst_ip" "SOURCE" "$flow"
+        print_verdict_block "$DST_NIC" "$dst_ip" "$src" "$src_ip" "$flow"
+    done
+}
+
+print_legend() {
+    local nic uuid id prio dir action pg match_rule peer side key
+    echo "======================================================================================================================================"
+    echo " LEGEND"
+    echo "======================================================================================================================================"
+    echo "  port group - IP list. The same port group is listed once for each distinct IP list."
+    echo "  ID is the same number in PORT GROUPS BY PRIORITY and in the IP chart."
+    echo "  Higher PRIO is checked first. drop denies. allow-related allows."
+    echo ""
+    : > "$WORK/seenleg"
+    if [ -s "$WORK/rules.tsv" ]; then
+        while IFS=$'\x1f' read -r id prio dir action pg match_rule; do
+            [ -n "$pg" ] || continue
+            if [ "$dir" = "inbound" ]; then
+                side="src"
+            else
+                side="dst"
+            fi
+            peer=$(peer_of "$match_rule" "$side")
+            key=$(printf '%s\t%s' "$pg" "$peer")
+            if grep -Fxq "$key" "$WORK/seenleg"; then
+                continue
+            fi
+            printf '%s\n' "$key" >> "$WORK/seenleg"
+            echo "$pg - $peer"
+        done < "$WORK/rules.tsv"
+    else
+        echo "(no port group IP mapping)"
+    fi
+    echo ""
+    if [ -s "$WORK/nicmap" ]; then
+        sort -u "$WORK/nicmap" | while read -r nic uuid; do
+            [ -n "$nic" ] || continue
+            echo "NIC $nic -> PORT GROUP $uuid"
+        done
+    fi
+    echo ""
+}
+
+build_rules() {
+    local rows="$1" filtered id=0 prio dir action pg match_rule
+    : > "$WORK/rules.tsv"
+    filtered=$(
+        printf '%s\n' "$rows" | while IFS=$'\x1f' read -r prio action _sg match_rule; do
+            [ -n "$match_rule" ] || continue
+            if printf '%s\n' "$match_rule" | grep -q "outport == @"; then
+                pg=$(printf '%s\n' "$match_rule" | grep -oE 'outport == @[^ )]+' | head -n 1 | sed 's/^outport == @//')
+                printf '%s\x1finbound\x1f%s\x1f%s\x1f%s\n' "$prio" "$action" "$(pg_to_uuid "$pg")" "$match_rule"
+            fi
+            if printf '%s\n' "$match_rule" | grep -q "inport == @"; then
+                pg=$(printf '%s\n' "$match_rule" | grep -oE 'inport == @[^ )]+' | head -n 1 | sed 's/^inport == @//')
+                printf '%s\x1foutbound\x1f%s\x1f%s\x1f%s\n' "$prio" "$action" "$(pg_to_uuid "$pg")" "$match_rule"
+            fi
+        done | sort -t $'\x1f' -k1,1nr
+    )
+    [ -n "$filtered" ] || return 0
+    while IFS=$'\x1f' read -r prio dir action pg match_rule; do
+        [ -n "$pg" ] || continue
+        id=$((id + 1))
+        printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' "$id" "$prio" "$dir" "$action" "$pg" "$match_rule" >> "$WORK/rules.tsv"
     done <<< "$filtered"
 }
 
+print_priority_chart() {
+    local id prio dir action pg match_rule
+    echo "======================================================================================================================================"
+    echo " PORT GROUPS BY PRIORITY"
+    echo "======================================================================================================================================"
+    printf "%-4s | %-5s | %-8s | %-14s | %s\n" "ID" "PRIO" "DIR" "ACTION" "PORT GROUP"
+    printf "%-4s-|-%-5s-|-%-8s-|-%-14s-|-%s\n" "----" "-----" "--------" "--------------" "------------------------------------"
+    if [ ! -s "$WORK/rules.tsv" ]; then
+        echo "(no ACLs)"
+        echo ""
+        return
+    fi
+    while IFS=$'\x1f' read -r id prio dir action pg match_rule; do
+        [ -n "$pg" ] || continue
+        printf "%-4s | %-5s | %-8s | %-14s | %s\n" "$id" "$prio" "$dir" "$action" "$pg"
+    done < "$WORK/rules.tsv"
+    echo ""
+}
+
 run_inside() {
-    local nic lsp pg lname groups=() seen=" " found
+    local nic lsp pg lname groups=() seen=" " found present=0
+    local -a nics=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --dst)
+                DST_NIC=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+                shift 2
+                ;;
+            --port)
+                DST_PORT="$2"
+                shift 2
+                ;;
+            --proto)
+                PROTO=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
+                shift 2
+                ;;
+            *)
+                nics+=("$1")
+                shift
+                ;;
+        esac
+    done
+    local -a src_nics=("${nics[@]}")
     WORK="${WORK:-$(mktemp -d /tmp/ovn-port-set.XXXXXX)}"
+    : > "$WORK/nicmap"
     command -v ovn-nbctl >/dev/null 2>&1 || die "ovn-nbctl not found"
     [ -S "${NB_DB#unix:}" ] || die "Northbound socket not found at ${NB_DB#unix:}"
+    if [ -n "$DST_NIC" ]; then
+        for nic in "${nics[@]}"; do
+            [ "$nic" = "$DST_NIC" ] && present=1
+        done
+        [ "$present" -eq 0 ] && nics+=("$DST_NIC")
+    fi
 
     echo "======================================================================================================================================"
     echo " NIC PORT SETS"
     echo "======================================================================================================================================"
-    for nic in "$@"; do
+    for nic in "${nics[@]}"; do
         nic=$(printf '%s' "$nic" | tr '[:upper:]' '[:lower:]')
         echo "NIC: $nic"
         log "NIC: $nic"
@@ -388,6 +868,7 @@ run_inside() {
                 [ -n "$pg" ] || continue
                 echo "  PORT SET: $(pg_to_uuid "$pg")    $pg"
                 log "  PORT SET: $(pg_to_uuid "$pg") $pg"
+                printf '%s %s\n' "$nic" "$(pg_to_uuid "$pg")" >> "$WORK/nicmap"
                 case "$seen" in
                     *" $pg "*) ;;
                     *)
@@ -411,20 +892,33 @@ run_inside() {
     local ACLS
     ACLS=$(fetch_group_acls "${groups[@]}") || die "failed to read ACLs"
 
+    build_rules "$ACLS"
+    print_legend
+    if [ -n "$DST_NIC" ] && [ -n "$DST_PORT" ]; then
+        print_conclusion "${src_nics[@]}"
+        return
+    fi
+    print_priority_chart
+
     echo "======================================================================================================================================"
-    echo " CONSOLIDATED TRAFFIC POLICY"
+    echo " PORT GROUP IP CHART"
     echo "======================================================================================================================================"
     for pg in "${groups[@]}"; do
         echo " TARGET PORT GROUP: $pg"
         echo " PORT SET: $(pg_to_uuid "$pg")"
-        echo " PORTS AFFECTED: $(resolve_port_group "$pg")"
+        member_ips=$(resolve_port_group "$pg")
+        if [ -n "$member_ips" ]; then
+            echo " MEMBER IPs: $member_ips"
+        else
+            echo " MEMBER IPs: (none recorded on the logical port)"
+        fi
         echo "--------------------------------------------------------------------------------------------------------------------------------------"
     done
     echo ""
-    print_acl_table ">>> 1. FROM WHERE IT CAN RECEIVE TRAFFIC (INBOUND / INGRESS) <<<" in "SOURCE (Who is sending)" "$ACLS"
+    print_acl_table ">>> 1. FROM WHERE IT CAN RECEIVE TRAFFIC (INBOUND / INGRESS) <<<" inbound "SOURCE (Who is sending)"
     echo ""
     echo ""
-    print_acl_table ">>> 2. WHERE IT CAN SEND TRAFFIC (OUTBOUND / EGRESS) <<<" out "DESTINATION (Where it can send)" "$ACLS"
+    print_acl_table ">>> 2. WHERE IT CAN SEND TRAFFIC (OUTBOUND / EGRESS) <<<" outbound "DESTINATION (Where it can send)"
     echo "======================================================================================================================================"
 }
 
@@ -521,20 +1015,77 @@ run_remote() {
     else
         die "ovn-nbctl failed in ${OVN_NS}/${OVN_POD}"
     fi
-    "${exec_cmd[@]}" -- env INSIDE_OVN=1 COLUMNS=1000000 bash -s -- "$@" < "$0"
+    local -a verdict_args=()
+    if [ -n "$DST_NIC" ]; then
+        verdict_args+=(--dst "$DST_NIC" --port "$DST_PORT" --proto "$PROTO")
+    fi
+    "${exec_cmd[@]}" -- env INSIDE_OVN=1 COLUMNS=1000000 bash -s -- "$@" "${verdict_args[@]}" < "$0"
+}
+
+is_uuid() {
+    [[ "$1" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
 }
 
 main() {
     [ "$#" -ge 1 ] || usage
-    local arg nic
+    local arg nic raw=()
     local nics=()
     local parts=()
-    for arg in "$@"; do
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --dst)
+                [ -n "${2:-}" ] || usage
+                DST_NIC=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+                shift 2
+                ;;
+            --port)
+                [ -n "${2:-}" ] || usage
+                DST_PORT="$2"
+                shift 2
+                ;;
+            --proto)
+                [ -n "${2:-}" ] || usage
+                PROTO=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
+                shift 2
+                ;;
+            -h|--help)
+                help_text
+                exit 0
+                ;;
+            *)
+                raw+=("$1")
+                shift
+                ;;
+        esac
+    done
+    if [ -z "$DST_NIC" ] && [ -z "$DST_PORT" ] && [ "${#raw[@]}" -eq 3 ]; then
+        case "${raw[2]}" in
+            ''|*[!0-9]*) ;;
+            *)
+                DST_NIC=$(printf '%s' "${raw[1]}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+                DST_PORT="${raw[2]}"
+                raw=("${raw[0]}")
+                ;;
+        esac
+    fi
+    if [ -n "$DST_NIC" ] || [ -n "$DST_PORT" ]; then
+        [ -n "$DST_NIC" ] && [ -n "$DST_PORT" ] || die "destination NIC and port are both required"
+        is_uuid "$DST_NIC" || die "not a NIC uuid: $DST_NIC"
+        case "$DST_PORT" in
+            ''|*[!0-9]*) die "port must be a number: $DST_PORT" ;;
+        esac
+        [ "$DST_PORT" -le 65535 ] || die "port must be 0-65535: $DST_PORT"
+        case "$PROTO" in
+            tcp|udp|icmp) ;;
+            *) die "proto must be tcp, udp, or icmp" ;;
+        esac
+    fi
+    for arg in "${raw[@]}"; do
         IFS=',' read -ra parts <<< "$arg"
         for nic in "${parts[@]}"; do
             nic=$(printf '%s' "$nic" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
             [ -n "$nic" ] || continue
-            if ! [[ "$nic" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+            if ! is_uuid "$nic"; then
                 die "not a NIC uuid: $nic"
             fi
             nics+=("$nic")
