@@ -58,6 +58,7 @@ Three arguments, source NIC, destination NIC, and destination port:
   Logic for each direction:
     source NIC outbound rules only
     destination NIC inbound rules only
+    port-set match is live OVN membership, no json file
     a drop on either side denies the packet
   Each row shows the port group, MATCH, and the service ports.
   --proto defaults to tcp. udp and icmp are also accepted.
@@ -566,8 +567,44 @@ pgs_of_nic() {
     awk -v n="$nic" '$1 == n { printf "%s ", $2 }' "$WORK/nicmap"
 }
 
+token_pg_uuid() {
+    local token="$1" body
+    case "$token" in
+        \$address_set_*) body="${token#\$address_set_}" ;;
+        @port_group_*) body="${token#@port_group_}" ;;
+        port_group_*) body="${token#port_group_}" ;;
+        *) printf '%s' ""; return ;;
+    esac
+    printf '%s' "${body//_/-}"
+}
+
+nic_in_pg_uuid() {
+    local nic="$1" uuid="$2" pgs
+    [ -n "$uuid" ] || return 1
+    pgs=" $(pgs_of_nic "$nic")"
+    case "$pgs" in
+        *" $uuid "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# MATCH is live OVN port-set membership, then the peer IP list. No json file.
+peer_hits() {
+    local match_rule="$1" side="$2" other_nic="$3" other_ips="$4"
+    local token uuid peer
+    while IFS= read -r token; do
+        [ -n "$token" ] || continue
+        uuid=$(token_pg_uuid "$token")
+        if nic_in_pg_uuid "$other_nic" "$uuid"; then
+            return 0
+        fi
+    done < <(printf '%s\n' "$match_rule" | grep -oE '\$address_set_[^ )]+|@port_group_[^ )]+' || true)
+    peer=$(peer_of "$match_rule" "$side")
+    ip_in_peer "$peer" "$other_ips"
+}
+
 winning_rule() {
-    local nic="$1" dir="$2" other_ips="$3"
+    local nic="$1" dir="$2" other_ips="$3" other_nic="$4"
     local side id prio d action pg match peer pgs
     pgs=" $(pgs_of_nic "$nic")"
     if [ "$dir" = "inbound" ]; then
@@ -582,7 +619,7 @@ winning_rule() {
             *) continue ;;
         esac
         peer=$(peer_of "$match" "$side")
-        ip_in_peer "$peer" "$other_ips" || continue
+        peer_hits "$match" "$side" "$other_nic" "$other_ips" || continue
         [ "$(port_matches "$match" "$PROTO" "$DST_PORT")" = "yes" ] || continue
         printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\n' "$id" "$prio" "$action" "$pg" "$peer"
         return 0
@@ -600,7 +637,7 @@ action_word() {
 }
 
 print_side_rows() {
-    local title="$1" nic="$2" dir="$3" other_ips="$4" peer_hdr="$5" flow="$6"
+    local title="$1" nic="$2" dir="$3" other_ips="$4" peer_hdr="$5" flow="$6" other_nic="$7"
     local side id prio d action pg match_rule peer ports hit shown=0 pgs
     pgs=" $(pgs_of_nic "$nic")"
     if [ "$dir" = "inbound" ]; then
@@ -626,7 +663,7 @@ print_side_rows() {
         peer=$(peer_of "$match_rule" "$side")
         ports=$(ports_of "$match_rule")
         hit="no"
-        if ip_in_peer "$peer" "$other_ips" && [ "$(port_matches "$match_rule" "$PROTO" "$DST_PORT")" = "yes" ]; then
+        if peer_hits "$match_rule" "$side" "$other_nic" "$other_ips" && [ "$(port_matches "$match_rule" "$PROTO" "$DST_PORT")" = "yes" ]; then
             hit="yes"
         fi
         printf "%-4s | %-5s | %-14s | %-36s | %-5s | %s | %s\n" "$id" "$prio" "$action" "$pg" "$hit" "$peer" "$ports"
@@ -666,11 +703,12 @@ print_verdict_block() {
     echo "  from $from_nic  IP ${from_ip:-unknown}"
     echo "  to   $to_nic  IP ${to_ip:-unknown}"
     echo "  logic: source NIC outbound rules only; destination NIC inbound rules only"
+    echo "  port-set match is live OVN membership, no json file"
     echo "  a drop on either side denies the packet"
     echo ""
     print_built_table
     echo ""
-    if out_row=$(winning_rule "$from_nic" outbound "$to_ip"); then
+    if out_row=$(winning_rule "$from_nic" outbound "$to_ip" "$to_nic"); then
         IFS=$'\x1f' read -r out_id out_prio out_act out_pg _peer <<< "$out_row"
         out_ports=$(awk -F $'\x1f' -v id="$out_id" '$2 == id { print $7; exit }' "$WORK/summary.tsv")
         echo "  source row: ID $out_id  PRIO $out_prio  $out_act  PORT GROUP $out_pg  SERVICE PORTS ${out_ports:-ALL}"
@@ -678,7 +716,7 @@ print_verdict_block() {
         out_act=""
         echo "  source row: no matching ACL (default allow)"
     fi
-    if in_row=$(winning_rule "$to_nic" inbound "$from_ip"); then
+    if in_row=$(winning_rule "$to_nic" inbound "$from_ip" "$from_nic"); then
         IFS=$'\x1f' read -r in_id in_prio in_act in_pg _peer <<< "$in_row"
         in_ports=$(awk -F $'\x1f' -v id="$in_id" '$2 == id { print $7; exit }' "$WORK/summary.tsv")
         echo "  dest row:   ID $in_id  PRIO $in_prio  $in_act  PORT GROUP $in_pg  SERVICE PORTS ${in_ports:-ALL}"
@@ -711,21 +749,23 @@ print_conclusion() {
         echo "  LOGIC  $flow"
         echo "  source NIC outbound rules only"
         echo "  destination NIC inbound rules only"
+        echo "  port-set match is live OVN membership, no json file"
         echo "  a drop on either side denies the packet"
         echo ""
         : > "$WORK/summary.tsv"
-        print_side_rows "SOURCE ROWS" "$src" outbound "$dst_ip" "DESTINATION" "$flow"
-        print_side_rows "DEST ROWS" "$DST_NIC" inbound "$src_ip" "SOURCE" "$flow"
+        print_side_rows "SOURCE ROWS" "$src" outbound "$dst_ip" "DESTINATION" "$flow" "$DST_NIC"
+        print_side_rows "DEST ROWS" "$DST_NIC" inbound "$src_ip" "SOURCE" "$flow" "$src"
         print_verdict_block "$src" "$src_ip" "$DST_NIC" "$dst_ip" "$flow"
         flow="$DST_NIC -> $src"
         echo "  LOGIC  $flow"
         echo "  source NIC outbound rules only"
         echo "  destination NIC inbound rules only"
+        echo "  port-set match is live OVN membership, no json file"
         echo "  a drop on either side denies the packet"
         echo ""
         : > "$WORK/summary.tsv"
-        print_side_rows "SOURCE ROWS" "$DST_NIC" outbound "$src_ip" "DESTINATION" "$flow"
-        print_side_rows "DEST ROWS" "$src" inbound "$dst_ip" "SOURCE" "$flow"
+        print_side_rows "SOURCE ROWS" "$DST_NIC" outbound "$src_ip" "DESTINATION" "$flow" "$src"
+        print_side_rows "DEST ROWS" "$src" inbound "$dst_ip" "SOURCE" "$flow" "$DST_NIC"
         print_verdict_block "$DST_NIC" "$dst_ip" "$src" "$src_ip" "$flow"
     done
 }
