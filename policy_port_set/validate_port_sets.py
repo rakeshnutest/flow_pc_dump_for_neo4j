@@ -10,8 +10,7 @@ ZK scope UUIDs. Actual port sets come from
 
   idfcli get entity -e atlas_port_set --all -o json
 
-Standalone. One file, stdlib only. Nothing is written to disk. It runs only on
-the Prism Central leader. A single-node PC is treated as the leader.
+Standalone. One file, stdlib only. Nothing is written to disk.
 Stdout is only mismatch rows, tab-separated:
 
   mismatch  port_set  policy  nic_mismatch
@@ -32,7 +31,14 @@ ZK scope UUIDs. CMSP uses the local idfcli and zkcat.
 
   python3 validate_port_sets.py
   python3 validate_port_sets.py --self-test
+  panacea_cli validate_port_sets.py
+  panacea_cli validate_port_sets.py --self-test
 """
+
+try:
+    import panacea_cli_usage_tracker  # noqa: F401  (present on a live PC)
+except ImportError:
+    pass
 
 import argparse
 import csv
@@ -85,12 +91,6 @@ VLAN_ZK = "/appliance/logical/flow/vlan_unique_uuid"
 GLOBAL_ZK = "/appliance/logical/flow/global_unique_uuid"
 UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-IPV4_RE = re.compile(r"(?:[0-9]+\.){3}[0-9]+")
-LEADER_YES_RE = re.compile(r"Currently leader(?:\s*\(Y/N\))?:\s*Yes")
-PRISM_LEADER_PATHS = (
-    "/appliance/logical/leaders/prism_monitor",
-    "/appliance/logical/pyleaders/prism_monitor",
-)
 ATLAS_ZK_PY = (
     "from zeus.zookeeper_session import ZookeeperSession\n"
     "zk = ZookeeperSession()\n"
@@ -121,6 +121,14 @@ def values(node, key):
         return [item for item in vals if item not in (None, "")]
     return [vals]
 
+def _md5(data):
+    """FLEX port-set id. usedforsecurity=False keeps MD5 available on FIPS PCs."""
+    try:
+        return hashlib.md5(data, usedforsecurity=False)
+    except TypeError:
+        return hashlib.md5(data)
+
+
 def generate_port_set_id(entity_type, refs, unique_uuid, project_uuid=None,
                          is_flex=False):
     """APPLICATION uuid5; FLEX MD5(salus+scope+Go list). Same as ingest.py."""
@@ -136,7 +144,7 @@ def generate_port_set_id(entity_type, refs, unique_uuid, project_uuid=None,
                 body = body + ":" + str(suffix)
         if project_uuid and project_uuid != DEFAULT_PROJECT:
             body = body + ":project:" + project_uuid
-        digest = hashlib.md5(
+        digest = _md5(
             (SALUS_SERVICE_NAME + unique_uuid + body).encode()).digest()
         return str(uuid_lib.UUID(bytes=digest)), body
     body = str(sorted(list(refs)))
@@ -703,83 +711,6 @@ def _zk_bin(name):
         if os.path.exists(path) and os.access(path, os.X_OK):
             return path
     return ""
-
-
-def leader_ip_from_text(text):
-    """IP on the ZooKeeper line that marks the current Prism leader."""
-    for line in (text or "").replace("\x00", "").splitlines():
-        if LEADER_YES_RE.search(line):
-            match = IPV4_RE.search(line)
-            if match:
-                return match.group(0)
-    return ""
-
-
-def pc_leader_status(leader, local_ips, node_count):
-    """Decide whether this VM may run. Returns (allowed, message)."""
-    if not leader:
-        if int(node_count) <= 1:
-            return True, "PC LEADER: single Prism Central node"
-        return False, (
-            "Prism Central leader was not found. "
-            "Run this script on the PC leader node.")
-    if leader in (local_ips or []):
-        return True, "PC LEADER: %s" % leader
-    return False, (
-        "this PCVM is not the Prism Central leader (%s). "
-        "Run the script on the PC leader node." % leader)
-
-
-def _local_ips():
-    """IPv4 addresses configured on this VM. svmips is the whole cluster."""
-    _rc, out, _err = _bash(
-        "hostname -I 2>/dev/null; hostname -i 2>/dev/null; "
-        "ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1")
-    seen, ips = set(), []
-    for token in re.split(r"[\s,]+", out or ""):
-        token = token.strip()
-        if IPV4_RE.fullmatch(token) and token not in seen:
-            seen.add(token)
-            ips.append(token)
-    return ips
-
-
-def _pc_node_count():
-    _rc, out, _err = _bash("command -v svmips >/dev/null 2>&1 && svmips -d || true")
-    return sum(1 for token in (out or "").split() if IPV4_RE.fullmatch(token.strip()))
-
-
-def _prism_leader_ip():
-    zkcat = _zk_bin("zkcat")
-    if not zkcat:
-        raise SystemExit(
-            "zkcat not found; cannot verify this is the Prism Central leader node")
-    zkls = _zk_bin("zkls")
-    for path in PRISM_LEADER_PATHS:
-        children = []
-        if zkls:
-            _rc, stdout, _err = _run([zkls, path], 20)
-            children = [
-                line.strip() for line in (stdout or "").splitlines() if line.strip()]
-        for child in children:
-            _rc, stdout, _err = _run([zkcat, "%s/%s" % (path, child)], 20)
-            leader = leader_ip_from_text(stdout)
-            if leader:
-                return leader
-        _rc, stdout, _err = _run([zkcat, path], 20)
-        leader = leader_ip_from_text(stdout)
-        if leader:
-            return leader
-    return ""
-
-
-def require_pc_leader():
-    """Stop unless this process is on the Prism Central leader."""
-    allowed, message = pc_leader_status(
-        _prism_leader_ip(), _local_ips(), _pc_node_count())
-    if not allowed:
-        raise SystemExit(message)
-    LOG.info(message)
 
 
 def _pc_zk_uuids():
@@ -1393,26 +1324,6 @@ def self_test():
     text = "".join(_render(rows))
     if "policy.json" in text or text.count("\n") != 1 + len(rows):
         raise SystemExit("unexpected output: %s" % text)
-    sample = "Handle: 10.1.2.3:9080 Currently leader (Y/N): Yes"
-    if leader_ip_from_text(sample) != "10.1.2.3":
-        raise SystemExit("leader parse failed: %s" % leader_ip_from_text(sample))
-    plain = "Handle: 10.9.9.9:9080 Currently leader: Yes"
-    if leader_ip_from_text(plain) != "10.9.9.9":
-        raise SystemExit("plain leader parse failed: %s" % leader_ip_from_text(plain))
-    if leader_ip_from_text("Handle: 10.1.2.4:9080 Currently leader (Y/N): No"):
-        raise SystemExit("non-leader line was accepted")
-    ok, msg = pc_leader_status("10.1.2.3", ["10.9.9.9"], 3)
-    if ok:
-        raise SystemExit("non-leader node was allowed: %s" % msg)
-    ok, msg = pc_leader_status("10.1.2.3", ["10.1.2.3"], 3)
-    if not ok:
-        raise SystemExit("leader node was refused: %s" % msg)
-    ok, msg = pc_leader_status("", [], 1)
-    if not ok:
-        raise SystemExit("single-node PC was refused: %s" % msg)
-    ok, msg = pc_leader_status("", ["10.1.2.3", "10.1.2.4"], 3)
-    if ok:
-        raise SystemExit("missing leader on a scale-out PC was allowed: %s" % msg)
     print("self-test ok mismatches=%s" % len(rows))
 
 
@@ -1427,8 +1338,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Validate policy port_set hashes against idfcli port_set. "
-            "Prints mismatch rows only. Writes no JSON. "
-            "Runs only on the Prism Central leader node."))
+            "Prints mismatch rows only. Writes no JSON."))
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument(
@@ -1444,7 +1354,6 @@ def main():
     if args.self_test:
         self_test()
         return 0
-    require_pc_leader()
     info = detect_platform()
     global_uuid, vlan_uuid = fetch_unique_uuids(info)
     if not global_uuid or not vlan_uuid:
