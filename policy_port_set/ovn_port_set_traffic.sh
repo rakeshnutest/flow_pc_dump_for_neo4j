@@ -42,8 +42,9 @@ Usage:
   $(basename "$0") <src-nic-uuid> <dst-nic-uuid> <dst-port>
   $(basename "$0") -h
 
-Run this on the Prism Central VM. It works on CMSP and SMSP. The script
-finds kubectl and the anc-ovn pod, then reads OVN port sets and ACLs.
+Run this on the Prism Central leader node. It works on CMSP and SMSP.
+A follower PCVM stops before any OVN query. The script then finds kubectl
+and the anc-ovn pod, then reads OVN port sets and ACLs.
 
 One argument, the source NIC:
   Prints the NIC, its port sets, and a LEGEND of each port group and its IPs.
@@ -983,6 +984,97 @@ write_smsp_kubeconfig() {
     chmod 600 "$KUBECONFIG_FILE" || true
 }
 
+zk_bin() {
+    local name="$1" cand
+    for cand in "/home/nutanix/cluster/bin/$name" "/usr/local/nutanix/cluster/bin/$name"; do
+        if [ -x "$cand" ]; then
+            printf '%s' "$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
+local_ips() {
+    if command -v svmips >/dev/null 2>&1; then
+        svmips 2>/dev/null | tr ' ' '\n'
+    fi
+    hostname -I 2>/dev/null | tr ' ' '\n'
+    hostname -i 2>/dev/null | tr ' ' '\n'
+    ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1
+}
+
+pc_node_count() {
+    local n=0 ip
+    if ! command -v svmips >/dev/null 2>&1; then
+        printf '%s' "0"
+        return
+    fi
+    while IFS= read -r ip; do
+        case "$ip" in
+            *.*.*.*) n=$((n + 1)) ;;
+        esac
+    done < <(svmips -d 2>/dev/null | tr ' ' '\n')
+    printf '%s' "$n"
+}
+
+leader_ip_from_text() {
+    awk '
+        /Currently leader:[[:space:]]*Yes/ {
+            if (match($0, /([0-9]+\.){3}[0-9]+/)) {
+                print substr($0, RSTART, RLENGTH)
+                exit
+            }
+        }
+    '
+}
+
+require_pc_leader() {
+    local zkls zkcat text child leader ip found=0 nodes
+    zkls=$(zk_bin zkls || true)
+    zkcat=$(zk_bin zkcat || true)
+    [ -n "$zkcat" ] || die "zkcat not found; cannot verify this is the Prism Central leader node"
+    for path in \
+        /appliance/logical/leaders/prism_monitor \
+        /appliance/logical/pyleaders/prism_monitor
+    do
+        if [ -n "$zkls" ]; then
+            while IFS= read -r child; do
+                child=$(trim "$child")
+                [ -n "$child" ] || continue
+                text=$("$zkcat" "${path}/${child}" 2>/dev/null | tr -d '\0' || true)
+                leader=$(printf '%s\n' "$text" | leader_ip_from_text || true)
+                if [ -n "$leader" ]; then
+                    found=1
+                    break 2
+                fi
+            done < <("$zkls" "$path" 2>/dev/null || true)
+        fi
+        text=$("$zkcat" "$path" 2>/dev/null | tr -d '\0' || true)
+        leader=$(printf '%s\n' "$text" | leader_ip_from_text || true)
+        if [ -n "$leader" ]; then
+            found=1
+            break
+        fi
+    done
+    if [ "$found" -ne 1 ]; then
+        nodes=$(pc_node_count)
+        if [ "$nodes" -le 1 ]; then
+            log "PC LEADER: single Prism Central node"
+            return 0
+        fi
+        die "Prism Central leader was not found. Run this script on the PC leader node."
+    fi
+    while IFS= read -r ip; do
+        [ -n "$ip" ] || continue
+        if [ "$ip" = "$leader" ]; then
+            log "PC LEADER: $leader"
+            return 0
+        fi
+    done < <(local_ips)
+    die "this PCVM is not the Prism Central leader (${leader}). Run the script on the PC leader node."
+}
+
 find_ovn_pod() {
     local ns name phase label
     OVN_NS=""
@@ -1092,6 +1184,8 @@ main() {
         done
     done
     [ "${#nics[@]}" -ge 1 ] || usage
+
+    require_pc_leader
 
     if [ -S "${NB_DB#unix:}" ] && command -v ovn-nbctl >/dev/null 2>&1; then
         log "PLATFORM: local-ovn"
