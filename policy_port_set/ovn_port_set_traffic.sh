@@ -42,9 +42,11 @@ Usage:
   $(basename "$0") <src-nic-uuid> <dst-nic-uuid> <dst-port>
   $(basename "$0") -h
 
-Run this on the Prism Central leader node. It works on CMSP and SMSP.
-A follower PCVM stops before any OVN query. The script then finds kubectl
-and the anc-ovn pod, then reads OVN port sets and ACLs.
+Run this on any Prism Central VM. It works on CMSP and SMSP.
+  panacea_cli ovn_port_set_traffic.sh <src-nic-uuid>
+If this PCVM is not the Prism Central leader, the script runs on the
+leader and prints that output here. It then finds kubectl and the
+anc-ovn pod, and reads OVN port sets and ACLs.
 
 One argument, the source NIC:
   Prints the NIC, its port sets, and a LEGEND of each port group and its IPs.
@@ -995,18 +997,30 @@ zk_bin() {
     return 1
 }
 
-local_ips() {
-    if command -v svmips >/dev/null 2>&1; then
-        svmips 2>/dev/null | tr ' ' '\n'
+cluster_bin() {
+    local name="$1" cand
+    cand=$(zk_bin "$name" || true)
+    if [ -n "$cand" ]; then
+        printf '%s' "$cand"
+        return 0
     fi
+    if command -v "$name" >/dev/null 2>&1; then
+        command -v "$name"
+        return 0
+    fi
+    return 1
+}
+
+local_ips() {
     hostname -I 2>/dev/null | tr ' ' '\n'
     hostname -i 2>/dev/null | tr ' ' '\n'
     ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1
 }
 
 pc_node_count() {
-    local n=0 ip
-    if ! command -v svmips >/dev/null 2>&1; then
+    local n=0 ip svm
+    svm=$(cluster_bin svmips || true)
+    if [ -z "$svm" ]; then
         printf '%s' "0"
         return
     fi
@@ -1014,13 +1028,13 @@ pc_node_count() {
         case "$ip" in
             *.*.*.*) n=$((n + 1)) ;;
         esac
-    done < <(svmips -d 2>/dev/null | tr ' ' '\n')
+    done < <("$svm" -d 2>/dev/null | tr ' ' '\n')
     printf '%s' "$n"
 }
 
 leader_ip_from_text() {
     awk '
-        /Currently leader:[[:space:]]*Yes/ {
+        /Currently leader/ && /:[[:space:]]*Yes/ {
             if (match($0, /([0-9]+\.){3}[0-9]+/)) {
                 print substr($0, RSTART, RLENGTH)
                 exit
@@ -1029,8 +1043,21 @@ leader_ip_from_text() {
     '
 }
 
-require_pc_leader() {
-    local zkls zkcat text child leader ip found=0 nodes
+bare_leader_ip() {
+    local text ip
+    text=$(printf '%s' "$1" | tr -d '[:space:]')
+    case "$text" in
+        *[!0-9.:]*) return 1 ;;
+    esac
+    ip=${text%%:*}
+    case "$ip" in
+        *.*.*.*) printf '%s' "$ip"; return 0 ;;
+    esac
+    return 1
+}
+
+pc_leader_ip() {
+    local zkls zkcat text child leader bare nodes
     zkls=$(zk_bin zkls || true)
     zkcat=$(zk_bin zkcat || true)
     [ -n "$zkcat" ] || die "zkcat not found; cannot verify this is the Prism Central leader node"
@@ -1045,34 +1072,77 @@ require_pc_leader() {
                 text=$("$zkcat" "${path}/${child}" 2>/dev/null | tr -d '\0' || true)
                 leader=$(printf '%s\n' "$text" | leader_ip_from_text || true)
                 if [ -n "$leader" ]; then
-                    found=1
-                    break 2
+                    printf '%s' "$leader"
+                    return 0
+                fi
+                if [ -z "$bare" ]; then
+                    bare=$(bare_leader_ip "$text" || true)
                 fi
             done < <("$zkls" "$path" 2>/dev/null || true)
         fi
         text=$("$zkcat" "$path" 2>/dev/null | tr -d '\0' || true)
         leader=$(printf '%s\n' "$text" | leader_ip_from_text || true)
         if [ -n "$leader" ]; then
-            found=1
-            break
-        fi
-    done
-    if [ "$found" -ne 1 ]; then
-        nodes=$(pc_node_count)
-        if [ "$nodes" -le 1 ]; then
-            log "PC LEADER: single Prism Central node"
+            printf '%s' "$leader"
             return 0
         fi
-        die "Prism Central leader was not found. Run this script on the PC leader node."
+        if [ -z "$bare" ]; then
+            bare=$(bare_leader_ip "$text" || true)
+        fi
+    done
+    if [ -n "$bare" ]; then
+        printf '%s' "$bare"
+        return 0
     fi
+    nodes=$(pc_node_count)
+    if [ "$nodes" -le 1 ]; then
+        printf '%s' "single"
+        return 0
+    fi
+    return 1
+}
+
+ip_is_local() {
+    local want="$1" ip
     while IFS= read -r ip; do
         [ -n "$ip" ] || continue
-        if [ "$ip" = "$leader" ]; then
-            log "PC LEADER: $leader"
+        if [ "$ip" = "$want" ]; then
             return 0
         fi
     done < <(local_ips)
-    die "this PCVM is not the Prism Central leader (${leader}). Run the script on the PC leader node."
+    return 1
+}
+
+forward_to_pc_leader() {
+    local leader="$1"
+    shift
+    local arg quoted=""
+    for arg in "$@"; do
+        quoted+=" $(printf '%q' "$arg")"
+    done
+    log "PC follower: running on Prism Central leader ${leader}"
+    ssh -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=no \
+        "nutanix@${leader}" \
+        "cat > /tmp/ovn_port_set_traffic.sh && chmod 755 /tmp/ovn_port_set_traffic.sh && env PC_LEADER_LOCAL=1 bash /tmp/ovn_port_set_traffic.sh${quoted}" \
+        < "$0"
+    exit $?
+}
+
+require_pc_leader() {
+    local leader
+    leader=$(pc_leader_ip) || die "Prism Central leader was not found"
+    if [ "$leader" = "single" ]; then
+        log "PC LEADER: single Prism Central node"
+        return 0
+    fi
+    if ip_is_local "$leader"; then
+        log "PC LEADER: $leader"
+        return 0
+    fi
+    if [ "${PC_LEADER_LOCAL:-}" = "1" ]; then
+        die "forwarded to ${leader}, but this PCVM is not the Prism Central leader"
+    fi
+    forward_to_pc_leader "$leader" "$@"
 }
 
 find_ovn_pod() {
@@ -1120,6 +1190,7 @@ is_uuid() {
 
 main() {
     [ "$#" -ge 1 ] || usage
+    local -a orig=("$@")
     local arg nic raw=()
     local nics=()
     local parts=()
@@ -1185,7 +1256,7 @@ main() {
     done
     [ "${#nics[@]}" -ge 1 ] || usage
 
-    require_pc_leader
+    require_pc_leader "${orig[@]}"
 
     if [ -S "${NB_DB#unix:}" ] && command -v ovn-nbctl >/dev/null 2>&1; then
         log "PLATFORM: local-ovn"
