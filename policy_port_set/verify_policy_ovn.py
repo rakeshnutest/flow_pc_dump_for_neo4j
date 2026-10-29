@@ -4,8 +4,11 @@
 Reads Flow policies and hashes every port set in this file.
 Records who may send in and who may be sent to.
 Standalone. Stdlib only. No other policy script is imported.
-Each row carries the ACL priority. The last lines are the OVN-NB check:
-the port group, the peer port group, and the ACL must exist in Northbound.
+Each row carries the OVN-NB ACL priority for that rule class.
+An address-group peer is uuid5(address_group, "IPv4"|"IPv6").
+A port-set peer is that port set's generated address set.
+The last lines are the OVN-NB check: the port group, the address set, and
+the class priority must exist in Northbound.
 
 Runs on any Prism Central VM. A follower copies this script to the leader
 over the cluster SSH key and prints the leader's output. No password is
@@ -32,8 +35,8 @@ report is ignored. Kubernetes names are ignored.
   ovn=service_missing  the ACL does not cover the service ports
 
 direction is incoming or outgoing. A service list is tcp/80, udp/53, icmp/8,
-or ALL when the rule has no service. priority is the OVN ACL priority when
-every service on that peer is covered, otherwise the policy rule priority.
+or ALL when the rule has no service. priority is the priority on the OVN-NB
+ACL row. The ACL table is the check: every ACL is classified and verified.
 """
 
 import csv
@@ -383,8 +386,9 @@ def rule_is_flex(rule, policy_type):
         return True
     return str(policy_type or "") in ("kFlex", "FLEX")
 
-def annotate_component(comp, unique_uuid, project_uuid, is_flex, include_project):
-    """Port-set hash only. Address groups are not port sets."""
+def annotate_component(comp, unique_uuid, project_uuid, is_flex, include_project,
+                        has_ipv6=False):
+    """Port-set hash, or the address-set uuid5 when the peer is an address group."""
     entity_type, refs, skip = component_refs(comp)
     role = comp.get("_key") or ""
     row = {
@@ -394,9 +398,13 @@ def annotate_component(comp, unique_uuid, project_uuid, is_flex, include_project
         "refs": refs,
         "port_set": "",
         "port_set_uuid": "",
+        "address_sets": [],
     }
-    if as_uuid_list(values(comp, "address_group_uuid")) or values(comp, "ip_subnet"):
+    groups = as_uuid_list(values(comp, "address_group_uuid"))
+    if groups or values(comp, "ip_subnet"):
         row["kind"] = "address_set"
+        for uid in groups:
+            row["address_sets"].extend(address_set_ids(uid, has_ipv6))
         return row
     if skip or not refs or not unique_uuid:
         return row
@@ -443,13 +451,14 @@ def annotate_policy(policy, vlan_uuid, global_uuid, include_project):
             walk_components(rule, comps)
             seen = set()
             component_rows = []
+            has_ipv6 = _policy_has_ipv6(policy)
             for comp in comps:
                 marker = (comp.get("_start"), comp.get("_end"), id(comp))
                 if marker in seen:
                     continue
                 seen.add(marker)
                 component_rows.append(annotate_component(
-                    comp, unique, project, is_flex, include_project))
+                    comp, unique, project, is_flex, include_project, has_ipv6))
             rules_out.append({
                 "rule_kind": rkey or rule.get("_key"),
                 "rule_uuid": rule_uuid,
@@ -1082,6 +1091,62 @@ IN_DIRECTIONS = frozenset((
 OUT_DIRECTIONS = frozenset((
     "kOut", "kOutbound", "OUT", "OUTBOUND", "kEgress"))
 K8S_NOISE_RE = re.compile(r"(k8s|kubernetes|cilium_vlan_scope)", re.I)
+
+# Hermes adds this to the Flow priority when it programs the ACL.
+# Flex security groups do not use it. hermes.consts.ACL_PRIORITY_OFFSET.
+ACL_PRIORITY_OFFSET = 1000
+
+# Flow policy_translator.consts after rearrange_priorities_for_enforce_monitor_policies.
+# kApply uses APPLY. kMonitor uses MONITOR. OVN stores value + ACL_PRIORITY_OFFSET.
+# Isolation L2 rows (eth.src / eth.dst) are the IP priority minus 1.
+APPLY_PRIORITY = {
+    "qs_intra_deny": 97,
+    "qs_default_deny": 95,
+    "qf_intra_deny": 92,
+    "qf_allow": 90,
+    "qf_default_deny": 80,
+    "ss_intra_deny": 77,
+    "ss_intra_allow": 75,
+    "ss_intra_default_deny": 74,
+    "ss_allow": 73,
+    "ss_default_allow": 72,
+    "ss_default_deny": 71,
+    "isolation_drop": 65,
+    "app_intra_deny": 60,
+    "app_intra_allow": 55,
+    "app_intra_default_deny": 52,
+    "app_allow": 50,
+    "app_default_allow": 47,
+    "app_default_deny": 45,
+    "isolation_allow_rest": 5,
+}
+MONITOR_PRIORITY = {
+    "qf_intra_allow": 40,
+    "qf_allow": 38,
+    "qf_default_allow": 35,
+    "ss_intra_deny": 33,
+    "ss_intra_allow": 31,
+    "ss_intra_default_deny": 30,
+    "ss_allow": 29,
+    "ss_default_allow": 27,
+    "isolation_allow": 23,
+    "app_intra_deny": 21,
+    "app_intra_allow": 19,
+    "app_intra_default_deny": 18,
+    "app_allow": 17,
+    "app_default_allow": 15,
+}
+# Hermes system ACLs. These are not Flow priority + offset.
+SYSTEM_PRIORITY = {
+    "dhcp": 31500,
+    "ipfix_allow": 500,
+    "nat_external_allow": 1000,
+    "nat_external_drop": 100,
+}
+MONITOR_MODES = frozenset(("kMonitor", "MONITOR"))
+SHARED_TYPES = frozenset(("kSharedServices", "kSharedService"))
+QUARANTINE_TYPES = frozenset(("kQuarantine",))
+ISOLATION_TYPES = frozenset(("kIsolation", "kMultiEnvIsolation"))
 OWNER_IN = re.compile(r"outport == @port_group_([A-Za-z0-9_]+)")
 OWNER_OUT = re.compile(r"inport == @port_group_([A-Za-z0-9_]+)")
 PEER_SRC = re.compile(
@@ -1096,6 +1161,80 @@ PRISM_LEADER_PATHS = (
     "/appliance/logical/leaders/prism_monitor",
     "/appliance/logical/pyleaders/prism_monitor",
 )
+
+
+def address_set_ids(entity_uuid, has_ipv6=False):
+    """uuid5(address_group, "IPv4"|"IPv6"). The OVN name is $address_set_<uuid>."""
+    vid = uuid_lib.UUID(str(entity_uuid))
+    rows = [str(uuid_lib.uuid5(vid, "IPv4"))]
+    if has_ipv6:
+        rows.append(str(uuid_lib.uuid5(vid, "IPv6")))
+    return rows
+
+
+def ovn_priority(role, mode="kApply"):
+    """OVN-NB priority for one Flow rule class. -1 when that class has none."""
+    table = MONITOR_PRIORITY if str(mode or "") in MONITOR_MODES else APPLY_PRIORITY
+    value = table.get(role)
+    if value is None:
+        return -1
+    return value + ACL_PRIORITY_OFFSET
+
+
+def _role_by_priority():
+    found = {}
+    for role, value in APPLY_PRIORITY.items():
+        found[value + ACL_PRIORITY_OFFSET] = role
+    for role, value in MONITOR_PRIORITY.items():
+        found.setdefault(value + ACL_PRIORITY_OFFSET, "monitor_%s" % role)
+    found[APPLY_PRIORITY["isolation_drop"] + ACL_PRIORITY_OFFSET - 1] = "isolation_drop_l2"
+    found[APPLY_PRIORITY["isolation_allow_rest"] + ACL_PRIORITY_OFFSET - 1] = (
+        "isolation_allow_rest_l2")
+    for role, value in SYSTEM_PRIORITY.items():
+        found[value] = role
+    return found
+
+
+ROLE_BY_PRIORITY = _role_by_priority()
+
+
+def _policy_has_ipv6(policy):
+    opts = first(policy, "options") or {}
+    if not isinstance(opts, dict):
+        return False
+    return bool(opts.get("ipv6_address_scope") or opts.get("allow_ipv6_traffic"))
+
+
+def _rule_role(policy_type, rule_kind, action, categories, quar):
+    """Flow class for this rule. The OVN number comes from ovn_priority."""
+    ptype = str(policy_type or "")
+    kind = str(rule_kind or "")
+    cats = set(str(item).lower() for item in (categories or []))
+    strict = str((quar or {}).get("strict") or "").lower()
+    forensic = str((quar or {}).get("forensic") or "").lower()
+    denied = action in (False, 0, "false", "False", "0")
+    quarantine = ptype in QUARANTINE_TYPES or kind == "quarantine_rule"
+    if quarantine and strict and strict in cats:
+        if kind == "secured_group_rule":
+            return "qs_intra_deny"
+        return "qs_default_deny"
+    if quarantine and forensic and forensic in cats:
+        if kind == "secured_group_rule":
+            return "qf_intra_deny"
+        return "qf_allow"
+    if quarantine:
+        return ""
+    if kind in ("isolation_rule", "multi_env_isolation_rule") or ptype in ISOLATION_TYPES:
+        return "isolation_drop"
+    if ptype in SHARED_TYPES or kind == "shared_service_rule":
+        if kind == "secured_group_rule":
+            return "ss_intra_deny" if denied else "ss_intra_allow"
+        return "ss_allow"
+    if kind == "secured_group_rule":
+        return "app_intra_deny" if denied else "app_intra_allow"
+    if kind in ("application_rule", "quarantine_rule", "flex_policy_rule"):
+        return "app_allow"
+    return ""
 
 
 def pg_uuid(token):
@@ -1142,14 +1281,21 @@ def _split_components(comps, direction):
     return selves, incoming, outgoing, isolated
 
 
-def _add_edge(found, policy, port_set, direction, peer, priority, spec):
+def _add_edge(found, policy, port_set, direction, peer, priority, spec, extra=None):
+    extra = extra or {}
     key = (
         policy, port_set, direction, peer,
-        spec.get("service_group") or "", spec.get("service") or "ALL")
+        spec.get("service_group") or "", spec.get("service") or "ALL",
+        extra.get("peer_kind") or "", extra.get("role") or "")
     slot = {
         "policy_priority": priority,
         "ports": spec.get("ports") or [],
         "missing_sg": bool(spec.get("missing_sg")),
+        "policy_name": extra.get("policy_name") or "",
+        "peer_kind": extra.get("peer_kind") or "",
+        "address_set": extra.get("address_set") or "",
+        "role": extra.get("role") or "",
+        "expected_priority": extra.get("expected_priority") or "",
     }
     prev = found.get(key)
     if prev is None or _prio_num(priority) > _prio_num(prev["policy_priority"]):
@@ -1290,15 +1436,55 @@ def _prio_num(value):
         return -1
 
 
-def policy_edges(policies, vlan_uuid, global_uuid, include_project=False, sg_map=None):
-    """One edge per policy port set and each incoming or outgoing peer."""
+def _address_peers(comps, direction):
+    incoming, outgoing = [], []
+    for comp in comps:
+        if comp.get("kind") != "address_set":
+            continue
+        ids = [item for item in (comp.get("address_sets") or []) if item]
+        if not ids:
+            continue
+        role = comp.get("role") or ""
+        if role in IN_ROLES or (role == "endpoint" and direction in IN_DIRECTIONS):
+            incoming.extend(ids)
+        elif role in OUT_ROLES or (role == "endpoint" and direction in OUT_DIRECTIONS):
+            outgoing.extend(ids)
+        elif role == "endpoint":
+            incoming.extend(ids)
+    return incoming, outgoing
+
+
+def _owner_categories(comps, owners):
+    cats = []
+    wanted = set(owners or [])
+    for comp in comps:
+        if comp.get("kind") != "port_set":
+            continue
+        if wanted and str(comp.get("port_set") or "").lower() not in wanted:
+            continue
+        cats.extend(str(item).lower() for item in (comp.get("refs") or []))
+    return cats
+
+
+def policy_edges(policies, vlan_uuid, global_uuid, include_project=False, sg_map=None,
+                 quar=None):
+    """One edge per policy port set and each incoming or outgoing peer.
+
+    The policy field is the policy UUID. An address-group peer is the
+    address-set UUID, not a port set. expected_priority is the OVN number
+    for that rule class.
+    """
     found = {}
+    quar = quar or {}
     for policy in policies or []:
         annotated, _extra = annotate_policy(
             policy, vlan_uuid, global_uuid, include_project)
         if annotated.get("skipped_save"):
             continue
-        name = annotated.get("name") or ""
+        policy_uuid = str(annotated.get("uuid") or "").lower()
+        policy_name = annotated.get("name") or ""
+        mode = annotated.get("mode") or ""
+        policy_type = annotated.get("policy_type") or ""
         raw_rules = list(iter_rules(policy))
         project = first(policy, "project_uuid") or ZERO
         project_arg = project if include_project else None
@@ -1313,49 +1499,112 @@ def policy_edges(policies, vlan_uuid, global_uuid, include_project=False, sg_map
                     hashed, _body = generate_port_set_id(
                         entity_type, refs, unique, project_arg, is_flex=True)
                     comps.append({
-                        "role": role, "kind": "port_set", "port_set": hashed})
+                        "role": role, "kind": "port_set", "port_set": hashed,
+                        "refs": refs})
             direction = str(first(raw, "direction") or "")
             priority = policy_priority(raw)
             services = rule_services(raw, sg_map or {})
             selves, incoming, outgoing, isolated = _split_components(
                 comps, direction)
+            addr_in, addr_out = _address_peers(comps, direction)
+            owners_for_role = selves or isolated
+            role = _rule_role(
+                policy_type, arule.get("rule_kind") or rkey,
+                first(raw, "action"),
+                _owner_categories(comps, owners_for_role), quar)
+            if arule.get("is_flex"):
+                expected = priority if _prio_num(priority) >= 0 else ""
+                role = role or "flex"
+            else:
+                expected = ovn_priority(role, mode)
+                expected = "" if expected < 0 else str(expected)
 
-            def emit(owner, way, peer):
-                for spec in services:
-                    _add_edge(found, name, owner, way, peer, priority, spec)
+            def emit(owner, way, peer, peer_kind, address_set, use_role):
+                use_expected = expected if use_role == role else ""
+                if use_role and use_role != role:
+                    alt = ovn_priority(use_role, mode)
+                    use_expected = "" if alt < 0 else str(alt)
+                extra = {
+                    "policy_name": policy_name,
+                    "peer_kind": peer_kind,
+                    "address_set": address_set,
+                    "role": use_role,
+                    "expected_priority": use_expected,
+                }
+                specs = services if peer_kind == "port_set" or peer_kind == "address_set" else [{
+                    "service_group": "", "service": "ALL", "ports": [],
+                    "missing_sg": False,
+                }]
+                for spec in specs:
+                    _add_edge(
+                        found, policy_uuid, owner, way, peer, priority, spec, extra)
 
             if isolated:
                 for owner in isolated:
                     peers = [item for item in isolated if item != owner]
                     if not peers:
-                        emit(owner, "", "")
+                        emit(owner, "", "", "port_set", "", role)
                         continue
                     for peer in peers:
-                        emit(owner, "incoming", peer)
-                        emit(owner, "outgoing", peer)
+                        emit(owner, "incoming", peer, "port_set", "", role)
+                        emit(owner, "outgoing", peer, "port_set", "", role)
+                    allow = "isolation_allow" if str(mode) in MONITOR_MODES else "isolation_allow_rest"
+                    emit(owner, "incoming", "", "default_deny", "", allow)
+                    emit(owner, "outgoing", "", "default_deny", "", allow)
                 continue
             owners = selves or []
-            if not owners and (incoming or outgoing):
-                owners = [""]
             for owner in owners:
                 if not owner:
                     continue
-                if not incoming and not outgoing:
-                    emit(owner, "", "")
                 for peer in incoming:
                     if peer != owner:
-                        emit(owner, "incoming", peer)
+                        emit(owner, "incoming", peer, "port_set", "", role)
                 for peer in outgoing:
                     if peer != owner:
-                        emit(owner, "outgoing", peer)
+                        emit(owner, "outgoing", peer, "port_set", "", role)
+                for peer in addr_in:
+                    emit(owner, "incoming", peer, "address_set", peer, role)
+                for peer in addr_out:
+                    emit(owner, "outgoing", peer, "address_set", peer, role)
+                if role.endswith("_intra_deny") or role.endswith("_intra_allow"):
+                    emit(owner, "incoming", "", "intra", "", role)
+                    emit(owner, "outgoing", "", "intra", "", role)
+                    intra_default = role.replace("_intra_deny", "_intra_default_deny").replace(
+                        "_intra_allow", "_intra_default_deny")
+                    if intra_default != role and ovn_priority(intra_default, mode) >= 0:
+                        emit(owner, "incoming", "", "intra", "", intra_default)
+                        emit(owner, "outgoing", "", "intra", "", intra_default)
+                    if role.startswith("app_intra"):
+                        deny_role = (
+                            "app_default_allow" if str(mode) in MONITOR_MODES
+                            else "app_default_deny")
+                        emit(owner, "incoming", "", "default_deny", "", deny_role)
+                        emit(owner, "outgoing", "", "default_deny", "", deny_role)
+                if role in ("app_allow", "ss_allow", "qf_allow", "qs_default_deny"):
+                    deny_role = {
+                        "app_allow": "app_default_allow" if str(mode) in MONITOR_MODES else "app_default_deny",
+                        "ss_allow": "ss_default_allow" if str(mode) in MONITOR_MODES else "ss_default_deny",
+                        "qf_allow": "qf_default_allow" if str(mode) in MONITOR_MODES else "qf_default_deny",
+                        "qs_default_deny": "qs_default_deny",
+                    }[role]
+                    emit(owner, "incoming", "", "default_deny", "", deny_role)
+                    emit(owner, "outgoing", "", "default_deny", "", deny_role)
+                    if role == "qf_allow":
+                        emit(owner, "incoming", "", "default_deny", "", "qf_allow")
+                        emit(owner, "outgoing", "", "default_deny", "", "qf_allow")
     rows = []
     for key, slot in sorted(found.items()):
-        policy, port_set, direction, peer, service_group, service = key
+        policy, port_set, direction, peer, service_group, service, peer_kind, role = key
         rows.append({
             "policy": policy,
+            "policy_name": slot["policy_name"],
             "port_set": port_set,
             "direction": direction,
-            "peer_port_set": peer,
+            "peer_port_set": "" if peer_kind in ("address_set", "intra", "default_deny") else peer,
+            "address_set": slot["address_set"] or (peer if peer_kind == "address_set" else ""),
+            "peer_kind": peer_kind,
+            "role": role,
+            "expected_priority": slot["expected_priority"],
             "service_group": service_group,
             "service": service,
             "policy_priority": slot["policy_priority"],
@@ -1375,6 +1624,121 @@ def parse_port_groups(text):
         if UUID_RE.fullmatch(uid):
             groups.add(uid)
     return groups
+
+
+def parse_acl_rows(text):
+    """Every OVN-NB ACL row. Priority is the number stored on that row."""
+    rows = []
+    reader = csv.reader(io.StringIO(text or ""))
+    for row in reader:
+        if len(row) < 3:
+            continue
+        priority, action = row[0].strip(), row[1].strip()
+        match = ",".join(row[2:]).strip()
+        if not match or match == "match" or priority == "priority":
+            continue
+        ins = [pg_uuid(item) for item in re.findall(
+            r"inport == @(port_group_[A-Za-z0-9_]+)", match)]
+        outs = [pg_uuid(item) for item in re.findall(
+            r"outport == @(port_group_[A-Za-z0-9_]+)", match)]
+        srcs = [pg_uuid(item) for item in PEER_SRC.findall(match)]
+        dsts = [pg_uuid(item) for item in PEER_DST.findall(match)]
+        ins = [item for item in ins if UUID_RE.fullmatch(item)]
+        outs = [item for item in outs if UUID_RE.fullmatch(item)]
+        srcs = [item for item in srcs if UUID_RE.fullmatch(item)]
+        dsts = [item for item in dsts if UUID_RE.fullmatch(item)]
+        if ins and outs and set(ins) == set(outs):
+            kind, direction, owners, peers = "intra", "intra", ins, ins
+        elif outs and srcs:
+            kind, direction, owners, peers = "incoming", "incoming", outs, srcs
+        elif ins and dsts:
+            kind, direction, owners, peers = "outgoing", "outgoing", ins, dsts
+        elif outs:
+            kind, direction, owners, peers = "outport_only", "incoming", outs, []
+        elif ins:
+            kind, direction, owners, peers = "inport_only", "outgoing", ins, []
+        else:
+            kind, direction, owners, peers = "global", "", [], []
+        rows.append({
+            "priority": priority,
+            "action": action,
+            "kind": kind,
+            "direction": direction,
+            "owners": owners,
+            "peers": peers,
+        })
+    return rows
+
+
+def verify_acl_rows(acl_rows, groups):
+    """Every ACL. The priority check uses the number on that OVN-NB row."""
+    failed = []
+    counts = {}
+    priorities = {}
+    priority_checked = 0
+    for rec in acl_rows:
+        counts[rec["kind"]] = counts.get(rec["kind"], 0) + 1
+        priority = rec["priority"]
+        if _prio_num(priority) < 0:
+            failed.append({
+                "priority": priority,
+                "action": rec["action"],
+                "kind": rec["kind"],
+                "port_set": (rec["owners"] or [""])[0],
+                "ovn": "priority_missing",
+            })
+            continue
+        priority_checked += 1
+        priorities[priority] = priorities.get(priority, 0) + 1
+        if rec["kind"] == "global":
+            continue
+        owners = list(rec["owners"])
+        missing = [uid for uid in owners if uid not in groups]
+        if not owners:
+            failed.append({
+                "priority": priority,
+                "action": rec["action"],
+                "kind": rec["kind"],
+                "port_set": "",
+                "ovn": "unparsed",
+            })
+        elif missing:
+            failed.append({
+                "priority": priority,
+                "action": rec["action"],
+                "kind": rec["kind"],
+                "port_set": missing[0],
+                "ovn": "owner_missing",
+            })
+    return failed, counts, priorities, priority_checked
+
+
+def write_acls(acl_rows, groups, handle):
+    """Print the ACL verification. Return how many ACL rows failed."""
+    failed, counts, priorities, priority_checked = verify_acl_rows(acl_rows, groups)
+    priority_failed = len(acl_rows) - priority_checked
+    handle.write(
+        "OVN NB acl: checked=%s verified=%s failed=%s "
+        "priority_checked=%s priority_failed=%s\n" % (
+            len(acl_rows), len(acl_rows) - len(failed), len(failed),
+            priority_checked, priority_failed))
+    handle.write(
+        "OVN NB acl kind: %s\n" % " ".join(
+            "%s=%s" % (kind, counts[kind]) for kind in sorted(counts)))
+    handle.write(
+        "OVN NB acl priority: %s\n" % " ".join(
+            "%s=%s" % (pri, priorities[pri])
+            for pri in sorted(priorities, key=_prio_num, reverse=True)))
+    roles = {}
+    for pri, count in priorities.items():
+        role = ROLE_BY_PRIORITY.get(_prio_num(pri), "unknown")
+        roles[role] = roles.get(role, 0) + count
+    handle.write(
+        "OVN NB acl role: %s\n" % " ".join(
+            "%s=%s" % (role, roles[role]) for role in sorted(roles)))
+    for rec in failed:
+        handle.write(json.dumps(rec, separators=(",", ":")) + "\n")
+    return len(failed)
 
 
 def parse_acl_index(text):
@@ -1505,7 +1869,7 @@ def atlas_port_name(atlas_ids, uid):
 
 def skip_kubernetes(edge, atlas_ids):
     """Same Kubernetes ignore class as the port-set leftover check."""
-    if is_k8s_name(edge.get("policy")):
+    if is_k8s_name(edge.get("policy")) or is_k8s_name(edge.get("policy_name")):
         return True
     if is_k8s_name(atlas_port_name(atlas_ids, edge.get("port_set"))):
         return True
@@ -1513,22 +1877,26 @@ def skip_kubernetes(edge, atlas_ids):
 
 
 def reported_by_atlas(edge, atlas_ids):
-    """False when Atlas did not report this port set or its peer.
+    """False when Atlas did not report this port set or its port-set peer.
 
-    atlas_ids None skips the filter. An empty peer is not a port set.
+    An address set is not an atlas_port_set row. atlas_ids None skips the filter.
     """
     if atlas_ids is None:
         return True
     if edge["port_set"] not in atlas_ids:
         return False
+    if edge.get("peer_kind") in ("address_set", "intra", "default_deny"):
+        return True
     peer = edge.get("peer_port_set") or ""
     return not peer or peer in atlas_ids
 
 
 def port_set_status(edge, groups):
-    """Port-group presence only. Service groups are a later check."""
+    """Port-group presence only. An address set is not a port group."""
     if edge["port_set"] not in groups:
         return "missing"
+    if edge.get("peer_kind") in ("address_set", "intra", "default_deny"):
+        return "present"
     if edge.get("peer_port_set") and edge["peer_port_set"] not in groups:
         return "peer_missing"
     return "present"
@@ -1555,19 +1923,41 @@ def port_set_rows(edges, groups, atlas_ids=None):
 
 
 def acls_for(edge, by_owner):
+    """ACLs for this owner and peer.
+
+    The peer is the address-set UUID when the rule names an address group
+    or a port set's generated address set. A port-group token still matches
+    when the ACL was programmed that way.
+    """
     port_set = edge["port_set"]
-    peer = edge.get("peer_port_set") or ""
     direction = edge.get("direction") or ""
-    directions = (direction,) if direction else ("incoming", "outgoing")
+    directions = (direction,) if direction in ("incoming", "outgoing") else (
+        "incoming", "outgoing")
     owner = by_owner.get(port_set) or {}
+    want = []
+    if edge.get("address_set"):
+        want.append(edge["address_set"])
+    peer = edge.get("peer_port_set") or ""
+    if peer and edge.get("peer_kind") != "address_set":
+        want.append(peer)
+    if edge.get("peer_kind") in ("intra", "default_deny") and not want:
+        want = [""]
+    elif not want:
+        want = [""]
     found = []
     for way in directions:
         peers = owner.get(way) or {}
-        if peer:
-            found.extend(peers.get(peer) or [])
-        else:
+        if want == [""] and edge.get("peer_kind") not in ("intra", "default_deny", "address_set"):
             for acls in peers.values():
                 found.extend(acls)
+            continue
+        for key in want:
+            found.extend(peers.get(key) or [])
+    expected = edge.get("expected_priority")
+    if expected not in (None, ""):
+        hit = [item for item in found if str(item[0]) == str(expected)]
+        if hit:
+            return hit
     return found
 
 
@@ -1600,8 +1990,12 @@ def service_rows(edges, groups, acl_index, atlas_ids=None):
             ovn = "acl_missing"
         else:
             found = cover_priority(acls, ports)
+            expected = edge.get("expected_priority")
             if found is None:
                 ovn = "service_missing"
+            elif expected not in (None, "") and str(found) != str(expected):
+                ovn = "priority_mismatch"
+                priority = found
             else:
                 ovn = "present"
                 priority = found
@@ -1619,8 +2013,8 @@ def service_rows(edges, groups, acl_index, atlas_ids=None):
 
 
 def _side_check(edge, groups, by_owner):
-    """Peer port set, priority, and service group against one OVN-NB direction."""
-    priority = edge.get("policy_priority") or ""
+    """Peer port set, OVN-NB ACL priority, and service group for one direction."""
+    priority = ""
     status = port_set_status(edge, groups)
     service_group = edge.get("service_group") or ""
     service = edge.get("service") or "ALL"
@@ -1630,17 +2024,26 @@ def _side_check(edge, groups, by_owner):
         ovn = "sg_missing"
     else:
         acls = acls_for(edge, by_owner)
+        expected = edge.get("expected_priority")
         if not acls:
             ovn = "acl_missing"
         else:
             found = cover_priority(acls, edge.get("ports") or [])
             if found is None:
                 ovn = "service_missing"
+            elif _prio_num(found) < 0:
+                ovn = "priority_missing"
+            elif expected not in (None, "") and str(found) != str(expected):
+                ovn = "priority_mismatch"
+                priority = found
             else:
                 ovn = "present"
                 priority = found
+    peer_kind = edge.get("peer_kind") or ""
     return {
-        "port_set": edge.get("peer_port_set") or "",
+        "port_set": "" if peer_kind == "address_set" else (edge.get("peer_port_set") or ""),
+        "address_set": edge.get("address_set") or "",
+        "role": edge.get("role") or "",
         "priority": priority,
         "service_group": service_group,
         "service": service,
@@ -1655,13 +2058,17 @@ def _service_parts(text):
 def _collapse_direction(items):
     """One peer entry. service_group and service are lists for that peer."""
     worst = {
-        "present": 0, "service_missing": 1, "acl_missing": 2,
-        "sg_missing": 3, "peer_missing": 4, "missing": 5,
+        "present": 0, "service_missing": 1, "priority_mismatch": 2,
+        "acl_missing": 3, "sg_missing": 4, "peer_missing": 5, "missing": 6,
     }
     grouped = {}
     order = []
     for item in items:
-        peer = item["port_set"]
+        peer = (
+            item.get("port_set") or "",
+            item.get("address_set") or "",
+            item.get("role") or "",
+        )
         if peer not in grouped:
             grouped[peer] = []
             order.append(peer)
@@ -1687,13 +2094,15 @@ def _collapse_direction(items):
             elif ports != ["ALL"]:
                 services.append(ports)
         out.append({
-            "port_set": peer,
+            "port_set": parts[0].get("port_set") or "",
+            "address_set": parts[0].get("address_set") or "",
+            "role": parts[0].get("role") or "",
             "priority": priority,
             "service_group": groups,
             "service": services,
             "ovn": ovn,
         })
-    out.sort(key=lambda item: item["port_set"])
+    out.sort(key=lambda item: (item["port_set"], item["address_set"], item["role"]))
     return out
 
 
@@ -1736,15 +2145,47 @@ def record_failed(rec):
         for item in rec.get("incoming", []) + rec.get("outgoing", []))
 
 
-def write_nb(records, handle):
-    """Print failing port-set dicts. Return how many port sets failed."""
+def not_checked_rows(records, groups, atlas_map):
+    """OVN port groups whose UUID no current policy hash produced.
+
+    A shared name string does not attach a port set to a policy. The only
+    link is the port-set UUID the policy rules hash to.
+    """
+    checked = {rec["port_set"] for rec in records}
+    rows = []
+    for uid in sorted(groups or ()):
+        if uid in checked:
+            continue
+        name = atlas_port_name(atlas_map, uid)
+        if is_k8s_name(name):
+            reason = "kubernetes"
+            detail = "Port set %s is skipped." % uid
+        elif isinstance(atlas_map, dict) and uid not in atlas_map:
+            reason = "not_in_atlas"
+            detail = "OVN-NB has port set %s. Atlas has no entity with this UUID." % uid
+        else:
+            reason = "no_policy_uuid"
+            detail = "No current policy UUID hashes to port set %s." % uid
+        rows.append({"port_set": uid, "reason": reason, "detail": detail})
+    return rows
+
+
+def write_nb(records, handle, port_groups=0, acls=0, groups=None, atlas_map=None):
+    """Print the OVN-NB fetch, the missing report, and port groups not checked."""
     failed = [rec for rec in records if record_failed(rec)]
-    handle.write("OVN NB\n")
+    skipped = not_checked_rows(records, groups, atlas_map) if groups is not None else []
+    handle.write(
+        "OVN NB fetched: port_groups=%s acls=%s\n" % (port_groups, acls))
+    handle.write(
+        "OVN NB report: port_sets=%s present=%s missing=%s not_checked=%s\n" % (
+            len(records), len(records) - len(failed), len(failed), len(skipped)))
+    handle.write("OVN NB missing: %s\n" % len(failed))
     for rec in failed:
         handle.write(json.dumps(rec, separators=(",", ":")) + "\n")
-    handle.write(
-        "OVN NB: port_sets=%s present=%s missing=%s\n" % (
-            len(records), len(records) - len(failed), len(failed)))
+    if groups is not None:
+        handle.write("OVN NB not_checked: %s\n" % len(skipped))
+        for row in skipped:
+            handle.write(json.dumps(row, separators=(",", ":")) + "\n")
     return len(failed)
 
 
@@ -1846,7 +2287,10 @@ def load_ovn(info, timeout):
         info, ["--columns=name", "list", "Port_Group"], timeout)
     _rc, acl_text, _err = _ovn_nb(
         info, ["--columns=priority,action,match", "list", "ACL"], timeout)
-    return parse_port_groups(groups_text), parse_acl_index(acl_text)
+    return (
+        parse_port_groups(groups_text),
+        parse_acl_index(acl_text),
+        parse_acl_rows(acl_text))
 
 
 def _local_ips():
@@ -2053,12 +2497,51 @@ def self_test():
     if any(item["port_set"].startswith("bc53edec") for rec in hidden for item in rec["incoming"] + rec["outgoing"]):
         raise SystemExit("peer missing from atlas was reported: %s" % hidden)
     buf = io.StringIO()
-    missing = write_nb(nb, buf)
+    missing = write_nb(
+        nb, buf, port_groups=len(groups), acls=len(index), groups=groups)
     text = buf.getvalue()
-    if not text.startswith("OVN NB\n{") or missing != 2:
+    if not text.startswith("OVN NB fetched: port_groups=2 acls=2\n") or missing != 2:
         raise SystemExit("nb output missing=%s\n%s" % (missing, text))
-    if not text.endswith("OVN NB: port_sets=2 present=0 missing=2\n"):
+    if "OVN NB report: port_sets=2 present=0 missing=2 not_checked=1\n" not in text:
         raise SystemExit("nb summary: %s" % text)
+    if "OVN NB missing: 2\n{" not in text:
+        raise SystemExit("missing report: %s" % text)
+    if '"reason":"no_policy_uuid"' not in text or "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" not in text:
+        raise SystemExit("not checked report: %s" % text)
+    if '"name":' in text.split("OVN NB not_checked:", 1)[-1]:
+        raise SystemExit("not checked row used a name: %s" % text)
+    acl_sample = "\n".join([
+        '100,allow-related,"outport == @port_group_aaaaaaaa_aaaa_4aaa_8aaa_aaaaaaaaaaaa && ip4.src == @port_group_bbbbbbbb_bbbb_4bbb_8bbb_bbbbbbbbbbbb"',
+        '1045,drop,"outport == @port_group_aaaaaaaa_aaaa_4aaa_8aaa_aaaaaaaaaaaa && ip4"',
+        '1017,allow-related,"inport == @port_group_aaaaaaaa_aaaa_4aaa_8aaa_aaaaaaaaaaaa && outport == @port_group_aaaaaaaa_aaaa_4aaa_8aaa_aaaaaaaaaaaa && ip4"',
+        '31500,allow-stateless,"udp.src == 67 && udp.dst == 68"',
+        '50,drop,"outport == @port_group_ffffffff_ffff_4fff_8fff_ffffffffffff && ip4"',
+    ])
+    acl_rows = parse_acl_rows(acl_sample)
+    kinds = {}
+    for rec in acl_rows:
+        kinds[rec["kind"]] = kinds.get(rec["kind"], 0) + 1
+    if kinds.get("incoming") != 1 or kinds.get("outport_only") != 2 or kinds.get("intra") != 1 or kinds.get("global") != 1:
+        raise SystemExit("acl kinds: %s" % kinds)
+    if acl_rows[0]["priority"] != "100":
+        raise SystemExit("acl priority: %s" % acl_rows[0])
+    acl_rows.append({
+        "priority": "",
+        "action": "allow-related",
+        "kind": "incoming",
+        "direction": "incoming",
+        "owners": ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"],
+        "peers": ["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"],
+    })
+    acl_buf = io.StringIO()
+    acl_failed = write_acls(acl_rows, groups, acl_buf)
+    acl_text_out = acl_buf.getvalue()
+    if acl_failed != 2 or "priority_checked=5 priority_failed=1" not in acl_text_out:
+        raise SystemExit("acl report: %s" % acl_text_out)
+    if '"ovn":"owner_missing"' not in acl_text_out or '"ovn":"priority_missing"' not in acl_text_out:
+        raise SystemExit("acl failure row: %s" % acl_text_out)
+    if "31500=1" not in acl_text_out or "100=1" not in acl_text_out:
+        raise SystemExit("acl priorities: %s" % acl_text_out)
     policy = {
         "uuid": "11111111-1111-4111-8111-111111111111",
         "name": "Iso",
@@ -2091,8 +2574,68 @@ def self_test():
     dirs = {(row["direction"], row["policy_priority"], row["service"]) for row in built}
     if ("incoming", "25", "tcp/80") not in dirs or ("outgoing", "25", "tcp/80") not in dirs:
         raise SystemExit("isolation edges: %s" % built)
-    if any(row["service_group"] != "Web" for row in built):
+    peer_rows = [row for row in built if row.get("peer_port_set")]
+    if any(row["service_group"] != "Web" for row in peer_rows):
         raise SystemExit("service group name: %s" % built)
+    if any(row["policy"] == "Iso" for row in built):
+        raise SystemExit("policy edge used a name: %s" % built)
+    if ovn_priority("app_allow", "kApply") != 1050:
+        raise SystemExit("app allow priority")
+    if ovn_priority("app_default_deny", "kApply") != 1045:
+        raise SystemExit("app default deny priority")
+    if ovn_priority("app_intra_deny", "kApply") != 1060:
+        raise SystemExit("app intra deny priority")
+    if ovn_priority("qs_intra_deny", "kApply") != 1097:
+        raise SystemExit("qs intra deny priority")
+    if ovn_priority("qf_default_deny", "kApply") != 1080:
+        raise SystemExit("qf default deny priority")
+    if ovn_priority("isolation_drop", "kApply") != 1065:
+        raise SystemExit("isolation drop priority")
+    if ovn_priority("app_allow", "kMonitor") != 1017:
+        raise SystemExit("monitor app allow priority")
+    if SYSTEM_PRIORITY["dhcp"] != 31500 or SYSTEM_PRIORITY["ipfix_allow"] != 500:
+        raise SystemExit("system priority")
+    if ROLE_BY_PRIORITY.get(31500) != "dhcp" or ROLE_BY_PRIORITY.get(500) != "ipfix_allow":
+        raise SystemExit("system role: %s" % ROLE_BY_PRIORITY.get(31500))
+    if ROLE_BY_PRIORITY.get(1050) != "app_allow" or ROLE_BY_PRIORITY.get(1045) != "app_default_deny":
+        raise SystemExit("apply role")
+    if ROLE_BY_PRIORITY.get(1097) != "qs_intra_deny" or ROLE_BY_PRIORITY.get(1065) != "isolation_drop":
+        raise SystemExit("quarantine or isolation role")
+    if address_set_ids("da2f45c1-e4a5-40a9-9aec-ac32fad3b6f8", False) != [
+            "49d3b015-7bac-5a2a-8d9a-5c033243ba71"]:
+        raise SystemExit("address set hash")
+    app_policy = {
+        "uuid": "af1c7c7a-b22e-4136-90eb-44eb2a006a17",
+        "name": "ignored",
+        "mode": "kApply",
+        "policy_type": "kApplication",
+        "scope": "kAllVlan",
+        "rules_list": [{
+            "application_rule": {
+                "rule_info": {"uuid": "9b1ebc64-6756-4d09-97d9-875539a8d831"},
+                "direction": "kIn",
+                "secured_group": {"category_uuid_list": [
+                    "e9a488b7-adab-346c-92d4-00180d6e6748"]},
+                "endpoint": {"address_group_uuid": "da2f45c1-e4a5-40a9-9aec-ac32fad3b6f8"},
+                "services": [{"service_group_uuid": "407982f9-5504-4504-a42d-78143d09f3fe"}],
+            }
+        }],
+    }
+    app_edges = policy_edges(
+        [app_policy], "29332a4d-9133-4c73-a219-ce82ea53d532",
+        "702970d3-d72d-41b9-9655-50c40ffd96f4",
+        sg_map={
+            "407982f9-5504-4504-a42d-78143d09f3fe": {
+                "uuid": "407982f9-5504-4504-a42d-78143d09f3fe",
+                "name": "Web", "ports": [("tcp", 80, 80)], "service": "tcp/80",
+            }})
+    addr = [
+        row for row in app_edges
+        if row.get("address_set") == "49d3b015-7bac-5a2a-8d9a-5c033243ba71"]
+    if not addr or addr[0]["expected_priority"] != "1050" or addr[0]["peer_kind"] != "address_set":
+        raise SystemExit("address set edge: %s" % app_edges)
+    if addr[0]["policy"] != "af1c7c7a-b22e-4136-90eb-44eb2a006a17":
+        raise SystemExit("policy uuid: %s" % addr[0])
     print("self-test ok edges=%s" % len(built))
 
 
@@ -2107,6 +2650,117 @@ def parse_args(argv):
     parser.add_argument("--include-project", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args(argv)
+
+
+AS_MAP_PY = r"""
+import json, sys, uuid
+try:
+  import gflags
+  gflags.FLAGS(sys.argv[:1], known_only=True)
+except Exception:
+  pass
+from util.sl_bufs.net.rpc_pb2 import RpcRequestContext
+from atlas.atlas_interface_pb2 import PortSetAddressSetMapGetArg
+from atlas.client.client import AtlasClient
+from util.misc.protobuf import pb2json, reformat_proto
+uuids = json.loads('''__UUIDS__''')
+ctx = RpcRequestContext()
+ctx.should_authorize = False
+client = AtlasClient()
+out = {}
+step = 400
+for start in range(0, len(uuids), step):
+  arg = PortSetAddressSetMapGetArg()
+  for uid in uuids[start:start + step]:
+    arg.port_set_uuid_list.append(uuid.UUID(str(uid)).bytes)
+  ret = client.PortSetAddressSetMapGet(arg, request_context=ctx)
+  payload = pb2json(reformat_proto(ret), b64_bytes=False, convert_enum_to_str=True)
+  for row in payload.get("port_set_address_set_map_list") or []:
+    out[str(row.get("uuid") or "").lower()] = {
+      "ipv4": str(row.get("generated_ipv4_address_set_uuid") or "").lower(),
+      "ipv6": str(row.get("generated_ipv6_address_set_uuid") or "").lower(),
+    }
+sys.stdout.write(json.dumps(out, separators=(",", ":")))
+"""
+
+CAT_PY = r"""
+import json, sys
+try:
+  import gflags
+  gflags.FLAGS(sys.argv[:1], known_only=True)
+except Exception:
+  pass
+from aplos.categories.category import Category
+sys.stdout.write(json.dumps({
+  "strict": str(Category("Quarantine", "Default").uuid),
+  "forensic": str(Category("Quarantine", "Forensics").uuid),
+}, separators=(",", ":")))
+"""
+
+
+def _atlas_python():
+    return _which(
+        "/home/nutanix/.venvs/bin/bin/python3",
+        "/home/nutanix/.venvs/flow/bin/python3",
+        "")
+
+
+def _run_pc_python(py, script, timeout):
+    if not py:
+        raise SystemExit("python3 for Atlas/Flow is missing")
+    rc, out, err = _run([py, "-"], timeout, input_text=script)
+    if rc != 0:
+        raise SystemExit((err or out or "python failed")[:400])
+    payload = _json_loads(out)
+    if not isinstance(payload, dict):
+        raise SystemExit("python returned no JSON object")
+    return payload
+
+
+def fetch_port_set_address_sets(info, uuids, timeout):
+    """Atlas generated IPv4/IPv6 address set for each port set."""
+    uuids = [str(uid).lower() for uid in (uuids or []) if uid]
+    if not uuids:
+        return {}
+    timeout = max(60, min(300, int(timeout or 180)))
+    py = _atlas_python()
+    script = AS_MAP_PY.replace("__UUIDS__", json.dumps(uuids))
+    return _run_pc_python(py, script, timeout)
+
+
+def fetch_quarantine_categories(info, timeout):
+    """System category UUIDs Flow uses to choose strict versus forensic.
+
+    The lookup is the same Category(key, value) Flow's quarantine translator
+    uses. The rest of this script compares those UUIDs and does not keep the
+    category value.
+    """
+    timeout = max(30, min(120, int(timeout or 60)))
+    py = _flow_python()
+    try:
+        return _run_pc_python(py, CAT_PY, timeout)
+    except SystemExit as err:
+        LOG.info("quarantine categories unavailable: %s", err)
+        return {}
+
+
+def bind_address_sets(edges, address_map):
+    """Fill the port set's generated address set. Address groups are already hashed."""
+    address_map = address_map or {}
+    for edge in edges:
+        kind = edge.get("peer_kind") or ""
+        if kind == "address_set":
+            continue
+        if kind == "intra":
+            rec = address_map.get(edge.get("port_set") or "") or {}
+            edge["address_set"] = rec.get("ipv4") or ""
+            continue
+        if kind == "default_deny":
+            continue
+        peer = edge.get("peer_port_set") or ""
+        rec = address_map.get(peer) or {}
+        if rec.get("ipv4"):
+            edge["address_set"] = rec["ipv4"]
 
 
 def main(argv=None):
@@ -2125,23 +2779,30 @@ def main(argv=None):
     if not policies:
         raise SystemExit("no policies from flow_cli")
     sg_map = fetch_service_groups(info, min(int(args.timeout), 300))
+    quar = fetch_quarantine_categories(info, min(int(args.timeout), 120))
     edges = policy_edges(
         policies, vlan_uuid, global_uuid, include_project=args.include_project,
-        sg_map=sg_map)
+        sg_map=sg_map, quar=quar)
     atlas_map = fetch_idf_port_sets(info, min(int(args.timeout), 300))
+    address_map = fetch_port_set_address_sets(
+        info, list(atlas_map), min(int(args.timeout), 300))
+    bind_address_sets(edges, address_map)
     kept = [
         edge for edge in edges
         if reported_by_atlas(edge, atlas_map) and not skip_kubernetes(edge, atlas_map)]
-    groups, acl_index = load_ovn(info, min(int(args.timeout), 600))
+    groups, acl_index, acl_rows = load_ovn(info, min(int(args.timeout), 600))
     LOG.info(
         "policies=%s service_groups=%s edges=%s atlas_port_sets=%s "
         "kept_edges=%s ovn_port_groups=%s ovn_acls=%s",
         len(policies), len(sg_map), len(edges), len(atlas_map), len(kept),
-        len(groups), len(acl_index))
+        len(groups), len(acl_rows))
+    acl_failed = write_acls(acl_rows, groups, sys.stdout)
     records = port_set_nb(kept, groups, acl_index, atlas_map)
-    missing = write_nb(records, sys.stdout)
+    missing = write_nb(
+        records, sys.stdout, port_groups=len(groups), acls=len(acl_rows),
+        groups=groups, atlas_map=atlas_map)
     sys.stdout.flush()
-    return 1 if missing else 0
+    return 1 if missing or acl_failed else 0
 
 
 if __name__ == "__main__":
