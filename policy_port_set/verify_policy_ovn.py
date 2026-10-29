@@ -1736,16 +1736,40 @@ def record_failed(rec):
         for item in rec.get("incoming", []) + rec.get("outgoing", []))
 
 
-def write_nb(records, handle, port_groups=0, acls=0):
-    """Print the OVN-NB fetch, failing port-set dicts, then the verification."""
+def not_checked_rows(records, groups, atlas_map):
+    """Port groups fetched from OVN-NB that were not part of the policy check."""
+    checked = {rec["port_set"] for rec in records}
+    rows = []
+    for uid in sorted(groups or ()):
+        if uid in checked:
+            continue
+        name = atlas_port_name(atlas_map, uid)
+        if is_k8s_name(name):
+            reason = "kubernetes"
+        elif isinstance(atlas_map, dict) and uid not in atlas_map:
+            reason = "not_in_atlas"
+        else:
+            reason = "no_policy_edge"
+        rows.append({"port_set": uid, "name": name, "reason": reason})
+    return rows
+
+
+def write_nb(records, handle, port_groups=0, acls=0, groups=None, atlas_map=None):
+    """Print the OVN-NB fetch, the missing report, and port groups not checked."""
     failed = [rec for rec in records if record_failed(rec)]
+    skipped = not_checked_rows(records, groups, atlas_map) if groups is not None else []
     handle.write(
         "OVN NB fetched: port_groups=%s acls=%s\n" % (port_groups, acls))
+    handle.write(
+        "OVN NB report: port_sets=%s present=%s missing=%s not_checked=%s\n" % (
+            len(records), len(records) - len(failed), len(failed), len(skipped)))
+    handle.write("OVN NB missing: %s\n" % len(failed))
     for rec in failed:
         handle.write(json.dumps(rec, separators=(",", ":")) + "\n")
-    handle.write(
-        "OVN NB verified: port_sets=%s present=%s missing=%s\n" % (
-            len(records), len(records) - len(failed), len(failed)))
+    if groups is not None:
+        handle.write("OVN NB not_checked: %s\n" % len(skipped))
+        for row in skipped:
+            handle.write(json.dumps(row, separators=(",", ":")) + "\n")
     return len(failed)
 
 
@@ -2054,12 +2078,20 @@ def self_test():
     if any(item["port_set"].startswith("bc53edec") for rec in hidden for item in rec["incoming"] + rec["outgoing"]):
         raise SystemExit("peer missing from atlas was reported: %s" % hidden)
     buf = io.StringIO()
-    missing = write_nb(nb, buf, port_groups=len(groups), acls=len(index))
+    missing = write_nb(
+        nb, buf, port_groups=len(groups), acls=len(index), groups=groups)
     text = buf.getvalue()
-    if not text.startswith("OVN NB fetched: port_groups=2 acls=2\n{") or missing != 2:
+    if not text.startswith("OVN NB fetched: port_groups=2 acls=2\n") or missing != 2:
         raise SystemExit("nb output missing=%s\n%s" % (missing, text))
-    if not text.endswith("OVN NB verified: port_sets=2 present=0 missing=2\n"):
+    if "OVN NB report: port_sets=2 present=0 missing=2 not_checked=1\n" not in text:
         raise SystemExit("nb summary: %s" % text)
+    if "OVN NB missing: 2\n{" not in text:
+        raise SystemExit("missing report: %s" % text)
+    if not text.endswith(
+            'OVN NB not_checked: 1\n'
+            '{"port_set":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",'
+            '"name":"","reason":"no_policy_edge"}\n'):
+        raise SystemExit("not checked report: %s" % text)
     policy = {
         "uuid": "11111111-1111-4111-8111-111111111111",
         "name": "Iso",
@@ -2141,7 +2173,8 @@ def main(argv=None):
         len(groups), len(acl_index))
     records = port_set_nb(kept, groups, acl_index, atlas_map)
     missing = write_nb(
-        records, sys.stdout, port_groups=len(groups), acls=len(acl_index))
+        records, sys.stdout, port_groups=len(groups), acls=len(acl_index),
+        groups=groups, atlas_map=atlas_map)
     sys.stdout.flush()
     return 1 if missing else 0
 

@@ -103,14 +103,18 @@ ovn-nbctl --db=unix:/var/run/ovn/ovnnb_db.sock --format=csv --data=bare --no-hea
 ovn-nbctl --db=unix:/var/run/ovn/ovnnb_db.sock --format=csv --data=bare --no-heading --columns=priority,action,match list ACL
 ```
 
-Stdout names that fetch, then prints only the dicts that fail, then names the verification against the fetched rows:
+Stdout is the report. It names the fetch, then the check, then the missing rows, then the fetched port groups that were not part of the check:
 
 ```
 OVN NB fetched: port_groups=1291 acls=16691
-OVN NB verified: port_sets=1184 present=1184 missing=0
+OVN NB report: port_sets=1184 present=1184 missing=0 not_checked=107
+OVN NB missing: 0
+OVN NB not_checked: 107
+{"port_set":"...","name":"...","reason":"kubernetes"}
+{"port_set":"...","name":"...","reason":"no_policy_edge"}
 ```
 
-`port_groups` is the number of `Port_Group` rows. `acls` is the number of `ACL` rows. Each dict is verified against those rows: the owner port group, the peer port group, the ACL direction, the priority, and every port in `service`.
+`missing` is a port set the policy check expected and OVN-NB did not confirm. Each missing row is the full incoming and outgoing dict. `not_checked` is a port group OVN-NB returned that the policy check did not own: `kubernetes`, or `no_policy_edge` when Atlas has the UUID and the policy walk did not emit it. `port_groups` is the number of `Port_Group` rows. `acls` is the number of `ACL` rows. Each checked dict is verified against those rows: the owner port group, the peer port group, the ACL direction, the priority, and every port in `service`.
 
 An incoming ACL has `outport == @port_group_<owner>` and the peer in `ip4.src` or `ip6.src`. An outgoing ACL has `inport == @port_group_<owner>` and the peer in `ip4.dst` or `ip6.dst`.
 
@@ -123,7 +127,7 @@ An incoming ACL has `outport == @port_group_<owner>` and the peer in `ip4.src` o
 | `service_missing` | an ACL exists and does not cover every port in the service lists |
 | `present` | the port group, peer, priority, and every service are in OVN-NB |
 
-A port set or peer that is absent from `atlas_port_set` is ignored. Kubernetes is ignored when the policy name or the Atlas name matches `k8s`, `kubernetes`, or `cilium_vlan_scope`. Only dicts that fail are printed. Exit status is 1 when any dict fails.
+A port set or peer that is absent from `atlas_port_set` is ignored. Kubernetes is ignored when the policy name or the Atlas name matches `k8s`, `kubernetes`, or `cilium_vlan_scope`. Those ignored port groups still appear under `OVN NB not_checked`. Exit status is 1 when `missing` is not 0.
 
 ## Completed OVN-NB check
 
@@ -131,8 +135,12 @@ The check finished on the CMSP Prism Central at `10.120.159.166`, with OVN-NB re
 
 ```
 OVN NB fetched: port_groups=1291 acls=16691
-OVN NB verified: port_sets=1184 present=1184 missing=0
+OVN NB report: port_sets=1184 present=1184 missing=0 not_checked=107
+OVN NB missing: 0
+OVN NB not_checked: 107
 ```
+
+Of the 107 not checked, 4 are `kubernetes` (`K8s_App_1_Cilium_VLAN_Scope` and `K8s_App_2_Cilium_VLAN_Scope`, owner and peer). The other 103 are `no_policy_edge`: Atlas and OVN-NB have the port group, and the policy walk did not emit that UUID. That list is the same extra Atlas UUIDs the Atlas script reports as `idf_without_computed`, including the Quarantine Forensic and Quarantine Strict port groups Atlas did create.
 
 | | count |
 |---|---|
