@@ -22,9 +22,10 @@ verify_policy_ovn.py
         | keep a row only when Atlas has the port set and the peer
         | drop Kubernetes names
         v
-   1. PORT SET VERIFICATION     OVN-NB Port_Group
-   2. SERVICE GROUP VERIFICATION
-        Flow ServiceGroupGet + OVN-NB ACL priority and ports
+   one dict per port set
+        incoming:  peer port_set, priority, service_group[], service[][]
+        outgoing:  peer port_set, priority, service_group[], service[][]
+        each entry checked in OVN-NB
 ```
 
 ## Port-set identity
@@ -63,38 +64,48 @@ That exception does not hide a hash Atlas never created. Quarantine Forensic and
 
 ## OVN-NB check
 
-`verify_policy_ovn.py` hashes the same selectors in its own copy of the algorithm. For each port set it records the incoming peers and the outgoing peers.
+`verify_policy_ovn.py` hashes the same selectors in its own copy of the algorithm. For each owner port set it builds one dict:
 
-An incoming ACL has `outport == @port_group_<owner>` and the peer in `ip4.src` or `ip6.src`. An outgoing ACL has `inport == @port_group_<owner>` and the peer in `ip4.dst` or `ip6.dst`. The peer may be a port group or an address set. The ACL priority is kept when that ACL covers the service ports. Otherwise the row keeps the policy rule priority.
+```json
+{
+  "policy": "App",
+  "port_set": "917386ac-6978-5da1-91a6-3782ffebd275",
+  "ovn": "present",
+  "incoming": [
+    {
+      "port_set": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      "priority": "100",
+      "service_group": ["Web", "SSH"],
+      "service": [["tcp/80"], ["tcp/22", "udp/22"]],
+      "ovn": "present"
+    }
+  ],
+  "outgoing": [
+    {
+      "port_set": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      "priority": "25",
+      "service_group": ["mysql"],
+      "service": [["tcp/3306", "udp/3306"]],
+      "ovn": "present"
+    }
+  ]
+}
+```
 
-The script prints two sections, in this order. Only failures are printed.
+`service_group` is the list of service groups on that peer. `service` is the matching list of port lists. One Flow rule carries a list of service groups, and one service group carries a list of protocol/port ranges, so neither field is a single string. `priority` is the OVN-NB ACL priority when every service in the list is covered. Otherwise it stays the policy rule priority.
 
-### 1. Port set verification
-
-Columns: `policy`, `port_set`, `direction`, `peer_port_set`, `ovn`.
+An incoming ACL has `outport == @port_group_<owner>` and the peer in `ip4.src` or `ip6.src`. An outgoing ACL has `inport == @port_group_<owner>` and the peer in `ip4.dst` or `ip6.dst`.
 
 | `ovn` | meaning |
 |---|---|
-| `missing` | Atlas has this port set and OVN-NB has no port group |
-| `peer_missing` | Atlas has the peer and OVN-NB has no port group for it |
-| `present` | both port groups exist; the row is not printed |
+| `missing` | this port group is not in OVN-NB |
+| `peer_missing` | the peer port group is not in OVN-NB |
+| `sg_missing` | Flow did not return a service group in the list |
+| `acl_missing` | no ACL for that peer and direction |
+| `service_missing` | an ACL exists and does not cover every port in the service lists |
+| `present` | the port group, peer, priority, and every service are in OVN-NB |
 
-A port set or peer that is absent from `atlas_port_set` is ignored. OVN is not asked to have a port group Atlas did not report. Kubernetes is ignored when the policy name or the Atlas name matches `k8s`, `kubernetes`, or `cilium_vlan_scope`. Those Cilium VLAN-scope port groups exist in OVN with no member ports and no ACL, so they are not an OVN failure.
-
-### 2. Service group verification
-
-This section runs only for rows whose port set and peer are already `present`. Columns add `service_group`, `service`, `priority`, and `ovn`.
-
-Flow service groups come from `ServiceGroupGet` through the Flow virtualenv. The JSON stays in memory. A rule with no service group and service `ALL` is not a service-group row.
-
-| `ovn` | meaning |
-|---|---|
-| `sg_missing` | Flow did not return this service group |
-| `acl_missing` | no ACL for that owner, direction, and peer |
-| `service_missing` | an ACL exists and does not cover the service ports |
-| `present` | the ACL covers every port in the service; not printed |
-
-`service` looks like `tcp/80`, `udp/53-53`, `icmp/8`, or a comma-separated list. Exit status is 1 when either section has a missing row.
+A port set or peer that is absent from `atlas_port_set` is ignored. Kubernetes is ignored when the policy name or the Atlas name matches `k8s`, `kubernetes`, or `cilium_vlan_scope`. Only dicts that fail are printed. Exit status is 1 when any dict fails.
 
 ## Completed OVN-NB check
 
@@ -114,4 +125,4 @@ The check finished on the CMSP Prism Central at `10.120.159.166`, with OVN-NB re
 
 The same counts were produced before and after `verify_policy_ovn.py` stopped importing `validate_port_sets.py`.
 
-The Atlas script on that same PC still reports its own mismatches. Those rows are outside the OVN sections because Atlas did not report the UUID, or because the Kubernetes name is ignored: 16 `EG_Exclude_Policy1` exclude port sets, Quarantine Forensic, Quarantine Strict, and the empty `K8s_App_*_Cilium_VLAN_Scope` port groups.
+The Atlas script on that same PC still reports its own mismatches. Those port sets stay out of the OVN dict because Atlas did not report the UUID, or because the Kubernetes name is ignored: 16 `EG_Exclude_Policy1` exclude port sets, Quarantine Forensic, Quarantine Strict, and the empty `K8s_App_*_Cilium_VLAN_Scope` port groups.

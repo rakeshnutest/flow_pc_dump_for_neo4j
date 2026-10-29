@@ -15,26 +15,25 @@ stored.
   python3 verify_policy_ovn.py --self-test
   panacea_cli verify_policy_ovn.py
 
-Stdout is two checks, in this order. Only rows that fail are printed.
-A port set or peer that Atlas does not report in atlas_port_set is ignored.
-Kubernetes is ignored when the policy or Atlas name matches k8s, kubernetes,
-or cilium_vlan_scope.
+Stdout is one JSON object per port set that fails. Each object is:
 
-  PORT SET VERIFICATION
-  policy  port_set  direction  peer_port_set  ovn
-  ovn=missing        Atlas has this port set and OVN-NB does not
-  ovn=peer_missing   Atlas has the peer and OVN-NB does not
+  {"policy","port_set","ovn","incoming":[...],"outgoing":[...]}
 
-  SERVICE GROUP VERIFICATION
-  policy  port_set  direction  peer_port_set  service_group  service  priority  ovn
-  Runs only for port sets and peers that are already present.
+incoming and outgoing each name the peer port set once. service_group is the
+list of service groups on that peer. service is the matching list of port
+lists, one list per service group. ovn=present means that peer, priority,
+and every service are in OVN-NB. A port set or peer that Atlas does not
+report is ignored. Kubernetes names are ignored.
+
+  ovn=missing          this port group is not in OVN-NB
+  ovn=peer_missing     the peer port group is not in OVN-NB
   ovn=sg_missing       Flow did not return this service group
-  ovn=acl_missing      no ACL for that direction and peer
+  ovn=acl_missing      no ACL for that peer and direction
   ovn=service_missing  the ACL does not cover the service ports
 
-direction is incoming or outgoing. service is tcp/80, udp/53-53, icmp/8,
-or ALL when the rule has no service. priority is the OVN ACL priority
-when that ACL covers the service, otherwise the policy rule priority.
+direction is incoming or outgoing. A service list is tcp/80, udp/53, icmp/8,
+or ALL when the rule has no service. priority is the OVN ACL priority when
+every service on that peer is covered, otherwise the policy rule priority.
 """
 
 import csv
@@ -1619,6 +1618,136 @@ def service_rows(edges, groups, acl_index, atlas_ids=None):
     return rows
 
 
+def _side_check(edge, groups, by_owner):
+    """Peer port set, priority, and service group against one OVN-NB direction."""
+    priority = edge.get("policy_priority") or ""
+    status = port_set_status(edge, groups)
+    service_group = edge.get("service_group") or ""
+    service = edge.get("service") or "ALL"
+    if status != "present":
+        ovn = status
+    elif edge.get("missing_sg"):
+        ovn = "sg_missing"
+    else:
+        acls = acls_for(edge, by_owner)
+        if not acls:
+            ovn = "acl_missing"
+        else:
+            found = cover_priority(acls, edge.get("ports") or [])
+            if found is None:
+                ovn = "service_missing"
+            else:
+                ovn = "present"
+                priority = found
+    return {
+        "port_set": edge.get("peer_port_set") or "",
+        "priority": priority,
+        "service_group": service_group,
+        "service": service,
+        "ovn": ovn,
+    }
+
+
+def _service_parts(text):
+    return [part for part in str(text or "").split(",") if part]
+
+
+def _collapse_direction(items):
+    """One peer entry. service_group and service are lists for that peer."""
+    worst = {
+        "present": 0, "service_missing": 1, "acl_missing": 2,
+        "sg_missing": 3, "peer_missing": 4, "missing": 5,
+    }
+    grouped = {}
+    order = []
+    for item in items:
+        peer = item["port_set"]
+        if peer not in grouped:
+            grouped[peer] = []
+            order.append(peer)
+        grouped[peer].append(item)
+    out = []
+    for peer in order:
+        parts = grouped[peer]
+        ovn = max((part["ovn"] for part in parts), key=lambda item: worst.get(item, 9))
+        if ovn == "present":
+            priority = max((part["priority"] for part in parts), key=_prio_num)
+        else:
+            priority = parts[0]["priority"]
+        groups = []
+        services = []
+        for part in parts:
+            ports = _service_parts(part["service"]) or ["ALL"]
+            name = part["service_group"]
+            if name:
+                groups.append(name)
+                services.append(ports)
+            elif not groups and ports == ["ALL"] and not services:
+                services.append(ports)
+            elif ports != ["ALL"]:
+                services.append(ports)
+        out.append({
+            "port_set": peer,
+            "priority": priority,
+            "service_group": groups,
+            "service": services,
+            "ovn": ovn,
+        })
+    out.sort(key=lambda item: item["port_set"])
+    return out
+
+
+def port_set_nb(edges, groups, acl_index, atlas_ids=None):
+    """One dict per port set: incoming peers and outgoing peers, checked in NB."""
+    by_owner = index_acls_by_owner(acl_index)
+    found = {}
+    for edge in edges:
+        if skip_kubernetes(edge, atlas_ids) or not reported_by_atlas(edge, atlas_ids):
+            continue
+        key = (edge["policy"], edge["port_set"])
+        slot = found.get(key)
+        if slot is None:
+            slot = {
+                "policy": edge["policy"],
+                "port_set": edge["port_set"],
+                "ovn": "missing" if edge["port_set"] not in groups else "present",
+                "incoming": [],
+                "outgoing": [],
+            }
+            found[key] = slot
+        direction = edge.get("direction") or ""
+        if direction not in ("incoming", "outgoing"):
+            continue
+        slot[direction].append(_side_check(edge, groups, by_owner))
+    records = []
+    for key in sorted(found):
+        rec = found[key]
+        for direction in ("incoming", "outgoing"):
+            rec[direction] = _collapse_direction(rec[direction])
+        records.append(rec)
+    return records
+
+
+def record_failed(rec):
+    if rec.get("ovn") != "present":
+        return True
+    return any(
+        item.get("ovn") != "present"
+        for item in rec.get("incoming", []) + rec.get("outgoing", []))
+
+
+def write_nb(records, handle):
+    """Print failing port-set dicts. Return how many port sets failed."""
+    failed = [rec for rec in records if record_failed(rec)]
+    handle.write("OVN NB\n")
+    for rec in failed:
+        handle.write(json.dumps(rec, separators=(",", ":")) + "\n")
+    handle.write(
+        "OVN NB: port_sets=%s present=%s missing=%s\n" % (
+            len(records), len(records) - len(failed), len(failed)))
+    return len(failed)
+
+
 def write_table(rows, handle, columns):
     writer = csv.DictWriter(
         handle, fieldnames=columns, delimiter="\t", lineterminator="\n",
@@ -1899,22 +2028,37 @@ def self_test():
     k8s_svc = service_rows([k8s_edge], groups, tcp_index, atlas)
     if k8s_svc:
         raise SystemExit("kubernetes service group was reported: %s" % k8s_svc)
+    nb = port_set_nb(edges[:3], groups, index)
+    by_policy = {rec["policy"]: rec for rec in nb}
+    app = by_policy["App"]
+    if app["ovn"] != "present" or len(app["incoming"]) != 1 or len(app["outgoing"]) != 1:
+        raise SystemExit("app dict: %s" % app)
+    inc = app["incoming"][0]
+    if inc["port_set"] != "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" or inc["priority"] != "100" or inc["ovn"] != "present":
+        raise SystemExit("incoming dict: %s" % inc)
+    if inc["service_group"] != [] or inc["service"] != [["ALL"]]:
+        raise SystemExit("incoming services: %s" % inc)
+    out = app["outgoing"][0]
+    if out["service_group"] != ["Web"] or out["service"] != [["tcp/80"]] or out["ovn"] != "peer_missing":
+        raise SystemExit("outgoing dict: %s" % out)
+    both = port_set_nb(edges[3:5], groups, tcp_index)
+    both_in = both[0]["incoming"][0]
+    if both_in["service_group"] != ["Web", "SSH"] or both_in["service"] != [["tcp/80"], ["tcp/22"]]:
+        raise SystemExit("service lists: %s" % both_in)
+    if by_policy["Gone"]["ovn"] != "missing":
+        raise SystemExit("missing port set dict: %s" % by_policy["Gone"])
+    hidden = port_set_nb(combined + [not_atlas, peer_not_atlas, k8s_edge], groups, index, atlas)
+    if any(rec["policy"].startswith("Quarantine") or is_k8s_name(rec["policy"]) for rec in hidden):
+        raise SystemExit("ignored port set was reported: %s" % hidden)
+    if any(item["port_set"].startswith("bc53edec") for rec in hidden for item in rec["incoming"] + rec["outgoing"]):
+        raise SystemExit("peer missing from atlas was reported: %s" % hidden)
     buf = io.StringIO()
-    port_missing = write_section(
-        "PORT SET VERIFICATION", port_rows, PORT_COLUMNS, buf)
-    sg_missing = write_section(
-        "SERVICE GROUP VERIFICATION", svc_rows, SG_COLUMNS, buf)
+    missing = write_nb(nb, buf)
     text = buf.getvalue()
-    if not text.startswith("PORT SET VERIFICATION\n"):
-        raise SystemExit("port set section is not first: %s" % text)
-    if "SERVICE GROUP VERIFICATION\n" not in text.split("PORT SET VERIFICATION:", 1)[-1]:
-        raise SystemExit("service section order: %s" % text)
-    if port_missing != 2 or sg_missing != 2:
-        raise SystemExit("counts port=%s sg=%s\n%s" % (port_missing, sg_missing, text))
-    if "PORT SET VERIFICATION: checked=3 present=1 missing=2\n" not in text:
-        raise SystemExit("port summary: %s" % text)
-    if not text.endswith("SERVICE GROUP VERIFICATION: checked=3 present=1 missing=2\n"):
-        raise SystemExit("service summary: %s" % text)
+    if not text.startswith("OVN NB\n{") or missing != 2:
+        raise SystemExit("nb output missing=%s\n%s" % (missing, text))
+    if not text.endswith("OVN NB: port_sets=2 present=0 missing=2\n"):
+        raise SystemExit("nb summary: %s" % text)
     policy = {
         "uuid": "11111111-1111-4111-8111-111111111111",
         "name": "Iso",
@@ -1994,15 +2138,10 @@ def main(argv=None):
         "kept_edges=%s ovn_port_groups=%s ovn_acls=%s",
         len(policies), len(sg_map), len(edges), len(atlas_map), len(kept),
         len(groups), len(acl_index))
-    port_rows = port_set_rows(kept, groups, atlas_map)
-    port_missing = write_section(
-        "PORT SET VERIFICATION", port_rows, PORT_COLUMNS, sys.stdout)
+    records = port_set_nb(kept, groups, acl_index, atlas_map)
+    missing = write_nb(records, sys.stdout)
     sys.stdout.flush()
-    svc_rows = service_rows(kept, groups, acl_index, atlas_map)
-    sg_missing = write_section(
-        "SERVICE GROUP VERIFICATION", svc_rows, SG_COLUMNS, sys.stdout)
-    sys.stdout.flush()
-    return 1 if port_missing or sg_missing else 0
+    return 1 if missing else 0
 
 
 if __name__ == "__main__":
