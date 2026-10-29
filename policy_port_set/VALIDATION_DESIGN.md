@@ -22,10 +22,12 @@ verify_policy_ovn.py
         | keep a row only when Atlas has the port set and the peer
         | drop Kubernetes names
         v
+   fetch OVN-NB Port_Group and ACL
+        v
    one dict per port set
         incoming:  peer port_set, priority, service_group[], service[][]
         outgoing:  peer port_set, priority, service_group[], service[][]
-        each entry checked in OVN-NB
+        each entry verified against the fetched OVN-NB rows
 ```
 
 ## Port-set identity
@@ -94,6 +96,22 @@ That exception does not hide a hash Atlas never created. Quarantine Forensic and
 
 `service_group` is the list of service groups on that peer. `service` is the matching list of port lists. One Flow rule carries a list of service groups, and one service group carries a list of protocol/port ranges, so neither field is a single string. `priority` is the OVN-NB ACL priority when every service in the list is covered. Otherwise it stays the policy rule priority.
 
+OVN-NB is fetched on the Prism Central leader before any port set is checked. The data stays in memory. On CMSP the commands run inside the `anc-ovn-0` pod:
+
+```
+ovn-nbctl --db=unix:/var/run/ovn/ovnnb_db.sock --format=csv --data=bare --no-heading --columns=name list Port_Group
+ovn-nbctl --db=unix:/var/run/ovn/ovnnb_db.sock --format=csv --data=bare --no-heading --columns=priority,action,match list ACL
+```
+
+Stdout names that fetch, then prints only the dicts that fail, then names the verification against the fetched rows:
+
+```
+OVN NB fetched: port_groups=1291 acls=16691
+OVN NB verified: port_sets=1184 present=1184 missing=0
+```
+
+`port_groups` is the number of `Port_Group` rows. `acls` is the number of `ACL` rows. Each dict is verified against those rows: the owner port group, the peer port group, the ACL direction, the priority, and every port in `service`.
+
 An incoming ACL has `outport == @port_group_<owner>` and the peer in `ip4.src` or `ip6.src`. An outgoing ACL has `inport == @port_group_<owner>` and the peer in `ip4.dst` or `ip6.dst`.
 
 | `ovn` | meaning |
@@ -110,6 +128,11 @@ A port set or peer that is absent from `atlas_port_set` is ignored. Kubernetes i
 ## Completed OVN-NB check
 
 The check finished on the CMSP Prism Central at `10.120.159.166`, with OVN-NB read from the leader `10.120.159.168`. Exit status 0.
+
+```
+OVN NB fetched: port_groups=1291 acls=16691
+OVN NB verified: port_sets=1184 present=1184 missing=0
+```
 
 | | count |
 |---|---|

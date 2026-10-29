@@ -1736,14 +1736,15 @@ def record_failed(rec):
         for item in rec.get("incoming", []) + rec.get("outgoing", []))
 
 
-def write_nb(records, handle):
-    """Print failing port-set dicts. Return how many port sets failed."""
+def write_nb(records, handle, port_groups=0, acls=0):
+    """Print the OVN-NB fetch, failing port-set dicts, then the verification."""
     failed = [rec for rec in records if record_failed(rec)]
-    handle.write("OVN NB\n")
+    handle.write(
+        "OVN NB fetched: port_groups=%s acls=%s\n" % (port_groups, acls))
     for rec in failed:
         handle.write(json.dumps(rec, separators=(",", ":")) + "\n")
     handle.write(
-        "OVN NB: port_sets=%s present=%s missing=%s\n" % (
+        "OVN NB verified: port_sets=%s present=%s missing=%s\n" % (
             len(records), len(records) - len(failed), len(failed)))
     return len(failed)
 
@@ -2053,11 +2054,11 @@ def self_test():
     if any(item["port_set"].startswith("bc53edec") for rec in hidden for item in rec["incoming"] + rec["outgoing"]):
         raise SystemExit("peer missing from atlas was reported: %s" % hidden)
     buf = io.StringIO()
-    missing = write_nb(nb, buf)
+    missing = write_nb(nb, buf, port_groups=len(groups), acls=len(index))
     text = buf.getvalue()
-    if not text.startswith("OVN NB\n{") or missing != 2:
+    if not text.startswith("OVN NB fetched: port_groups=2 acls=2\n{") or missing != 2:
         raise SystemExit("nb output missing=%s\n%s" % (missing, text))
-    if not text.endswith("OVN NB: port_sets=2 present=0 missing=2\n"):
+    if not text.endswith("OVN NB verified: port_sets=2 present=0 missing=2\n"):
         raise SystemExit("nb summary: %s" % text)
     policy = {
         "uuid": "11111111-1111-4111-8111-111111111111",
@@ -2139,7 +2140,8 @@ def main(argv=None):
         len(policies), len(sg_map), len(edges), len(atlas_map), len(kept),
         len(groups), len(acl_index))
     records = port_set_nb(kept, groups, acl_index, atlas_map)
-    missing = write_nb(records, sys.stdout)
+    missing = write_nb(
+        records, sys.stdout, port_groups=len(groups), acls=len(acl_index))
     sys.stdout.flush()
     return 1 if missing else 0
 
