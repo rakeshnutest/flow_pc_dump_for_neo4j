@@ -110,19 +110,16 @@ OVN NB fetched: port_groups=1291 acls=16691
 OVN NB report: port_sets=1184 present=1184 missing=0 not_checked=107
 OVN NB missing: 0
 OVN NB not_checked: 107
-{"port_set":"...","name":"VPC_California_SJ_Pheonix_Customer_1_Multi_Isolation_Policy","reason":"policy_hash_differs","detail":"Atlas has 10 port set(s) named VPC_California_SJ_Pheonix_Customer_1_Multi_Isolation_Policy. The policy hash matched none of them."}
-{"port_set":"...","name":"App_2","reason":"same_policy_other_port_set","detail":"Atlas has 5 port sets named App_2. The policy hash matched 3. This UUID is not one of them."}
+{"port_set":"07388d75-8498-5e07-813a-b007f27679a9","reason":"no_policy_uuid","detail":"No current policy UUID hashes to port set 07388d75-8498-5e07-813a-b007f27679a9."}
 ```
 
-`missing` is a port set the policy check expected and OVN-NB did not confirm. Each missing row is the full incoming and outgoing dict. `not_checked` is a port group OVN-NB returned that the policy hash did not use as an owner. The `detail` on each row says how many Atlas port sets share that name and how many of those the policy hash matched.
+`missing` is a port set the policy check expected and OVN-NB did not confirm. Each missing row is the full incoming and outgoing dict. `not_checked` is an OVN port group whose UUID no current policy hash produced. A shared name string does not attach that port set to a policy. The row carries the port-set UUID only.
 
 | reason | meaning |
 |---|---|
-| `policy_hash_differs` | Hashing the current policy selectors matched none of the Atlas port sets with this name. |
-| `same_policy_other_port_set` | The same name has another Atlas port set the hash did match, and that one was verified. This UUID is an extra port set with the same name. |
-| `empty_port_set` | The Atlas port set has no NICs, and the hash did not produce this UUID. |
-| `quarantine_extra_port_set` | Quarantine Forensic or Strict. Atlas has several empty port sets with that name. The hash matched one of them. This UUID is one of the others. |
-| `kubernetes` | The name matches `k8s`, `kubernetes`, or `cilium_vlan_scope`. |
+| `no_policy_uuid` | No current policy UUID hashes to this port-set UUID. |
+| `not_in_atlas` | OVN-NB has this port-set UUID. Atlas has no entity with that UUID. |
+| `kubernetes` | This port set is skipped by the kubernetes name filter. |
 
 `port_groups` is the number of `Port_Group` rows. `acls` is the number of `ACL` rows. Each checked dict is verified against those rows: the owner port group, the peer port group, the ACL direction, the priority, and every port in `service`.
 
@@ -150,14 +147,7 @@ OVN NB missing: 0
 OVN NB not_checked: 107
 ```
 
-Of the 107 not checked, 4 are `kubernetes` (`K8s_App_1_Cilium_VLAN_Scope` and `K8s_App_2_Cilium_VLAN_Scope`, owner and peer). The other 103 are Atlas port sets the policy hash did not produce:
-
-| reason | count | what Atlas shows |
-|---|---|---|
-| `policy_hash_differs` | 89 | Every Atlas port set with that name missed the hash. This is the VPC California customer policies, the Flow-CNI VPC apps, VPC-as-category App_51 through App_54, and `VPC_California_SJ_Pheonix_Customer_1_Multi_Isolation_Policy` (10 port sets, none matched). |
-| `same_policy_other_port_set` | 4 | `App_2` has 5 Atlas port sets and the hash matched 3. `Global_Application_Policy1` has 3 and the hash matched 1. These 4 UUIDs are the ones the hash did not match. |
-| `empty_port_set` | 4 | Both port sets of `App_680_No_VMs` and both of `App_681_No_VMs`. Each has no NICs. |
-| `quarantine_extra_port_set` | 6 | Forensic and Strict each have 4 empty Atlas port sets. The hash matched 1 of each. These 6 are the other empty port sets. |
+Of the 107 not checked, 4 are `kubernetes`: `bc82fa37-7265-5538-aa20-219c289683aa`, `39c086c2-f638-5ff6-a243-476b74f79e08`, `587c061b-1ce1-5cac-b0b4-e6687b4f32ea`, `ae312d44-626d-5369-b3f4-b7d6a782afb6`. The other 103 are `no_policy_uuid`. No current policy UUID hashes to those port-set UUIDs. The name string on the Atlas entity is not used.
 
 | | count |
 |---|---|

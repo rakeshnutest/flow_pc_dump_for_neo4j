@@ -1737,61 +1737,27 @@ def record_failed(rec):
 
 
 def not_checked_rows(records, groups, atlas_map):
-    """Port groups fetched from OVN-NB that were not part of the policy check.
+    """OVN port groups whose UUID no current policy hash produced.
 
-    The reason says how this Atlas port set relates to the UUIDs the policy
-    hash produced. Same policy name can own several Atlas port sets.
+    A shared name string does not attach a port set to a policy. The only
+    link is the port-set UUID the policy rules hash to.
     """
     checked = {rec["port_set"] for rec in records}
-    by_name = {}
-    if isinstance(atlas_map, dict):
-        for other, rec in atlas_map.items():
-            if isinstance(rec, dict):
-                by_name.setdefault(rec.get("name") or "", []).append(other)
     rows = []
     for uid in sorted(groups or ()):
         if uid in checked:
             continue
         name = atlas_port_name(atlas_map, uid)
-        rec = atlas_map.get(uid) if isinstance(atlas_map, dict) else None
-        nics = rec.get("nics") if isinstance(rec, dict) else None
-        siblings = by_name.get(name, []) if name else []
-        matched = [item for item in siblings if item in checked]
         if is_k8s_name(name):
             reason = "kubernetes"
-            detail = "Kubernetes port group. The OVN check does not verify it."
+            detail = "Port set %s is skipped." % uid
         elif isinstance(atlas_map, dict) and uid not in atlas_map:
             reason = "not_in_atlas"
-            detail = "OVN-NB has this port group. Atlas has no port set for it."
-        elif name.startswith("Quarantine"):
-            reason = "quarantine_extra_port_set"
-            detail = (
-                "Atlas has %s empty port sets named %s. "
-                "The policy hash matched %s. This UUID is one of the others."
-                % (len(siblings), name, len(matched)))
-        elif name and matched:
-            reason = "same_policy_other_port_set"
-            detail = (
-                "Atlas has %s port sets named %s. "
-                "The policy hash matched %s. This UUID is not one of them."
-                % (len(siblings), name, len(matched)))
-        elif nics is not None and not nics:
-            reason = "empty_port_set"
-            detail = (
-                "Atlas port set %s has no NICs. "
-                "The policy hash did not produce this UUID."
-                % (name or uid))
-        elif name and not matched:
-            reason = "policy_hash_differs"
-            detail = (
-                "Atlas has %s port set(s) named %s. "
-                "The policy hash matched none of them."
-                % (len(siblings), name))
+            detail = "OVN-NB has port set %s. Atlas has no entity with this UUID." % uid
         else:
-            reason = "policy_hash_differs"
-            detail = "The policy hash did not produce this UUID."
-        rows.append({
-            "port_set": uid, "name": name, "reason": reason, "detail": detail})
+            reason = "no_policy_uuid"
+            detail = "No current policy UUID hashes to port set %s." % uid
+        rows.append({"port_set": uid, "reason": reason, "detail": detail})
     return rows
 
 
@@ -2128,17 +2094,10 @@ def self_test():
         raise SystemExit("nb summary: %s" % text)
     if "OVN NB missing: 2\n{" not in text:
         raise SystemExit("missing report: %s" % text)
-    if '"reason":"policy_hash_differs"' not in text or "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" not in text:
+    if '"reason":"no_policy_uuid"' not in text or "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" not in text:
         raise SystemExit("not checked report: %s" % text)
-    named = not_checked_rows(
-        nb, groups, {
-            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa": {
-                "name": "App", "nics": ["n1"]},
-            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb": {
-                "name": "App", "nics": ["n2"]},
-        })
-    if named[0]["reason"] != "same_policy_other_port_set":
-        raise SystemExit("same policy reason: %s" % named)
+    if '"name":' in text.split("OVN NB not_checked:", 1)[-1]:
+        raise SystemExit("not checked row used a name: %s" % text)
     policy = {
         "uuid": "11111111-1111-4111-8111-111111111111",
         "name": "Iso",
