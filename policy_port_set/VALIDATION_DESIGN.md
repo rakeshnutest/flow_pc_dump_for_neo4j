@@ -110,11 +110,21 @@ OVN NB fetched: port_groups=1291 acls=16691
 OVN NB report: port_sets=1184 present=1184 missing=0 not_checked=107
 OVN NB missing: 0
 OVN NB not_checked: 107
-{"port_set":"...","name":"...","reason":"kubernetes"}
-{"port_set":"...","name":"...","reason":"no_policy_edge"}
+{"port_set":"...","name":"VPC_California_SJ_Pheonix_Customer_1_Multi_Isolation_Policy","reason":"policy_hash_differs","detail":"Atlas has 10 port set(s) named VPC_California_SJ_Pheonix_Customer_1_Multi_Isolation_Policy. The policy hash matched none of them."}
+{"port_set":"...","name":"App_2","reason":"same_policy_other_port_set","detail":"Atlas has 5 port sets named App_2. The policy hash matched 3. This UUID is not one of them."}
 ```
 
-`missing` is a port set the policy check expected and OVN-NB did not confirm. Each missing row is the full incoming and outgoing dict. `not_checked` is a port group OVN-NB returned that the policy check did not own: `kubernetes`, or `no_policy_edge` when Atlas has the UUID and the policy walk did not emit it. `port_groups` is the number of `Port_Group` rows. `acls` is the number of `ACL` rows. Each checked dict is verified against those rows: the owner port group, the peer port group, the ACL direction, the priority, and every port in `service`.
+`missing` is a port set the policy check expected and OVN-NB did not confirm. Each missing row is the full incoming and outgoing dict. `not_checked` is a port group OVN-NB returned that the policy hash did not use as an owner. The `detail` on each row says how many Atlas port sets share that name and how many of those the policy hash matched.
+
+| reason | meaning |
+|---|---|
+| `policy_hash_differs` | Hashing the current policy selectors matched none of the Atlas port sets with this name. |
+| `same_policy_other_port_set` | The same name has another Atlas port set the hash did match, and that one was verified. This UUID is an extra port set with the same name. |
+| `empty_port_set` | The Atlas port set has no NICs, and the hash did not produce this UUID. |
+| `quarantine_extra_port_set` | Quarantine Forensic or Strict. Atlas has several empty port sets with that name. The hash matched one of them. This UUID is one of the others. |
+| `kubernetes` | The name matches `k8s`, `kubernetes`, or `cilium_vlan_scope`. |
+
+`port_groups` is the number of `Port_Group` rows. `acls` is the number of `ACL` rows. Each checked dict is verified against those rows: the owner port group, the peer port group, the ACL direction, the priority, and every port in `service`.
 
 An incoming ACL has `outport == @port_group_<owner>` and the peer in `ip4.src` or `ip6.src`. An outgoing ACL has `inport == @port_group_<owner>` and the peer in `ip4.dst` or `ip6.dst`.
 
@@ -140,7 +150,14 @@ OVN NB missing: 0
 OVN NB not_checked: 107
 ```
 
-Of the 107 not checked, 4 are `kubernetes` (`K8s_App_1_Cilium_VLAN_Scope` and `K8s_App_2_Cilium_VLAN_Scope`, owner and peer). The other 103 are `no_policy_edge`: Atlas and OVN-NB have the port group, and the policy walk did not emit that UUID. That list is the same extra Atlas UUIDs the Atlas script reports as `idf_without_computed`, including the Quarantine Forensic and Quarantine Strict port groups Atlas did create.
+Of the 107 not checked, 4 are `kubernetes` (`K8s_App_1_Cilium_VLAN_Scope` and `K8s_App_2_Cilium_VLAN_Scope`, owner and peer). The other 103 are Atlas port sets the policy hash did not produce:
+
+| reason | count | what Atlas shows |
+|---|---|---|
+| `policy_hash_differs` | 89 | Every Atlas port set with that name missed the hash. This is the VPC California customer policies, the Flow-CNI VPC apps, VPC-as-category App_51 through App_54, and `VPC_California_SJ_Pheonix_Customer_1_Multi_Isolation_Policy` (10 port sets, none matched). |
+| `same_policy_other_port_set` | 4 | `App_2` has 5 Atlas port sets and the hash matched 3. `Global_Application_Policy1` has 3 and the hash matched 1. These 4 UUIDs are the ones the hash did not match. |
+| `empty_port_set` | 4 | Both port sets of `App_680_No_VMs` and both of `App_681_No_VMs`. Each has no NICs. |
+| `quarantine_extra_port_set` | 6 | Forensic and Strict each have 4 empty Atlas port sets. The hash matched 1 of each. These 6 are the other empty port sets. |
 
 | | count |
 |---|---|
