@@ -94,7 +94,7 @@ That exception does not hide a hash Atlas never created. Quarantine Forensic and
 }
 ```
 
-`service_group` is the list of service groups on that peer. `service` is the matching list of port lists. One Flow rule carries a list of service groups, and one service group carries a list of protocol/port ranges, so neither field is a single string. `priority` is the OVN-NB ACL priority when every service in the list is covered. Otherwise it stays the policy rule priority.
+`service_group` is the list of service groups on that peer. `service` is the matching list of port lists. One Flow rule carries a list of service groups, and one service group carries a list of protocol/port ranges, so neither field is a single string. `priority` is the number on the OVN-NB ACL row. Every ACL is priority-checked: a row with no integer priority fails as `priority_missing`. The check does not rank policy types.
 
 OVN-NB is fetched on the Prism Central leader before any port set is checked. The data stays in memory. On CMSP the commands run inside the `anc-ovn-0` pod:
 
@@ -132,7 +132,8 @@ An incoming ACL has `outport == @port_group_<owner>` and the peer in `ip4.src` o
 | `sg_missing` | Flow did not return a service group in the list |
 | `acl_missing` | no ACL for that peer and direction |
 | `service_missing` | an ACL exists and does not cover every port in the service lists |
-| `present` | the port group, peer, priority, and every service are in OVN-NB |
+| `present` | the port group, peer, and every service are covered by an ACL whose priority is an integer |
+| `priority_missing` | the ACL row has no integer priority |
 
 A port set or peer that is absent from `atlas_port_set` is ignored. Kubernetes is ignored when the policy name or the Atlas name matches `k8s`, `kubernetes`, or `cilium_vlan_scope`. Those ignored port groups still appear under `OVN NB not_checked`. Exit status is 1 when `missing` is not 0.
 
@@ -141,10 +142,11 @@ A port set or peer that is absent from `atlas_port_set` is ignored. Kubernetes i
 The check finished on the CMSP Prism Central at `10.120.159.166`, with OVN-NB read from the leader `10.120.159.168`. Exit status 0.
 
 ```
-OVN NB fetched: port_groups=1291 acls=16691
+OVN NB acl: checked=28793 verified=28793 failed=0 priority_checked=28793 priority_failed=0
+OVN NB acl kind: global=7406 incoming=8796 inport_only=2534 outgoing=7539 outport_only=2518
+OVN NB acl priority: 31500=3762 1097=8 1095=24 1092=8 1090=8 1080=16 1065=40 1064=20 1060=2414 1055=8 1052=2422 1050=11355 1045=4844 1019=32 1018=32 1017=32 1015=64 1005=40 1004=20 1000=2 500=3640 100=2
+OVN NB fetched: port_groups=1291 acls=28793
 OVN NB report: port_sets=1184 present=1184 missing=0 not_checked=107
-OVN NB missing: 0
-OVN NB not_checked: 107
 ```
 
 Of the 107 not checked, 4 are `kubernetes`: `bc82fa37-7265-5538-aa20-219c289683aa`, `39c086c2-f638-5ff6-a243-476b74f79e08`, `587c061b-1ce1-5cac-b0b4-e6687b4f32ea`, `ae312d44-626d-5369-b3f4-b7d6a782afb6`. The other 103 are `no_policy_uuid`. No current policy UUID hashes to those port-set UUIDs. The name string on the Atlas entity is not used.

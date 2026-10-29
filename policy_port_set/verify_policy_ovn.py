@@ -32,8 +32,8 @@ report is ignored. Kubernetes names are ignored.
   ovn=service_missing  the ACL does not cover the service ports
 
 direction is incoming or outgoing. A service list is tcp/80, udp/53, icmp/8,
-or ALL when the rule has no service. priority is the OVN ACL priority when
-every service on that peer is covered, otherwise the policy rule priority.
+or ALL when the rule has no service. priority is the priority on the OVN-NB
+ACL row. The ACL table is the check: every ACL is classified and verified.
 """
 
 import csv
@@ -1377,6 +1377,114 @@ def parse_port_groups(text):
     return groups
 
 
+def parse_acl_rows(text):
+    """Every OVN-NB ACL row. Priority is the number stored on that row."""
+    rows = []
+    reader = csv.reader(io.StringIO(text or ""))
+    for row in reader:
+        if len(row) < 3:
+            continue
+        priority, action = row[0].strip(), row[1].strip()
+        match = ",".join(row[2:]).strip()
+        if not match or match == "match" or priority == "priority":
+            continue
+        ins = [pg_uuid(item) for item in re.findall(
+            r"inport == @(port_group_[A-Za-z0-9_]+)", match)]
+        outs = [pg_uuid(item) for item in re.findall(
+            r"outport == @(port_group_[A-Za-z0-9_]+)", match)]
+        srcs = [pg_uuid(item) for item in PEER_SRC.findall(match)]
+        dsts = [pg_uuid(item) for item in PEER_DST.findall(match)]
+        ins = [item for item in ins if UUID_RE.fullmatch(item)]
+        outs = [item for item in outs if UUID_RE.fullmatch(item)]
+        srcs = [item for item in srcs if UUID_RE.fullmatch(item)]
+        dsts = [item for item in dsts if UUID_RE.fullmatch(item)]
+        if ins and outs and set(ins) == set(outs):
+            kind, direction, owners, peers = "intra", "intra", ins, ins
+        elif outs and srcs:
+            kind, direction, owners, peers = "incoming", "incoming", outs, srcs
+        elif ins and dsts:
+            kind, direction, owners, peers = "outgoing", "outgoing", ins, dsts
+        elif outs:
+            kind, direction, owners, peers = "outport_only", "incoming", outs, []
+        elif ins:
+            kind, direction, owners, peers = "inport_only", "outgoing", ins, []
+        else:
+            kind, direction, owners, peers = "global", "", [], []
+        rows.append({
+            "priority": priority,
+            "action": action,
+            "kind": kind,
+            "direction": direction,
+            "owners": owners,
+            "peers": peers,
+        })
+    return rows
+
+
+def verify_acl_rows(acl_rows, groups):
+    """Every ACL. The priority check uses the number on that OVN-NB row."""
+    failed = []
+    counts = {}
+    priorities = {}
+    priority_checked = 0
+    for rec in acl_rows:
+        counts[rec["kind"]] = counts.get(rec["kind"], 0) + 1
+        priority = rec["priority"]
+        if _prio_num(priority) < 0:
+            failed.append({
+                "priority": priority,
+                "action": rec["action"],
+                "kind": rec["kind"],
+                "port_set": (rec["owners"] or [""])[0],
+                "ovn": "priority_missing",
+            })
+            continue
+        priority_checked += 1
+        priorities[priority] = priorities.get(priority, 0) + 1
+        if rec["kind"] == "global":
+            continue
+        owners = list(rec["owners"])
+        missing = [uid for uid in owners if uid not in groups]
+        if not owners:
+            failed.append({
+                "priority": priority,
+                "action": rec["action"],
+                "kind": rec["kind"],
+                "port_set": "",
+                "ovn": "unparsed",
+            })
+        elif missing:
+            failed.append({
+                "priority": priority,
+                "action": rec["action"],
+                "kind": rec["kind"],
+                "port_set": missing[0],
+                "ovn": "owner_missing",
+            })
+    return failed, counts, priorities, priority_checked
+
+
+def write_acls(acl_rows, groups, handle):
+    """Print the ACL verification. Return how many ACL rows failed."""
+    failed, counts, priorities, priority_checked = verify_acl_rows(acl_rows, groups)
+    priority_failed = len(acl_rows) - priority_checked
+    handle.write(
+        "OVN NB acl: checked=%s verified=%s failed=%s "
+        "priority_checked=%s priority_failed=%s\n" % (
+            len(acl_rows), len(acl_rows) - len(failed), len(failed),
+            priority_checked, priority_failed))
+    handle.write(
+        "OVN NB acl kind: %s\n" % " ".join(
+            "%s=%s" % (kind, counts[kind]) for kind in sorted(counts)))
+    handle.write(
+        "OVN NB acl priority: %s\n" % " ".join(
+            "%s=%s" % (pri, priorities[pri])
+            for pri in sorted(priorities, key=_prio_num, reverse=True)))
+    for rec in failed:
+        handle.write(json.dumps(rec, separators=(",", ":")) + "\n")
+    return len(failed)
+
+
 def parse_acl_index(text):
     """Map (port_set, direction, peer) to (priority, match) ACL rows."""
     index = {}
@@ -1619,8 +1727,8 @@ def service_rows(edges, groups, acl_index, atlas_ids=None):
 
 
 def _side_check(edge, groups, by_owner):
-    """Peer port set, priority, and service group against one OVN-NB direction."""
-    priority = edge.get("policy_priority") or ""
+    """Peer port set, OVN-NB ACL priority, and service group for one direction."""
+    priority = ""
     status = port_set_status(edge, groups)
     service_group = edge.get("service_group") or ""
     service = edge.get("service") or "ALL"
@@ -1636,6 +1744,8 @@ def _side_check(edge, groups, by_owner):
             found = cover_priority(acls, edge.get("ports") or [])
             if found is None:
                 ovn = "service_missing"
+            elif _prio_num(found) < 0:
+                ovn = "priority_missing"
             else:
                 ovn = "present"
                 priority = found
@@ -1878,7 +1988,10 @@ def load_ovn(info, timeout):
         info, ["--columns=name", "list", "Port_Group"], timeout)
     _rc, acl_text, _err = _ovn_nb(
         info, ["--columns=priority,action,match", "list", "ACL"], timeout)
-    return parse_port_groups(groups_text), parse_acl_index(acl_text)
+    return (
+        parse_port_groups(groups_text),
+        parse_acl_index(acl_text),
+        parse_acl_rows(acl_text))
 
 
 def _local_ips():
@@ -2098,6 +2211,38 @@ def self_test():
         raise SystemExit("not checked report: %s" % text)
     if '"name":' in text.split("OVN NB not_checked:", 1)[-1]:
         raise SystemExit("not checked row used a name: %s" % text)
+    acl_sample = "\n".join([
+        '100,allow-related,"outport == @port_group_aaaaaaaa_aaaa_4aaa_8aaa_aaaaaaaaaaaa && ip4.src == @port_group_bbbbbbbb_bbbb_4bbb_8bbb_bbbbbbbbbbbb"',
+        '1045,drop,"outport == @port_group_aaaaaaaa_aaaa_4aaa_8aaa_aaaaaaaaaaaa && ip4"',
+        '1017,allow-related,"inport == @port_group_aaaaaaaa_aaaa_4aaa_8aaa_aaaaaaaaaaaa && outport == @port_group_aaaaaaaa_aaaa_4aaa_8aaa_aaaaaaaaaaaa && ip4"',
+        '31500,allow-stateless,"udp.src == 67 && udp.dst == 68"',
+        '50,drop,"outport == @port_group_ffffffff_ffff_4fff_8fff_ffffffffffff && ip4"',
+    ])
+    acl_rows = parse_acl_rows(acl_sample)
+    kinds = {}
+    for rec in acl_rows:
+        kinds[rec["kind"]] = kinds.get(rec["kind"], 0) + 1
+    if kinds.get("incoming") != 1 or kinds.get("outport_only") != 2 or kinds.get("intra") != 1 or kinds.get("global") != 1:
+        raise SystemExit("acl kinds: %s" % kinds)
+    if acl_rows[0]["priority"] != "100":
+        raise SystemExit("acl priority: %s" % acl_rows[0])
+    acl_rows.append({
+        "priority": "",
+        "action": "allow-related",
+        "kind": "incoming",
+        "direction": "incoming",
+        "owners": ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"],
+        "peers": ["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"],
+    })
+    acl_buf = io.StringIO()
+    acl_failed = write_acls(acl_rows, groups, acl_buf)
+    acl_text_out = acl_buf.getvalue()
+    if acl_failed != 2 or "priority_checked=5 priority_failed=1" not in acl_text_out:
+        raise SystemExit("acl report: %s" % acl_text_out)
+    if '"ovn":"owner_missing"' not in acl_text_out or '"ovn":"priority_missing"' not in acl_text_out:
+        raise SystemExit("acl failure row: %s" % acl_text_out)
+    if "31500=1" not in acl_text_out or "100=1" not in acl_text_out:
+        raise SystemExit("acl priorities: %s" % acl_text_out)
     policy = {
         "uuid": "11111111-1111-4111-8111-111111111111",
         "name": "Iso",
@@ -2171,18 +2316,19 @@ def main(argv=None):
     kept = [
         edge for edge in edges
         if reported_by_atlas(edge, atlas_map) and not skip_kubernetes(edge, atlas_map)]
-    groups, acl_index = load_ovn(info, min(int(args.timeout), 600))
+    groups, acl_index, acl_rows = load_ovn(info, min(int(args.timeout), 600))
     LOG.info(
         "policies=%s service_groups=%s edges=%s atlas_port_sets=%s "
         "kept_edges=%s ovn_port_groups=%s ovn_acls=%s",
         len(policies), len(sg_map), len(edges), len(atlas_map), len(kept),
-        len(groups), len(acl_index))
+        len(groups), len(acl_rows))
+    acl_failed = write_acls(acl_rows, groups, sys.stdout)
     records = port_set_nb(kept, groups, acl_index, atlas_map)
     missing = write_nb(
-        records, sys.stdout, port_groups=len(groups), acls=len(acl_index),
+        records, sys.stdout, port_groups=len(groups), acls=len(acl_rows),
         groups=groups, atlas_map=atlas_map)
     sys.stdout.flush()
-    return 1 if missing else 0
+    return 1 if missing or acl_failed else 0
 
 
 if __name__ == "__main__":
