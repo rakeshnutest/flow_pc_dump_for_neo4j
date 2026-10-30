@@ -7,16 +7,25 @@ Standalone. Stdlib only. No other policy script is imported.
 Each row carries the OVN-NB ACL priority for that rule class.
 An address-group peer is uuid5(address_group, "IPv4"|"IPv6").
 A port-set peer is that port set's generated address set.
-The last lines are the OVN-NB check: the port group, the address set, and
-the class priority must exist in Northbound.
+The last lines are the OVN-NB check, then the derived OVN-SB check.
+Each Northbound ACL that northd should emit must have a Logical_Flow at
+the ACL priority plus 1000, in ls_in_acl_eval or ls_out_acl_eval.
 
 Runs on any Prism Central VM. A follower copies this script to the leader
 over the cluster SSH key and prints the leader's output. No password is
 stored.
 
   python3 verify_policy_ovn.py
+  python3 verify_policy_ovn.py --skip-sb
+  python3 verify_policy_ovn.py --src NIC --dst NIC --port 80 --proto tcp
   python3 verify_policy_ovn.py --self-test
   panacea_cli verify_policy_ovn.py
+
+With no arguments the full port-set and ACL check runs, including
+southbound. --skip-sb stops after the Northbound check. --src, --dst,
+--port, and --proto select one flow and print its Northbound ACL, its
+Southbound flow, the OpenFlow cookie, the host to check in OVS, and
+allow or deny.
 
 Stdout is one JSON object per port set that fails. Each object is:
 
@@ -1096,6 +1105,37 @@ K8S_NOISE_RE = re.compile(r"(k8s|kubernetes|cilium_vlan_scope)", re.I)
 # Flex security groups do not use it. hermes.consts.ACL_PRIORITY_OFFSET.
 ACL_PRIORITY_OFFSET = 1000
 
+# ovn-northd adds this to the NB ACL priority when it writes Logical_Flow.
+# northd.c OVN_ACL_PRI_OFFSET. The stage is ls_in_acl_eval or ls_out_acl_eval.
+SB_ACL_PRI_OFFSET = 1000
+SB_STAGE = {
+    "from-lport": "ls_in_acl_eval",
+    "to-lport": "ls_out_acl_eval",
+}
+SB_VERDICT = {
+    "allow": "reg8[16]",
+    "allow-related": "reg8[16]",
+    "allow-stateless": "reg8[16]",
+    "drop": "reg8[17]",
+    "reject": "reg8[18]",
+}
+# Flow BaseNetworkSecurityPolicyTranslator label. Bits 14-0 unique_id,
+# bit 15 is 0 for outbound and 1 for inbound, bits 17-16 are the mode.
+LABEL_LSB_MASK = 32767
+LABEL_MODE = {"allow": 1, "monitor": 2, "deny": 3}
+
+
+def flow_label(unique_id, direction, mode):
+    """32-bit conntrack label Flow stores on the OVN-NB ACL."""
+    uid = int(unique_id)
+    value = uid & LABEL_LSB_MASK
+    if str(direction) not in ("kOutbound", "outbound", "from-lport"):
+        value |= 1 << 15
+    value |= LABEL_MODE[mode] << 16
+    if uid > LABEL_LSB_MASK:
+        value |= (uid >> 15) << 28
+    return value
+
 # Flow policy_translator.consts after rearrange_priorities_for_enforce_monitor_policies.
 # kApply uses APPLY. kMonitor uses MONITOR. OVN stores value + ACL_PRIORITY_OFFSET.
 # Isolation L2 rows (eth.src / eth.dst) are the IP priority minus 1.
@@ -1741,6 +1781,280 @@ def write_acls(acl_rows, groups, handle):
     return len(failed)
 
 
+PG_TOKEN_RE = re.compile(
+    r"port_group_([0-9a-f]{8}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{4}_[0-9a-f]{12})")
+
+
+def acl_hint(acl_uuid):
+    """northd stage-hint: first 32 bits of the ACL uuid, 8 hex digits."""
+    text = str(acl_uuid or "").strip().lower()
+    group = text.split("-", 1)[0]
+    if len(group) != 8 or not UUID_RE.fullmatch(text):
+        return ""
+    return group
+
+
+def flow_cookie(flow_uuid):
+    """OpenFlow cookie ovn-controller installs: Logical_Flow uuid.parts[0]."""
+    text = str(flow_uuid or "").strip().lower()
+    group = text.split("-", 1)[0]
+    if len(group) != 8 or not UUID_RE.fullmatch(text):
+        return 0
+    return int(group, 16)
+
+
+def cookie_hex(cookies):
+    """Same cookies as 8 hex digits, the form ovs-ofctl prints."""
+    return ["0x%08x" % int(value) for value in cookies or []]
+
+
+def _verdict_set(actions, bit):
+    return bool(re.search(r"%s\s*=\s*1" % re.escape(bit), actions or ""))
+
+
+def _label_set(actions, label):
+    return bool(re.search(r"(?:^|[^0-9])%d(?:[^0-9]|$)" % int(label), actions or ""))
+
+
+def parse_nb_acl_detail(text):
+    """NB ACL rows with the uuid, direction, and label northd copies."""
+    rows = []
+    reader = csv.reader(io.StringIO(text or ""))
+    for row in reader:
+        if len(row) < 6:
+            continue
+        acl_uuid, priority, direction, action, label = (item.strip() for item in row[:5])
+        match = ",".join(row[5:]).strip()
+        if not match or acl_uuid in ("_uuid", "uuid") or priority == "priority":
+            continue
+        if not UUID_RE.fullmatch(acl_uuid):
+            continue
+        owners = []
+        for token in PG_TOKEN_RE.findall(match):
+            uid = token.replace("_", "-")
+            if uid not in owners:
+                owners.append(uid)
+        rows.append({
+            "acl": acl_uuid.lower(),
+            "priority": priority,
+            "direction": direction,
+            "action": action,
+            "label": _prio_num(label),
+            "match": match,
+            "owners": owners,
+        })
+    return rows
+
+
+def parse_sb_flows(text):
+    """Index Logical_Flow rows by stage-hint."""
+    found = {}
+    reader = csv.reader(io.StringIO(text or ""))
+    for row in reader:
+        if len(row) < 4:
+            continue
+        flow_uuid, priority, actions, external = (item.strip() for item in row[:4])
+        match = ",".join(row[4:]).strip() if len(row) > 4 else ""
+        if priority == "priority" or flow_uuid in ("_uuid", "uuid"):
+            continue
+        if "stage-hint=" not in external:
+            continue
+        hint = external.split("stage-hint=", 1)[1].split()[0].strip(",\"")
+        stage = ""
+        if "stage-name=" in external:
+            stage = external.split("stage-name=", 1)[1].split()[0].strip(",\"")
+        if not hint or "acl_eval" not in stage:
+            continue
+        found.setdefault(hint, []).append({
+            "priority": _prio_num(priority),
+            "stage": stage,
+            "actions": actions,
+            "match": match,
+            "cookie": flow_cookie(flow_uuid),
+        })
+    return found
+
+
+def parse_sb_port_groups(text):
+    """Port-group UUIDs that have at least one logical switch port in SB."""
+    live = set()
+    reader = csv.reader(io.StringIO(text or ""))
+    for row in reader:
+        if len(row) < 2:
+            continue
+        name, ports = row[0].strip(), ",".join(row[1:]).strip()
+        if name in ("name", ""):
+            continue
+        if "port_" not in ports:
+            continue
+        for token in PG_TOKEN_RE.findall(name):
+            live.add(token.replace("_", "-"))
+    return live
+
+
+def verify_sb(nb_rows, flows, live_groups):
+    """Each policy ACL that northd should emit has a Logical_Flow at priority+1000.
+
+    A policy ACL names a port group. DHCP, IPFIX, and the other system ACLs
+    do not, and they are skipped. A port-group ACL is emitted only when that
+    port group has a member port on a logical switch. An empty port group is
+    not_emitted. The cookie is the OpenFlow cookie of each matching flow.
+    """
+    failed = []
+    matched = []
+    emitted = 0
+    not_emitted = 0
+    skipped = 0
+    for rec in nb_rows:
+        owners = rec["owners"]
+        if not owners:
+            skipped += 1
+            continue
+        if not any(uid in live_groups for uid in owners):
+            not_emitted += 1
+            continue
+        emitted += 1
+        hint = acl_hint(rec["acl"])
+        stage = SB_STAGE.get(rec["direction"], "")
+        expect = _prio_num(rec["priority"])
+        expect = expect + SB_ACL_PRI_OFFSET if expect >= 0 else -1
+        hits = [
+            flow for flow in flows.get(hint, [])
+            if flow["stage"] == stage and flow["priority"] == expect
+        ]
+        reason = ""
+        if not hint or not stage or expect < 0:
+            reason = "sb_unparsed"
+        elif not hits:
+            reason = "sb_missing"
+        else:
+            bit = SB_VERDICT.get(rec["action"], "")
+            if bit and not any(_verdict_set(flow["actions"], bit) for flow in hits):
+                reason = "sb_verdict"
+            elif rec["label"] > 0 and not any(
+                    _label_set(flow["actions"], rec["label"]) for flow in hits):
+                reason = "sb_label"
+            else:
+                tokens = PG_TOKEN_RE.findall(rec["match"])
+                tokens += re.findall(r"address_set_[0-9a-f_]+", rec["match"])
+                blob = " ".join(flow["match"] for flow in hits)
+                if any(token not in blob for token in tokens):
+                    reason = "sb_match"
+        cookies = sorted({
+            flow["cookie"] for flow in hits if flow.get("cookie")})
+        row = {
+            "acl": rec["acl"],
+            "priority": rec["priority"],
+            "direction": rec["direction"],
+            "port_set": owners[0],
+            "cookie": cookies,
+            "cookie_hex": cookie_hex(cookies),
+        }
+        if reason:
+            row.update({
+                "action": rec["action"],
+                "label": rec["label"] if rec["label"] > 0 else 0,
+                "stage": stage,
+                "sb_priority": expect if expect >= 0 else "",
+                "ovn": reason,
+            })
+            failed.append(row)
+        else:
+            matched.append(row)
+    return failed, emitted, len(matched), not_emitted, skipped, matched
+
+
+def write_sb(nb_rows, flows, live_groups, handle):
+    """Print the policy southbound check. Return how many policy ACLs failed."""
+    failed, emitted, verified, not_emitted, skipped, matched = verify_sb(
+        nb_rows, flows, live_groups)
+    handle.write(
+        "OVN SB acl: policy=%s skipped=%s emitted=%s verified=%s "
+        "not_emitted=%s failed=%s\n" % (
+            emitted + not_emitted, skipped, emitted, verified,
+            not_emitted, len(failed)))
+    for rec in matched:
+        handle.write(json.dumps(rec, separators=(",", ":")) + "\n")
+    for rec in failed:
+        handle.write(json.dumps(rec, separators=(",", ":")) + "\n")
+    return len(failed)
+
+
+def _cfg_ints(text):
+    nums = [int(item) for item in re.findall(r"\d+", text or "")]
+    return nums
+
+
+def write_cfg(cfg, handle):
+    """Pass only when one sample read the same nb_cfg from both databases."""
+    nb_cfg = cfg.get("nb_cfg", -1)
+    sb_cfg = cfg.get("sb_nb_cfg", -1)
+    hv_cfg = cfg.get("hv_cfg", -1)
+    handle.write(
+        "OVN cfg: nb_cfg=%s sb_nb_cfg=%s hv_cfg=%s\n" % (nb_cfg, sb_cfg, hv_cfg))
+    return nb_cfg < 0 or sb_cfg < 0 or nb_cfg != sb_cfg
+
+
+def pick_cfg(samples):
+    """First sample where both counters are the same number, else the last."""
+    last = {"nb_cfg": -1, "sb_nb_cfg": -1, "hv_cfg": -1}
+    for cfg in samples or []:
+        last = cfg
+        nb_cfg = cfg.get("nb_cfg", -1)
+        if nb_cfg >= 0 and nb_cfg == cfg.get("sb_nb_cfg"):
+            return cfg
+    return last
+
+
+def _cfg_from_text(nb_text, sb_text):
+    nb_nums = _cfg_ints(nb_text)
+    sb_nums = _cfg_ints(sb_text)
+    return {
+        "nb_cfg": nb_nums[0] if nb_nums else -1,
+        "hv_cfg": nb_nums[1] if len(nb_nums) > 1 else -1,
+        "sb_nb_cfg": sb_nums[0] if sb_nums else -1,
+    }
+
+
+def read_cfg(info, timeout, attempts=5):
+    """Read NB and SB nb_cfg until one pair is equal.
+
+    The extra count appears when a transaction commits between the two reads.
+    Repeating the pair until both sides show the same number removes that gap.
+    """
+    samples = []
+    for _ in range(max(1, int(attempts))):
+        _rc, nb_text, _err = _ovn_nb(
+            info, ["--columns=nb_cfg,hv_cfg", "list", "NB_Global"], timeout)
+        _rc, sb_text, _err = _ovn_sb(
+            info, ["--columns=nb_cfg", "list", "SB_Global"], timeout)
+        cfg = _cfg_from_text(nb_text, sb_text)
+        samples.append(cfg)
+        if cfg["nb_cfg"] >= 0 and cfg["nb_cfg"] == cfg["sb_nb_cfg"]:
+            break
+    return pick_cfg(samples)
+
+
+def load_sb(info, timeout):
+    """NB ACL identity plus the SB logical flows and live port groups."""
+    _rc, acl_text, _err = _ovn_nb(
+        info,
+        ["--columns=_uuid,priority,direction,action,label,match", "list", "ACL"],
+        timeout)
+    _rc, flow_text, _err = _ovn_sb(
+        info,
+        ["--columns=_uuid,priority,actions,external_ids,match", "list", "Logical_Flow"],
+        timeout)
+    _rc, pg_text, _err = _ovn_sb(
+        info, ["--columns=name,ports", "list", "Port_Group"], timeout)
+    cfg = read_cfg(info, timeout)
+    return (
+        parse_nb_acl_detail(acl_text),
+        parse_sb_flows(flow_text),
+        parse_sb_port_groups(pg_text),
+        cfg)
+
+
 def parse_acl_index(text):
     """Map (port_set, direction, peer) to (priority, match) ACL rows."""
     index = {}
@@ -2210,11 +2524,14 @@ def write_section(title, rows, columns, handle):
     return len(missing)
 
 
-def _ovn_nb(info, args, timeout):
-    base = ["--db=unix:/var/run/ovn/ovnnb_db.sock",
+def _ovn_ctl(info, which, args, timeout):
+    """ovn-nbctl or ovn-sbctl. which is nb or sb."""
+    tool = "ovn-%sctl" % which
+    db = "ovnnb" if which == "nb" else "ovnsb"
+    base = ["--db=unix:/var/run/ovn/%s_db.sock" % db,
             "--format=csv", "--data=bare", "--no-heading"]
-    if os.path.exists("/var/run/ovn/ovnnb_db.sock"):
-        return _run(["ovn-nbctl"] + base + list(args), timeout)
+    if os.path.exists("/var/run/ovn/%s_db.sock" % db):
+        return _run([tool] + base + list(args), timeout)
     kubeconfig = ""
     if info.get("platform") == "smsp":
         dest = "/tmp/policy_ovn_kube"
@@ -2224,14 +2541,22 @@ def _ovn_nb(info, args, timeout):
     ns, pod, err = _find_pod("anc-ovn", "anc-ovn-0", kubeconfig=kubeconfig)
     if not pod:
         raise SystemExit(err or "anc-ovn pod not found")
-    cmd = ["exec", "-n", ns, pod, "-c", "anc-ovn", "--", "ovn-nbctl"] + base + list(args)
+    cmd = ["exec", "-n", ns, pod, "-c", "anc-ovn", "--", tool] + base + list(args)
     rc, out, err = _kubectl(cmd, timeout, kubeconfig=kubeconfig)
     if rc != 0:
-        cmd = ["exec", "-n", ns, pod, "--", "ovn-nbctl"] + base + list(args)
+        cmd = ["exec", "-n", ns, pod, "--", tool] + base + list(args)
         rc, out, err = _kubectl(cmd, timeout, kubeconfig=kubeconfig)
     if rc != 0:
-        raise SystemExit((err or out or "ovn-nbctl failed")[:400])
+        raise SystemExit((err or out or "%s failed" % tool)[:400])
     return rc, out, err
+
+
+def _ovn_nb(info, args, timeout):
+    return _ovn_ctl(info, "nb", args, timeout)
+
+
+def _ovn_sb(info, args, timeout):
+    return _ovn_ctl(info, "sb", args, timeout)
 
 
 def _flow_python():
@@ -2636,7 +2961,531 @@ def self_test():
         raise SystemExit("address set edge: %s" % app_edges)
     if addr[0]["policy"] != "af1c7c7a-b22e-4136-90eb-44eb2a006a17":
         raise SystemExit("policy uuid: %s" % addr[0])
+    if flow_label(27044, "kOutbound", "allow") != 92580:
+        raise SystemExit("label allow")
+    if flow_label(27048, "kOutbound", "deny") != 223656:
+        raise SystemExit("label deny")
+    if flow_label(27052, "kIn", "allow") != 125356:
+        raise SystemExit("label inbound")
+    if acl_hint("d4ee03c2-fff9-414d-a8c6-41be729442c3") != "d4ee03c2":
+        raise SystemExit("hint")
+    nb_text = "\n".join([
+        "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa,1050,from-lport,allow-related,92580,"
+        "inport == @port_group_aaaaaaaa_1111_4111_8111_aaaaaaaaaaaa && ip4",
+        "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb,1045,to-lport,drop,217679,"
+        "ip4 && outport == @port_group_bbbbbbbb_2222_4222_8222_bbbbbbbbbbbb",
+        "cccccccc-3333-4333-8333-cccccccccccc,1045,to-lport,drop,1,"
+        "ip4 && outport == @port_group_cccccccc_3333_4333_8333_cccccccccccc",
+    ])
+    nb_text += (
+        "\ndddddddd-4444-4444-8444-dddddddddddd,500,from-lport,allow-related,0,"
+        "tcp || udp || icmp"
+    )
+    flow_buf = io.StringIO()
+    csv.writer(flow_buf).writerow([
+        "11223344-5555-4666-8777-888888888888",
+        "2050",
+        "reg8[16] = 1; reg3 = 92580; next;",
+        "stage-hint=aaaaaaaa stage-name=ls_in_acl_eval",
+        "reg0[7] == 1 && (inport == @port_group_aaaaaaaa_1111_4111_8111_aaaaaaaaaaaa && ip4)",
+    ])
+    pg_text = "\n".join([
+        "10040_port_group_aaaaaaaa_1111_4111_8111_aaaaaaaaaaaa,port_abc",
+        "10041_port_group_bbbbbbbb_2222_4222_8222_bbbbbbbbbbbb,port_def",
+        "10042_port_group_cccccccc_3333_4333_8333_cccccccccccc,[]",
+    ])
+    failed, emitted, verified, not_emitted, skipped, matched = verify_sb(
+        parse_nb_acl_detail(nb_text),
+        parse_sb_flows(flow_buf.getvalue()),
+        parse_sb_port_groups(pg_text))
+    if (len(failed), emitted, verified, not_emitted, skipped) != (1, 2, 1, 1, 1):
+        raise SystemExit(
+            "sb check %s %s %s %s %s" % (
+                failed, emitted, verified, not_emitted, skipped))
+    if failed[0]["ovn"] != "sb_missing" or failed[0]["sb_priority"] != 2045:
+        raise SystemExit("sb missing: %s" % failed[0])
+    if failed[0]["acl"].startswith("dddddddd"):
+        raise SystemExit("system acl was checked: %s" % failed[0])
+    if matched[0]["cookie"] != [0x11223344]:
+        raise SystemExit("cookie: %s" % matched[0])
+    if matched[0]["cookie_hex"] != ["0x11223344"]:
+        raise SystemExit("cookie hex: %s" % matched[0])
+    bare = parse_args([])
+    if bare.src or bare.dst or bare.port is not None or bare.proto or bare.skip_sb:
+        raise SystemExit("default args: %s" % bare)
+    if not parse_args(["--skip-sb"]).skip_sb:
+        raise SystemExit("skip-sb flag")
+    src_nic = "11111111-1111-4111-8111-111111111111"
+    dst_nic = "22222222-2222-4222-8222-222222222222"
+    src_set = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+    dst_set = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
+    src_as = "cccccccc-3333-4333-8333-cccccccccccc"
+    dst_as = "dddddddd-4444-4444-8444-dddddddddddd"
+    allow_nb = {
+        "acl": "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa",
+        "priority": "1050",
+        "direction": "from-lport",
+        "action": "allow-related",
+        "label": 92580,
+        "match": (
+            "inport == @port_group_aaaaaaaa_1111_4111_8111_aaaaaaaaaaaa && "
+            "ip4.dst == $address_set_%s && tcp && tcp.dst == 80" % dst_as.replace("-", "_")),
+        "owners": [src_set],
+    }
+    deny_nb = {
+        "acl": "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb",
+        "priority": "1045",
+        "direction": "from-lport",
+        "action": "drop",
+        "label": 217679,
+        "match": "inport == @port_group_aaaaaaaa_1111_4111_8111_aaaaaaaaaaaa && ip4",
+        "owners": [src_set],
+    }
+    in_allow = {
+        "acl": "eeeeeeee-5555-4555-8555-eeeeeeeeeeee",
+        "priority": "1050",
+        "direction": "to-lport",
+        "action": "allow-related",
+        "label": 125356,
+        "match": (
+            "outport == @port_group_bbbbbbbb_2222_4222_8222_bbbbbbbbbbbb && "
+            "ip4.src == $address_set_%s && tcp && tcp.dst == 80" % src_as.replace("-", "_")),
+        "owners": [dst_set],
+    }
+    in_deny = {
+        "acl": "ffffffff-6666-4666-8666-ffffffffffff",
+        "priority": "1045",
+        "direction": "to-lport",
+        "action": "drop",
+        "label": 1,
+        "match": "outport == @port_group_bbbbbbbb_2222_4222_8222_bbbbbbbbbbbb && ip4",
+        "owners": [dst_set],
+    }
+    flow_rows = {}
+    for hint, pri, stage in (
+            ("aaaaaaaa", 2050, "ls_in_acl_eval"),
+            ("eeeeeeee", 2050, "ls_out_acl_eval")):
+        flow_rows.setdefault(hint, []).append({
+            "priority": pri, "stage": stage, "actions": "reg8[16] = 1; next;",
+            "match": "", "cookie": 0x11223344,
+        })
+    _out, _inc, verdict, src_remote, dst_remote = traffic_verdict(
+        [allow_nb, deny_nb, in_allow, in_deny], flow_rows,
+        [src_set], [dst_set], [src_as], [dst_as], "tcp", 80)
+    if verdict != "allow" or _out["acl"] != allow_nb["acl"] or _inc["acl"] != in_allow["acl"]:
+        raise SystemExit("traffic allow: %s %s %s" % (verdict, _out, _inc))
+    if src_remote or dst_remote:
+        raise SystemExit("both nics are local")
+    _stage, sb_pri, cookies = _sb_hits(_out, flow_rows)
+    if _stage != "ls_in_acl_eval" or sb_pri != 2050 or cookies != [0x11223344]:
+        raise SystemExit("traffic cookie: %s %s %s" % (_stage, sb_pri, cookies))
+    _out, _inc, verdict, _sr, _dr = traffic_verdict(
+        [deny_nb, in_deny], flow_rows, [src_set], [dst_set], [src_as], [dst_as],
+        "tcp", 80)
+    if verdict != "deny" or _out is None or _inc is None:
+        raise SystemExit("traffic deny: %s" % verdict)
+    _out, _inc, verdict, _sr, _dr = traffic_verdict(
+        [allow_nb, deny_nb, in_allow, in_deny], flow_rows,
+        [src_set], [dst_set], [src_as], [dst_as], "udp", 80)
+    if verdict != "deny":
+        raise SystemExit("traffic proto: %s" % verdict)
+    _out, _inc, verdict, src_remote, dst_remote = traffic_verdict(
+        [allow_nb, deny_nb, in_allow, in_deny], flow_rows,
+        [src_set], [], [src_as], [], "tcp", 80)
+    if not dst_remote or src_remote or verdict != "deny" or _inc is not None:
+        raise SystemExit("dest remote: %s %s %s" % (verdict, dst_remote, _out))
+    if _out["acl"] != deny_nb["acl"]:
+        raise SystemExit("dest remote used a specific peer: %s" % _out)
+    _out, _inc, verdict, src_remote, dst_remote = traffic_verdict(
+        [allow_nb, deny_nb, in_allow, in_deny], flow_rows,
+        [], [dst_set], [], [dst_as], "tcp", 80)
+    if not src_remote or dst_remote or verdict != "deny" or _out is not None:
+        raise SystemExit("src remote: %s %s %s" % (verdict, src_remote, _inc))
+    if _inc["acl"] != in_deny["acl"]:
+        raise SystemExit("src remote used a specific peer: %s" % _inc)
+    mon = {
+        "acl": "abababab-7777-4777-8777-abababababab",
+        "priority": "1021",
+        "direction": "from-lport",
+        "action": "drop",
+        "label": 0,
+        "match": "inport == @port_group_aaaaaaaa_1111_4111_8111_aaaaaaaaaaaa && ip4",
+        "owners": [src_set],
+    }
+    _out, _inc, verdict, _sr, _dr = traffic_verdict(
+        [mon, in_allow], flow_rows, [src_set], [dst_set], [src_as], [dst_as],
+        "tcp", 80)
+    if verdict != "allow" or not _is_monitor(mon):
+        raise SystemExit("traffic monitor: %s" % verdict)
+    hosts = index_ovs_hosts(
+        "port_%s,chassis-1\n"
+        "port_c2fb9fbf-80cf-4242-8f1a-2b6ac872d341,"
+        "50:6b:8d:4d:49:af unknown,chassis-1\n" % src_nic,
+        "chassis-1,host-a,10.1.1.1\n")
+    if host_for(hosts, src_nic) != "10.1.1.1":
+        raise SystemExit("ovs host: %s" % hosts)
+    if host_for(hosts, "99999999-9999-4999-8999-999999999999",
+                "50:6b:8d:4d:49:af") != "10.1.1.1":
+        raise SystemExit("ovs host mac: %s" % hosts)
+    printed = io.StringIO()
+    write_traffic(
+        src_nic, dst_nic, "tcp", 80, allow_nb, in_allow, "allow",
+        flow_rows, hosts, printed, macs={src_nic: "50:6b:8d:4d:49:af"})
+    printed_text = printed.getvalue()
+    if "OVS host" in printed_text or '"ovs_host":"10.1.1.1"' not in printed_text:
+        raise SystemExit("host json: %s" % printed_text)
+    if port_sets_for_nic({src_set: {"nics": [src_nic]}}, src_nic) != [src_set]:
+        raise SystemExit("nic port set")
+    sink = io.StringIO()
+    if write_cfg({"nb_cfg": 10, "sb_nb_cfg": 10, "hv_cfg": 10}, sink):
+        raise SystemExit("cfg equal")
+    if not write_cfg({"nb_cfg": 10, "sb_nb_cfg": 11, "hv_cfg": 10}, sink):
+        raise SystemExit("cfg unequal")
+    picked = pick_cfg([
+        {"nb_cfg": 740533, "sb_nb_cfg": 740534, "hv_cfg": 740533},
+        {"nb_cfg": 740534, "sb_nb_cfg": 740534, "hv_cfg": 740534},
+    ])
+    if picked["nb_cfg"] != 740534 or picked["sb_nb_cfg"] != 740534:
+        raise SystemExit("cfg resample: %s" % picked)
+    if write_cfg(picked, sink):
+        raise SystemExit("cfg resample failed")
     print("self-test ok edges=%s" % len(built))
+
+
+def port_sets_for_nic(atlas_map, nic):
+    """Port-set UUIDs whose NIC list contains this NIC."""
+    want = str(nic or "").strip().lower()
+    found = []
+    if not want:
+        return found
+    for uid, rec in (atlas_map or {}).items():
+        nics = [str(item).strip().lower() for item in (rec.get("nics") or [])]
+        if want in nics and uid not in found:
+            found.append(uid)
+    return found
+
+
+def acl_owner(rec):
+    """Port group this ACL is attached to, from its direction."""
+    if rec.get("direction") == "from-lport":
+        found = OWNER_OUT.search(rec.get("match") or "")
+    elif rec.get("direction") == "to-lport":
+        found = OWNER_IN.search(rec.get("match") or "")
+    else:
+        return ""
+    return pg_uuid(found.group(1)) if found else ""
+
+
+def acl_covers(match, proto, port):
+    """True when this ACL match applies to proto and the destination port."""
+    proto = str(proto or "").lower()
+    kind, spec = _parsed_ranges(match, proto)
+    if kind == "absent":
+        low = (match or "").lower()
+        return not any(token in low for token in ("tcp", "udp", "icmp"))
+    if kind == "any":
+        return True
+    if kind == "icmp":
+        return not spec or int(port) in spec
+    if kind == "ranges":
+        value = int(port)
+        return any(lo <= value <= hi for lo, hi in spec)
+    return False
+
+
+def _peer_ids(match, direction):
+    rule = PEER_DST if direction == "from-lport" else PEER_SRC
+    return [pg_uuid(item) for item in rule.findall(match or "")]
+
+
+def _is_monitor(rec):
+    role = ROLE_BY_PRIORITY.get(_prio_num(rec.get("priority")), "")
+    return role.startswith("monitor_")
+
+
+def _stage_effect(rec):
+    """Enforce drop denies. A monitor drop does not."""
+    if rec is None:
+        return "allow"
+    if rec.get("action") == "drop" and not _is_monitor(rec):
+        return "deny"
+    return "allow"
+
+
+def _pick_winner(rows):
+    if not rows:
+        return None
+    best = max(_prio_num(rec["priority"]) for rec in rows)
+    top = [rec for rec in rows if _prio_num(rec["priority"]) == best]
+    drops = [rec for rec in top if rec.get("action") == "drop"]
+    return drops[0] if drops else top[0]
+
+
+def _sb_hits(rec, flows):
+    hint = acl_hint(rec["acl"])
+    stage = SB_STAGE.get(rec.get("direction"), "")
+    expect = _prio_num(rec.get("priority"))
+    expect = expect + SB_ACL_PRI_OFFSET if expect >= 0 else -1
+    hits = [
+        flow for flow in (flows or {}).get(hint, [])
+        if flow["stage"] == stage and flow["priority"] == expect]
+    cookies = sorted({flow["cookie"] for flow in hits if flow.get("cookie")})
+    return stage, expect, cookies
+
+
+def matching_acls(nb_rows, owners, direction, peer_sets, proto, port,
+                  remote_peer=False):
+    """Policy ACLs on these port sets that fit the other side, protocol, and port.
+
+    remote_peer means the other NIC is not on this cluster. Only an ACL with
+    no named peer applies to that remote side.
+    """
+    owners = set(owners or [])
+    peers = set(peer_sets or [])
+    found = []
+    for rec in nb_rows or []:
+        if rec.get("direction") != direction:
+            continue
+        owner = acl_owner(rec)
+        if owner not in owners:
+            continue
+        if not acl_covers(rec.get("match"), proto, port):
+            continue
+        named = _peer_ids(rec.get("match"), direction)
+        if remote_peer:
+            if named:
+                continue
+        elif named and not any(item in peers for item in named):
+            continue
+        found.append(rec)
+    return found
+
+
+def traffic_verdict(nb_rows, flows, src_sets, dst_sets, src_addr, dst_addr,
+                    proto, port):
+    """Winning outgoing and incoming policy ACL, and allow or deny.
+
+    Both sides are checked when both NICs belong to a port set. A NIC with
+    no port set is remote: that direction is not a local policy, and the
+    side that does exist is still checked.
+    """
+    src_remote = not src_sets
+    dst_remote = not dst_sets
+    outgoing = None
+    incoming = None
+    if not src_remote:
+        outgoing = _pick_winner(matching_acls(
+            nb_rows, src_sets, "from-lport", set(dst_sets) | set(dst_addr),
+            proto, port, remote_peer=dst_remote))
+    if not dst_remote:
+        incoming = _pick_winner(matching_acls(
+            nb_rows, dst_sets, "to-lport", set(src_sets) | set(src_addr),
+            proto, port, remote_peer=src_remote))
+    effects = []
+    if not src_remote:
+        effects.append(_stage_effect(outgoing))
+    if not dst_remote:
+        effects.append(_stage_effect(incoming))
+    verdict = "deny" if "deny" in effects else "allow"
+    return outgoing, incoming, verdict, src_remote, dst_remote
+
+
+def _stage_report(rec, flows):
+    if not rec:
+        return None
+    stage, sb_pri, cookies = _sb_hits(rec, flows)
+    return {
+        "acl": rec["acl"],
+        "priority": rec["priority"],
+        "direction": rec["direction"],
+        "action": rec["action"],
+        "port_set": acl_owner(rec),
+        "stage": stage,
+        "sb_priority": sb_pri if sb_pri >= 0 else "",
+        "cookie": cookies,
+        "effect": _stage_effect(rec),
+    }
+
+
+def index_ovs_hosts(binding_text, chassis_text):
+    """logical port, NIC uuid, or MAC -> chassis hostname, where OVS has the cookie.
+
+    Port_Binding.logical_port is port_<atlas-port-uuid>. The NIC uuid passed
+    on the command line is the virtual_nic id, so the MAC is the join.
+    """
+    names = {}
+    reader = csv.reader(io.StringIO(chassis_text or ""))
+    for row in reader:
+        if len(row) < 3:
+            continue
+        uid, name, hostname = (item.strip() for item in row[:3])
+        if uid in ("_uuid", "uuid"):
+            continue
+        label = hostname or name
+        if uid:
+            names[uid.lower()] = label
+        if name:
+            names[name.lower()] = label
+    hosts = {}
+    reader = csv.reader(io.StringIO(binding_text or ""))
+    for row in reader:
+        if len(row) < 2:
+            continue
+        if len(row) >= 3:
+            logical, mac, chassis = (item.strip() for item in row[:3])
+        else:
+            logical, mac, chassis = row[0].strip(), "", row[1].strip()
+        if logical in ("logical_port", ""):
+            continue
+        host = names.get(chassis.lower(), chassis)
+        hosts[logical.lower()] = host
+        for token in mac.replace('"', " ").split():
+            if ":" in token:
+                hosts[token.lower()] = host
+    return hosts
+
+
+def host_for(hosts, nic, mac=""):
+    """Chassis hostname for this NIC. Empty when Port_Binding has no row."""
+    want = str(nic or "").strip().lower()
+    mac_key = str(mac or "").strip().lower()
+    if mac_key and mac_key in (hosts or {}):
+        return hosts[mac_key]
+    if not want:
+        return ""
+    keys = (want, "port_%s" % want, want.replace("-", "_"))
+    for key in keys:
+        if key in (hosts or {}):
+            return hosts[key]
+    folded = want.replace("-", "_")
+    for key, host in (hosts or {}).items():
+        if folded and folded in key.replace("-", "_"):
+            return host
+    return ""
+
+
+def write_traffic(src, dst, proto, port, outgoing, incoming, verdict,
+                  flows, hosts, handle, src_remote=False, dst_remote=False,
+                  macs=None):
+    """Print the one-flow check. The last line is allow or deny.
+
+    The chassis hostname is a field of the first JSON for that direction.
+    """
+    macs = macs or {}
+    handle.write(
+        "traffic src=%s dst=%s proto=%s port=%s\n" % (src, dst, proto, port))
+    for label, rec, nic, remote in (
+            ("outgoing", outgoing, src, src_remote),
+            ("incoming", incoming, dst, dst_remote)):
+        if remote:
+            handle.write("OVN NB %s: %s\n" % (
+                label, json.dumps({"ovs_host": "remote"}, separators=(",", ":"))))
+            handle.write("OVN SB %s: remote\n" % label)
+            continue
+        host = host_for(hosts, nic, macs.get(str(nic).lower(), ""))
+        report = _stage_report(rec, flows)
+        if not report:
+            handle.write("OVN NB %s: %s\n" % (
+                label, json.dumps({"ovs_host": host}, separators=(",", ":"))))
+            handle.write("OVN SB %s: none\n" % label)
+        else:
+            handle.write("OVN NB %s: %s\n" % (
+                label, json.dumps({
+                    "acl": report["acl"],
+                    "priority": report["priority"],
+                    "direction": report["direction"],
+                    "action": report["action"],
+                    "port_set": report["port_set"],
+                    "effect": report["effect"],
+                    "ovs_host": host,
+                }, separators=(",", ":"))))
+            handle.write("OVN SB %s: %s\n" % (
+                label, json.dumps({
+                    "stage": report["stage"],
+                    "sb_priority": report["sb_priority"],
+                    "cookie": report["cookie"],
+                    "cookie_hex": cookie_hex(report["cookie"]),
+                }, separators=(",", ":"))))
+    handle.write("verdict: %s\n" % verdict)
+
+
+def _nic_mac(entity):
+    for item in (entity or {}).get("attribute_data_map") or []:
+        if item.get("name") != "mac_address":
+            continue
+        value = item.get("value") or {}
+        return str(value.get("str_value") or "").strip().lower()
+    return ""
+
+
+def fetch_nic_macs(nics, timeout):
+    """virtual_nic uuid -> MAC. The OVN port name is a different uuid."""
+    binary = idfcli_bin()
+    if not binary:
+        return {}
+    found = {}
+    for nic in nics or []:
+        nic = str(nic or "").strip()
+        if not nic:
+            continue
+        _rc, text, _err = _run(
+            [binary, "get", "entity", "-e", "virtual_nic", "-k", nic, "-o", "json"],
+            timeout)
+        payload = _json_loads(text)
+        entities = []
+        if isinstance(payload, dict):
+            entities = payload.get("entity") or []
+        for entity in entities:
+            mac = _nic_mac(entity)
+            if mac:
+                found[nic.lower()] = mac
+    return found
+
+
+def load_hosts(info, timeout):
+    _rc, binding_text, _err = _ovn_sb(
+        info, ["--columns=logical_port,mac,chassis", "list", "Port_Binding"], timeout)
+    _rc, chassis_text, _err = _ovn_sb(
+        info, ["--columns=_uuid,name,hostname", "list", "Chassis"], timeout)
+    return index_ovs_hosts(binding_text, chassis_text)
+
+
+def traffic_main(info, args):
+    """One source NIC, one dest NIC, one protocol, one destination port."""
+    proto = str(args.proto or "").strip().lower()
+    if proto not in ("tcp", "udp", "icmp"):
+        raise SystemExit("traffic check needs --proto tcp, udp, or icmp")
+    if not args.src or not args.dst or args.port is None:
+        raise SystemExit("traffic check needs --src, --dst, --port, and --proto")
+    atlas_map = fetch_idf_port_sets(info, min(int(args.timeout), 300))
+    src_sets = port_sets_for_nic(atlas_map, args.src)
+    dst_sets = port_sets_for_nic(atlas_map, args.dst)
+    wanted = []
+    for uid in src_sets + dst_sets:
+        if uid not in wanted:
+            wanted.append(uid)
+    address_map = fetch_port_set_address_sets(
+        info, wanted, min(int(args.timeout), 300))
+    src_addr = [
+        (address_map.get(uid) or {}).get("ipv4") or ""
+        for uid in src_sets]
+    dst_addr = [
+        (address_map.get(uid) or {}).get("ipv4") or ""
+        for uid in dst_sets]
+    src_addr = [item for item in src_addr if item]
+    dst_addr = [item for item in dst_addr if item]
+    nb_rows, flows, _live, _cfg = load_sb(info, min(int(args.timeout), 600))
+    hosts = load_hosts(info, min(int(args.timeout), 300))
+    macs = fetch_nic_macs([args.src, args.dst], min(int(args.timeout), 120))
+    outgoing, incoming, verdict, src_remote, dst_remote = traffic_verdict(
+        nb_rows, flows, src_sets, dst_sets, src_addr, dst_addr,
+        proto, args.port)
+    write_traffic(
+        args.src, args.dst, proto, args.port, outgoing, incoming, verdict,
+        flows, hosts, sys.stdout, src_remote=src_remote, dst_remote=dst_remote,
+        macs=macs)
+    sys.stdout.flush()
+    return 0
 
 
 def parse_args(argv):
@@ -2644,11 +3493,20 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(
         description=(
             "List policy port-set incoming and outgoing peers, service groups, "
-            "and priority, then validate them in OVN-NB."))
+            "and priority, then validate them in OVN-NB. "
+            "With --src, --dst, --port, and --proto, print the ACL, the "
+            "southbound flow, the cookie, the OVS host, and allow or deny."))
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--include-project", action="store_true")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument(
+        "--skip-sb", action="store_true",
+        help="stop after the Northbound check and do not read Logical_Flow")
+    parser.add_argument("--src", default="", help="source NIC uuid")
+    parser.add_argument("--dst", default="", help="destination NIC uuid")
+    parser.add_argument("--port", type=int, default=None, help="destination port or icmp type")
+    parser.add_argument("--proto", default="", help="tcp, udp, or icmp")
     return parser.parse_args(argv)
 
 
@@ -2772,6 +3630,8 @@ def main(argv=None):
         return 0
     maybe_forward(argv)
     info = detect_platform()
+    if args.src or args.dst or args.port is not None or args.proto:
+        return traffic_main(info, args)
     global_uuid, vlan_uuid = fetch_unique_uuids(info)
     if not global_uuid or not vlan_uuid:
         raise SystemExit("missing vlan/global unique uuid (zkcat / atlas ZK)")
@@ -2801,8 +3661,17 @@ def main(argv=None):
     missing = write_nb(
         records, sys.stdout, port_groups=len(groups), acls=len(acl_rows),
         groups=groups, atlas_map=atlas_map)
+    if args.skip_sb:
+        sys.stdout.flush()
+        return 1 if missing or acl_failed else 0
+    nb_detail, flows, live_groups, cfg = load_sb(info, min(int(args.timeout), 600))
+    cfg_failed = write_cfg(cfg, sys.stdout)
+    sb_failed = write_sb(nb_detail, flows, live_groups, sys.stdout)
+    LOG.info(
+        "sb_acls=%s sb_hints=%s sb_live_port_groups=%s sb_failed=%s",
+        len(nb_detail), len(flows), len(live_groups), sb_failed)
     sys.stdout.flush()
-    return 1 if missing or acl_failed else 0
+    return 1 if missing or acl_failed or cfg_failed or sb_failed else 0
 
 
 if __name__ == "__main__":
