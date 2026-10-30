@@ -22,6 +22,9 @@ Stdout is only mismatch rows, tab-separated:
 
 K8s_* port sets and Quarantine port sets with no NICs are left out.
 Address groups are not port sets. SAVE-mode policies are skipped.
+A port set that is in Atlas with no generated IPv4 address set is
+address_set_missing. CMSP reads that map from the PC AtlasClient. SMSP
+runs the same call in the flow-cluster atlas pod.
 
 FLEX also hashes applied_to (the entity group on the rule) and an empty
 VM selector when should_allow_any_src/dst is set or the rule has no
@@ -1156,9 +1159,14 @@ def mismatch_rows(policies, vlan_uuid, global_uuid, idf_map, include_project=Fal
                     scope=annotated.get("scope") or "",
                     refs=",".join(str(item) for item in refs))
     rows = []
+    matched = []
     for uid in sorted(computed):
         slot = computed[uid]
         if slot.pop("present"):
+            matched.append({
+                "port_set": uid,
+                "policy": slot.get("policy") or "",
+            })
             continue
         slot["nic_mismatch"] = "port_set_missing"
         rows.append(slot)
@@ -1175,6 +1183,34 @@ def mismatch_rows(policies, vlan_uuid, global_uuid, idf_map, include_project=Fal
             "idf_name": rec.get("name") or "",
             "policy": "",
             "nic_mismatch": ",".join(nics),
+        })
+    return rows, matched
+
+
+def usable_address(rec):
+    """Generated address set. IPv4 when Atlas has one, otherwise IPv6.
+
+    The all-zero UUID is not an address set. An IPv6-only port set is present.
+    """
+    for key in ("ipv4", "ipv6"):
+        uid = str((rec or {}).get(key) or "").strip().lower()
+        if UUID_RE.fullmatch(uid) and uid != ZERO:
+            return uid
+    return ""
+
+
+def missing_address_sets(matched, address_map):
+    """Port sets Atlas has, with no generated IPv4 or IPv6 address set."""
+    rows = []
+    for rec in matched or []:
+        uid = str(rec.get("port_set") or "").lower()
+        if usable_address((address_map or {}).get(uid)):
+            continue
+        rows.append({
+            "mismatch": "address_set_missing",
+            "port_set": uid,
+            "policy": rec.get("policy") or "",
+            "nic_mismatch": "address_set_missing",
         })
     return rows
 
@@ -1237,7 +1273,7 @@ def self_test():
             "virtual_nic_uuid_list": [],
         },
     ])
-    rows = mismatch_rows([policy], vlan_uuid, global_uuid, idf_map)
+    rows, matched = mismatch_rows([policy], vlan_uuid, global_uuid, idf_map)
     kinds = {(row["mismatch"], row["port_set"]) for row in rows}
     if ("computed_without_idf", expect) not in kinds:
         raise SystemExit("missing computed mismatch: %s" % rows)
@@ -1300,7 +1336,7 @@ def self_test():
     flex_idf[src_hash] = {"uuid": src_hash, "name": "flex-src", "nics": ["n"]}
     flex_idf[global_hash] = {
         "uuid": global_hash, "name": "flex-global", "nics": ["n"]}
-    flex_rows = mismatch_rows(
+    flex_rows, _flex_matched = mismatch_rows(
         [policy, flex, flex_global], vlan_uuid, global_uuid, flex_idf)
     flex_kinds = {
         (row["mismatch"], row["port_set"], row.get("role") or "")
@@ -1321,6 +1357,20 @@ def self_test():
         "cmsp", "pc-g", "pc-v", "atlas-g", "atlas-v")
     if (cmsp_g, cmsp_v) != ("pc-g", "pc-v"):
         raise SystemExit("CMSP scope uuid %s %s" % (cmsp_g, cmsp_v))
+    present = [rec for rec in matched if rec["port_set"] == other_hash]
+    if not present:
+        raise SystemExit("matched port set was not kept for the address set")
+    gaps = missing_address_sets(present, {})
+    if len(gaps) != 1 or gaps[0]["mismatch"] != "address_set_missing":
+        raise SystemExit("address set gap: %s" % gaps)
+    if gaps[0]["policy"] != "T":
+        raise SystemExit("address set policy: %s" % gaps[0])
+    if missing_address_sets(present, {other_hash: {"ipv4": "49d3b015-7bac-5a2a-8d9a-5c033243ba71"}}):
+        raise SystemExit("present address set was reported")
+    if missing_address_sets(present, {other_hash: {"ipv4": "", "ipv6": "49d3b015-7bac-5a2a-8d9a-5c033243ba71"}}):
+        raise SystemExit("ipv6-only address set was reported missing")
+    if not missing_address_sets(present, {other_hash: {"ipv4": ZERO, "ipv6": ""}}):
+        raise SystemExit("zero address set was accepted")
     text = "".join(_render(rows))
     if "policy.json" in text or text.count("\n") != 1 + len(rows):
         raise SystemExit("unexpected output: %s" % text)
@@ -1348,6 +1398,105 @@ def parse_args():
     return parser.parse_args()
 
 
+AS_MAP_PY = r"""
+import json, sys, uuid
+try:
+  import gflags
+  gflags.FLAGS(sys.argv[:1], known_only=True)
+except Exception:
+  pass
+from util.sl_bufs.net.rpc_pb2 import RpcRequestContext
+from atlas.atlas_interface_pb2 import PortSetAddressSetMapGetArg
+from atlas.client.client import AtlasClient
+from util.misc.protobuf import pb2json, reformat_proto
+uuids = json.loads('''__UUIDS__''')
+ctx = RpcRequestContext()
+ctx.should_authorize = False
+client = AtlasClient()
+out = {}
+step = 400
+for start in range(0, len(uuids), step):
+  arg = PortSetAddressSetMapGetArg()
+  for uid in uuids[start:start + step]:
+    arg.port_set_uuid_list.append(uuid.UUID(str(uid)).bytes)
+  ret = client.PortSetAddressSetMapGet(arg, request_context=ctx)
+  payload = pb2json(reformat_proto(ret), b64_bytes=False, convert_enum_to_str=True)
+  for row in payload.get("port_set_address_set_map_list") or []:
+    out[str(row.get("uuid") or "").lower()] = {
+      "ipv4": str(row.get("generated_ipv4_address_set_uuid") or "").lower(),
+      "ipv6": str(row.get("generated_ipv6_address_set_uuid") or "").lower(),
+    }
+sys.stdout.write(json.dumps(out, separators=(",", ":")))
+"""
+
+
+def _atlas_python():
+    return _which(
+        "/home/nutanix/.venvs/bin/bin/python3",
+        "/home/nutanix/.venvs/flow/bin/python3",
+        "")
+
+
+def _run_atlas_pod(info, script, timeout):
+    """Run AtlasClient inside the flow-cluster atlas pod. SMSP Atlas is not on the PC."""
+    tmp = tempfile.mkdtemp(prefix="port_set_as_")
+    kubeconfig = ""
+    try:
+        kubeconfig, err = _flow_kubeconfig(tmp)
+        if not kubeconfig:
+            raise SystemExit(err or "mspctl kubeconfig failed")
+        ns, pod, err = _find_pod("atlas", "atlas-0", "ntnx-flow", kubeconfig)
+        if not pod:
+            ns, pod, err = _find_pod("atlas", "atlas-0", "", kubeconfig)
+        if not pod:
+            raise SystemExit(err or "atlas pod not found")
+        py = _pod_bin(
+            kubeconfig, ns, pod,
+            "ls /home/nutanix/.venvs/bin/bin/python3 "
+            "/home/nutanix/.venvs/flow/bin/python3 2>/dev/null | head -1")
+        if not py:
+            raise SystemExit("no python3 in atlas pod")
+        return _kubectl(
+            ["exec", "-i", "-n", ns, pod, "--", py, "-"],
+            timeout, kubeconfig=kubeconfig, input_text=script)
+    finally:
+        if kubeconfig:
+            try:
+                os.remove(kubeconfig)
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmp)
+        except OSError:
+            pass
+
+
+def fetch_port_set_address_sets(info, uuids, timeout):
+    """Generated IPv4/IPv6 address set for each port set.
+
+    CMSP calls AtlasClient on the PC. SMSP runs the same call in the flow
+    cluster atlas pod.
+    """
+    uuids = [str(uid).lower() for uid in (uuids or []) if uid]
+    if not uuids:
+        return {}
+    timeout = max(60, min(300, int(timeout or 180)))
+    script = AS_MAP_PY.replace("__UUIDS__", json.dumps(uuids))
+    if (info or {}).get("platform") == "smsp":
+        rc, out, err = _run_atlas_pod(info, script, timeout)
+    else:
+        py = _atlas_python()
+        if not py:
+            raise SystemExit("python3 for Atlas is missing")
+        rc, out, err = _run([py, "-"], timeout, input_text=script)
+    if rc != 0:
+        raise SystemExit((err or out or "PortSetAddressSetMapGet failed")[:400])
+    payload = _json_loads(out)
+    if not isinstance(payload, dict):
+        raise SystemExit("PortSetAddressSetMapGet returned no JSON object")
+    return payload
+
+
 def main():
     args = parse_args()
     setup_logging()
@@ -1363,12 +1512,16 @@ def main():
     if not policies:
         raise SystemExit("no policies from flow_cli")
     idf_map = fetch_idf_port_sets(info, timeout=min(int(args.timeout), 600))
-    rows = mismatch_rows(
+    rows, matched = mismatch_rows(
         policies, vlan_uuid, global_uuid, idf_map,
         include_project=args.include_project)
+    address_map = fetch_port_set_address_sets(
+        info, [rec["port_set"] for rec in matched],
+        min(int(args.timeout), 300))
+    rows.extend(missing_address_sets(matched, address_map))
     LOG.info(
-        "policies=%s idf_port_sets=%s mismatches=%s",
-        len(policies), len(idf_map), len(rows))
+        "policies=%s idf_port_sets=%s mismatches=%s address_sets=%s",
+        len(policies), len(idf_map), len(rows), len(address_map))
     if not rows:
         return 0
     write_rows(rows, sys.stdout)

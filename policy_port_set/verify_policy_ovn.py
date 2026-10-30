@@ -3076,7 +3076,7 @@ def self_test():
         raise SystemExit("traffic allow: %s %s %s" % (verdict, _out, _inc))
     if src_remote or dst_remote:
         raise SystemExit("both nics are local")
-    _stage, sb_pri, cookies = _sb_hits(_out, flow_rows)
+    _stage, sb_pri, cookies, _actions = _sb_hits(_out, flow_rows)
     if _stage != "ls_in_acl_eval" or sb_pri != 2050 or cookies != [0x11223344]:
         raise SystemExit("traffic cookie: %s %s %s" % (_stage, sb_pri, cookies))
     _out, _inc, verdict, _sr, _dr = traffic_verdict(
@@ -3117,6 +3117,34 @@ def self_test():
         "tcp", 80)
     if verdict != "allow" or not _is_monitor(mon):
         raise SystemExit("traffic monitor: %s" % verdict)
+    ip6_deny = {
+        "acl": "241d9ec4-b1af-4507-9755-c3ea9ca046c5",
+        "priority": "1090",
+        "direction": "from-lport",
+        "action": "drop",
+        "label": 196625,
+        "match": "inport == @port_group_aaaaaaaa_1111_4111_8111_aaaaaaaaaaaa && ip6",
+        "owners": [src_set],
+    }
+    _out, _inc, verdict, _sr, _dr = traffic_verdict(
+        [ip6_deny, allow_nb, deny_nb, in_allow, in_deny], flow_rows,
+        [src_set], [dst_set], [src_as], [dst_as], "tcp", 80)
+    if _out["acl"] == ip6_deny["acl"] or verdict != "allow":
+        raise SystemExit("ip6 deny covered ipv4: %s %s" % (verdict, _out))
+    _out6, _inc6, verdict6, _sr, _dr = traffic_verdict(
+        [ip6_deny, allow_nb, deny_nb, in_allow, in_deny], flow_rows,
+        [src_set], [dst_set], [src_as], [dst_as], "tcp", 80, family="ip6")
+    if not _out6 or _out6["acl"] != ip6_deny["acl"] or verdict6 != "deny":
+        raise SystemExit("ip6 deny missing: %s %s" % (verdict6, _out6))
+    if not acl_covers("ip6", "tcp", 22, "ip6"):
+        raise SystemExit("ip6 generic did not cover ipv6")
+    if acl_covers("ip4 && tcp", "tcp", 22, "ip6"):
+        raise SystemExit("ip4 match covered ipv6")
+    if usable_address({"ipv4": "", "ipv6": "49d3b015-7bac-5a2a-8d9a-5c033243ba71"}) != (
+            "49d3b015-7bac-5a2a-8d9a-5c033243ba71"):
+        raise SystemExit("ipv6 address set fallback")
+    if usable_address({"ipv4": ZERO, "ipv6": ""}):
+        raise SystemExit("zero address set accepted")
     hosts = index_ovs_hosts(
         "port_%s,chassis-1\n"
         "port_c2fb9fbf-80cf-4242-8f1a-2b6ac872d341,"
@@ -3134,6 +3162,22 @@ def self_test():
     printed_text = printed.getvalue()
     if "OVS host" in printed_text or '"ovs_host":"10.1.1.1"' not in printed_text:
         raise SystemExit("host json: %s" % printed_text)
+    if '"family":"ip4"' not in printed_text:
+        raise SystemExit("family missing: %s" % printed_text)
+    if '"label":92580' not in printed_text or "reg8[16]" not in printed_text:
+        raise SystemExit("label or reg missing: %s" % printed_text)
+    both = {
+        src_nic: {"mac": "50:6b:8d:4d:49:af", "ipv4": ["10.1.1.2"], "ipv6": ["fe80::1"]},
+        dst_nic: {"mac": "", "ipv4": ["10.1.1.3"], "ipv6": ["fe80::2"]},
+    }
+    if families_for(both, src_nic, dst_nic) != ["ip4", "ip6"]:
+        raise SystemExit("nic families: %s" % families_for(both, src_nic, dst_nic))
+    ip6_text = io.StringIO()
+    write_traffic(
+        src_nic, dst_nic, "tcp", 80, ip6_deny, None, "deny",
+        flow_rows, hosts, ip6_text, macs=both, family="ip6")
+    if ip6_deny["acl"] not in ip6_text.getvalue():
+        raise SystemExit("ip6 deny not printed: %s" % ip6_text.getvalue())
     if port_sets_for_nic({src_set: {"nics": [src_nic]}}, src_nic) != [src_set]:
         raise SystemExit("nic port set")
     sink = io.StringIO()
@@ -3176,8 +3220,27 @@ def acl_owner(rec):
     return pg_uuid(found.group(1)) if found else ""
 
 
-def acl_covers(match, proto, port):
-    """True when this ACL match applies to proto and the destination port."""
+def _match_family(match):
+    """ip4, ip6, or empty when the match names neither or both."""
+    low = (match or "").lower()
+    has4 = re.search(r"\bip4\b", low) is not None
+    has6 = re.search(r"\bip6\b", low) is not None
+    if has4 and not has6:
+        return "ip4"
+    if has6 and not has4:
+        return "ip6"
+    return ""
+
+
+def acl_covers(match, proto, port, family="ip4"):
+    """True when this ACL match applies to proto, the destination port, and family.
+
+    A generic IPv6 deny does not cover an IPv4 packet. A match with no ip4
+    or ip6 token covers both.
+    """
+    got = _match_family(match)
+    if family and got and got != family:
+        return False
     proto = str(proto or "").lower()
     kind, spec = _parsed_ranges(match, proto)
     if kind == "absent":
@@ -3230,11 +3293,12 @@ def _sb_hits(rec, flows):
         flow for flow in (flows or {}).get(hint, [])
         if flow["stage"] == stage and flow["priority"] == expect]
     cookies = sorted({flow["cookie"] for flow in hits if flow.get("cookie")})
-    return stage, expect, cookies
+    actions = [flow.get("actions") or "" for flow in hits]
+    return stage, expect, cookies, actions
 
 
 def matching_acls(nb_rows, owners, direction, peer_sets, proto, port,
-                  remote_peer=False):
+                  remote_peer=False, family="ip4"):
     """Policy ACLs on these port sets that fit the other side, protocol, and port.
 
     remote_peer means the other NIC is not on this cluster. Only an ACL with
@@ -3249,7 +3313,7 @@ def matching_acls(nb_rows, owners, direction, peer_sets, proto, port,
         owner = acl_owner(rec)
         if owner not in owners:
             continue
-        if not acl_covers(rec.get("match"), proto, port):
+        if not acl_covers(rec.get("match"), proto, port, family):
             continue
         named = _peer_ids(rec.get("match"), direction)
         if remote_peer:
@@ -3262,12 +3326,13 @@ def matching_acls(nb_rows, owners, direction, peer_sets, proto, port,
 
 
 def traffic_verdict(nb_rows, flows, src_sets, dst_sets, src_addr, dst_addr,
-                    proto, port):
+                    proto, port, family="ip4"):
     """Winning outgoing and incoming policy ACL, and allow or deny.
 
     Both sides are checked when both NICs belong to a port set. A NIC with
     no port set is remote: that direction is not a local policy, and the
-    side that does exist is still checked.
+    side that does exist is still checked. family is ip4 or ip6. An ip6
+    match is not applied to an ip4 packet.
     """
     src_remote = not src_sets
     dst_remote = not dst_sets
@@ -3276,11 +3341,11 @@ def traffic_verdict(nb_rows, flows, src_sets, dst_sets, src_addr, dst_addr,
     if not src_remote:
         outgoing = _pick_winner(matching_acls(
             nb_rows, src_sets, "from-lport", set(dst_sets) | set(dst_addr),
-            proto, port, remote_peer=dst_remote))
+            proto, port, remote_peer=dst_remote, family=family))
     if not dst_remote:
         incoming = _pick_winner(matching_acls(
             nb_rows, dst_sets, "to-lport", set(src_sets) | set(src_addr),
-            proto, port, remote_peer=src_remote))
+            proto, port, remote_peer=src_remote, family=family))
     effects = []
     if not src_remote:
         effects.append(_stage_effect(outgoing))
@@ -3293,16 +3358,19 @@ def traffic_verdict(nb_rows, flows, src_sets, dst_sets, src_addr, dst_addr,
 def _stage_report(rec, flows):
     if not rec:
         return None
-    stage, sb_pri, cookies = _sb_hits(rec, flows)
+    stage, sb_pri, cookies, actions = _sb_hits(rec, flows)
     return {
         "acl": rec["acl"],
         "priority": rec["priority"],
         "direction": rec["direction"],
         "action": rec["action"],
+        "label": rec.get("label") or 0,
+        "match": rec.get("match") or "",
         "port_set": acl_owner(rec),
         "stage": stage,
         "sb_priority": sb_pri if sb_pri >= 0 else "",
         "cookie": cookies,
+        "actions": actions,
         "effect": _stage_effect(rec),
     }
 
@@ -3364,29 +3432,74 @@ def host_for(hosts, nic, mac=""):
     return ""
 
 
+def _mac_of(facts, nic):
+    rec = (facts or {}).get(str(nic or "").lower())
+    if isinstance(rec, str):
+        return rec
+    if isinstance(rec, dict):
+        return rec.get("mac") or ""
+    return ""
+
+
+def nic_families(facts, nic):
+    """ip4 and ip6 present on this NIC. Unknown addresses stay on ip4."""
+    rec = (facts or {}).get(str(nic or "").lower())
+    if not isinstance(rec, dict):
+        return ["ip4"]
+    found = []
+    if rec.get("ipv4"):
+        found.append("ip4")
+    if rec.get("ipv6"):
+        found.append("ip6")
+    return found or ["ip4"]
+
+
+def families_for(facts, src, dst):
+    """One result per address family that either NIC actually has."""
+    order = []
+    present = set(nic_families(facts, src)) | set(nic_families(facts, dst))
+    for family in ("ip4", "ip6"):
+        if family in present:
+            order.append(family)
+    return order or ["ip4"]
+
+
 def write_traffic(src, dst, proto, port, outgoing, incoming, verdict,
                   flows, hosts, handle, src_remote=False, dst_remote=False,
-                  macs=None):
+                  macs=None, family="ip4"):
     """Print the one-flow check. The last line is allow or deny.
 
-    The chassis hostname is a field of the first JSON for that direction.
+    The chassis hostname and the address family are fields of the first JSON
+    for that direction. family is ip4 or ip6.
     """
     macs = macs or {}
     handle.write(
-        "traffic src=%s dst=%s proto=%s port=%s\n" % (src, dst, proto, port))
+        "traffic src=%s dst=%s proto=%s port=%s family=%s\n" % (
+            src, dst, proto, port, family))
     for label, rec, nic, remote in (
             ("outgoing", outgoing, src, src_remote),
             ("incoming", incoming, dst, dst_remote)):
         if remote:
             handle.write("OVN NB %s: %s\n" % (
-                label, json.dumps({"ovs_host": "remote"}, separators=(",", ":"))))
+                label, json.dumps(
+                    {"family": family, "ovs_host": "remote"},
+                    separators=(",", ":"))))
             handle.write("OVN SB %s: remote\n" % label)
             continue
-        host = host_for(hosts, nic, macs.get(str(nic).lower(), ""))
-        report = _stage_report(rec, flows)
-        if not report:
+        host = host_for(hosts, nic, _mac_of(macs, nic))
+        has_family = family in nic_families(macs, nic)
+        report = _stage_report(rec, flows) if has_family else None
+        if not has_family:
             handle.write("OVN NB %s: %s\n" % (
-                label, json.dumps({"ovs_host": host}, separators=(",", ":"))))
+                label, json.dumps(
+                    {"family": family, "ovs_host": host},
+                    separators=(",", ":"))))
+            handle.write("OVN SB %s: none\n" % label)
+        elif not report:
+            handle.write("OVN NB %s: %s\n" % (
+                label, json.dumps(
+                    {"family": family, "ovs_host": host},
+                    separators=(",", ":"))))
             handle.write("OVN SB %s: none\n" % label)
         else:
             handle.write("OVN NB %s: %s\n" % (
@@ -3395,8 +3508,11 @@ def write_traffic(src, dst, proto, port, outgoing, incoming, verdict,
                     "priority": report["priority"],
                     "direction": report["direction"],
                     "action": report["action"],
+                    "label": report["label"],
+                    "match": report["match"],
                     "port_set": report["port_set"],
                     "effect": report["effect"],
+                    "family": family,
                     "ovs_host": host,
                 }, separators=(",", ":"))))
             handle.write("OVN SB %s: %s\n" % (
@@ -3405,21 +3521,29 @@ def write_traffic(src, dst, proto, port, outgoing, incoming, verdict,
                     "sb_priority": report["sb_priority"],
                     "cookie": report["cookie"],
                     "cookie_hex": cookie_hex(report["cookie"]),
+                    "actions": report["actions"],
                 }, separators=(",", ":"))))
     handle.write("verdict: %s\n" % verdict)
 
 
-def _nic_mac(entity):
+def _attr_values(entity, name):
     for item in (entity or {}).get("attribute_data_map") or []:
-        if item.get("name") != "mac_address":
+        if item.get("name") != name:
             continue
         value = item.get("value") or {}
-        return str(value.get("str_value") or "").strip().lower()
-    return ""
+        if value.get("str_value"):
+            return [str(value.get("str_value")).strip()]
+        listed = (value.get("str_list") or {}).get("value_list") or []
+        return [str(item).strip() for item in listed if str(item).strip()]
+    return []
 
 
 def fetch_nic_macs(nics, timeout):
-    """virtual_nic uuid -> MAC. The OVN port name is a different uuid."""
+    """virtual_nic uuid -> mac, ipv4, and ipv6.
+
+    The OVN port name is a different uuid. The MAC joins the port binding.
+    IPv6 addresses, including link-local, mean the ip6 deny is printed.
+    """
     binary = idfcli_bin()
     if not binary:
         return {}
@@ -3436,9 +3560,25 @@ def fetch_nic_macs(nics, timeout):
         if isinstance(payload, dict):
             entities = payload.get("entity") or []
         for entity in entities:
-            mac = _nic_mac(entity)
-            if mac:
-                found[nic.lower()] = mac
+            mac = ""
+            for item in _attr_values(entity, "mac_address"):
+                mac = item.lower()
+                break
+            found[nic.lower()] = {
+                "mac": mac,
+                "ipv4": _attr_values(entity, "ipv4_addresses"),
+                "ipv6": _attr_values(entity, "ipv6_addresses"),
+            }
+    return found
+
+
+def _family_addrs(address_map, uids, family):
+    key = "ipv6" if family == "ip6" else "ipv4"
+    found = []
+    for uid in uids or []:
+        got = str((address_map or {}).get(uid, {}).get(key) or "").strip().lower()
+        if UUID_RE.fullmatch(got) and got != ZERO and got not in found:
+            found.append(got)
     return found
 
 
@@ -3466,24 +3606,19 @@ def traffic_main(info, args):
             wanted.append(uid)
     address_map = fetch_port_set_address_sets(
         info, wanted, min(int(args.timeout), 300))
-    src_addr = [
-        (address_map.get(uid) or {}).get("ipv4") or ""
-        for uid in src_sets]
-    dst_addr = [
-        (address_map.get(uid) or {}).get("ipv4") or ""
-        for uid in dst_sets]
-    src_addr = [item for item in src_addr if item]
-    dst_addr = [item for item in dst_addr if item]
     nb_rows, flows, _live, _cfg = load_sb(info, min(int(args.timeout), 600))
     hosts = load_hosts(info, min(int(args.timeout), 300))
     macs = fetch_nic_macs([args.src, args.dst], min(int(args.timeout), 120))
-    outgoing, incoming, verdict, src_remote, dst_remote = traffic_verdict(
-        nb_rows, flows, src_sets, dst_sets, src_addr, dst_addr,
-        proto, args.port)
-    write_traffic(
-        args.src, args.dst, proto, args.port, outgoing, incoming, verdict,
-        flows, hosts, sys.stdout, src_remote=src_remote, dst_remote=dst_remote,
-        macs=macs)
+    for family in families_for(macs, args.src, args.dst):
+        src_addr = _family_addrs(address_map, src_sets, family)
+        dst_addr = _family_addrs(address_map, dst_sets, family)
+        outgoing, incoming, verdict, src_remote, dst_remote = traffic_verdict(
+            nb_rows, flows, src_sets, dst_sets, src_addr, dst_addr,
+            proto, args.port, family=family)
+        write_traffic(
+            args.src, args.dst, proto, args.port, outgoing, incoming, verdict,
+            flows, hosts, sys.stdout, src_remote=src_remote,
+            dst_remote=dst_remote, macs=macs, family=family)
     sys.stdout.flush()
     return 0
 
@@ -3575,15 +3710,64 @@ def _run_pc_python(py, script, timeout):
     return payload
 
 
+def _run_atlas_pod(info, script, timeout):
+    """Run AtlasClient inside the flow-cluster atlas pod. SMSP Atlas is not on the PC."""
+    tmp = tempfile.mkdtemp(prefix="policy_ovn_as_")
+    kubeconfig = ""
+    try:
+        kubeconfig, err = _flow_kubeconfig(tmp)
+        if not kubeconfig:
+            raise SystemExit(err or "mspctl kubeconfig failed")
+        ns, pod, err = _find_pod("atlas", "atlas-0", "ntnx-flow", kubeconfig)
+        if not pod:
+            ns, pod, err = _find_pod("atlas", "atlas-0", "", kubeconfig)
+        if not pod:
+            raise SystemExit(err or "atlas pod not found")
+        py = _pod_bin(
+            kubeconfig, ns, pod,
+            "ls /home/nutanix/.venvs/bin/bin/python3 "
+            "/home/nutanix/.venvs/flow/bin/python3 2>/dev/null | head -1")
+        if not py:
+            raise SystemExit("no python3 in atlas pod")
+        return _kubectl(
+            ["exec", "-i", "-n", ns, pod, "--", py, "-"],
+            timeout, kubeconfig=kubeconfig, input_text=script)
+    finally:
+        if kubeconfig:
+            try:
+                os.remove(kubeconfig)
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmp)
+        except OSError:
+            pass
+
+
 def fetch_port_set_address_sets(info, uuids, timeout):
-    """Atlas generated IPv4/IPv6 address set for each port set."""
+    """Atlas generated IPv4/IPv6 address set for each port set.
+
+    CMSP calls AtlasClient on the PC. SMSP runs the same call in the flow
+    cluster atlas pod, because that Atlas is not the PC process.
+    """
     uuids = [str(uid).lower() for uid in (uuids or []) if uid]
     if not uuids:
         return {}
     timeout = max(60, min(300, int(timeout or 180)))
-    py = _atlas_python()
     script = AS_MAP_PY.replace("__UUIDS__", json.dumps(uuids))
-    return _run_pc_python(py, script, timeout)
+    if (info or {}).get("platform") == "smsp":
+        rc, out, err = _run_atlas_pod(info, script, timeout)
+    else:
+        py = _atlas_python()
+        if not py:
+            raise SystemExit("python3 for Atlas is missing")
+        rc, out, err = _run([py, "-"], timeout, input_text=script)
+    if rc != 0:
+        raise SystemExit((err or out or "PortSetAddressSetMapGet failed")[:400])
+    payload = _json_loads(out)
+    if not isinstance(payload, dict):
+        raise SystemExit("PortSetAddressSetMapGet returned no JSON object")
+    return payload
 
 
 def fetch_quarantine_categories(info, timeout):
@@ -3602,6 +3786,18 @@ def fetch_quarantine_categories(info, timeout):
         return {}
 
 
+def usable_address(rec):
+    """Generated address set. IPv4 when Atlas has one, otherwise IPv6.
+
+    The all-zero UUID is not an address set.
+    """
+    for key in ("ipv4", "ipv6"):
+        uid = str((rec or {}).get(key) or "").strip().lower()
+        if UUID_RE.fullmatch(uid) and uid != ZERO:
+            return uid
+    return ""
+
+
 def bind_address_sets(edges, address_map):
     """Fill the port set's generated address set. Address groups are already hashed."""
     address_map = address_map or {}
@@ -3610,15 +3806,15 @@ def bind_address_sets(edges, address_map):
         if kind == "address_set":
             continue
         if kind == "intra":
-            rec = address_map.get(edge.get("port_set") or "") or {}
-            edge["address_set"] = rec.get("ipv4") or ""
+            edge["address_set"] = usable_address(
+                address_map.get(edge.get("port_set") or ""))
             continue
         if kind == "default_deny":
             continue
         peer = edge.get("peer_port_set") or ""
-        rec = address_map.get(peer) or {}
-        if rec.get("ipv4"):
-            edge["address_set"] = rec["ipv4"]
+        got = usable_address(address_map.get(peer))
+        if got:
+            edge["address_set"] = got
 
 
 def main(argv=None):
