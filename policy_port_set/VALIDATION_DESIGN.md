@@ -5,7 +5,7 @@ Two standalone scripts. Each is one file, stdlib only, and neither imports the o
 | Script | Question it answers |
 |---|---|
 | `validate_port_sets.py` | Does the port-set UUID hashed from the Flow policy exist in Atlas `atlas_port_set`? |
-| `verify_policy_ovn.py` | For port sets Atlas reports, does OVN-NB have the port group, the peer, and the service-group ACL? |
+| `verify_policy_ovn.py` | For port sets Atlas reports, does OVN-NB have the port group, the peer, and the service-group ACL, and did northd copy each emitted ACL into OVN-SB? |
 
 `validate_port_sets.py` runs on any Prism Central VM. `verify_policy_ovn.py` also starts on any PC VM. OVN-NB is reached from the Prism Central leader, so a follower copies that one file to the leader over the cluster SSH key and prints the leader's stdout. No password is stored in the script.
 
@@ -168,7 +168,40 @@ An incoming ACL has `outport == @port_group_<owner>` and the peer in `ip4.src` o
 | `priority_missing` | the ACL row has no integer priority |
 | `priority_mismatch` | an ACL for that peer exists and its priority is not the class priority |
 
-A port set or peer that is absent from `atlas_port_set` is ignored. Kubernetes is ignored when the policy name or the Atlas name matches `k8s`, `kubernetes`, or `cilium_vlan_scope`. Those ignored port groups still appear under `OVN NB not_checked`. Exit status is 1 when `missing` is not 0.
+A port set or peer that is absent from `atlas_port_set` is ignored. Kubernetes is ignored when the policy name or the Atlas name matches `k8s`, `kubernetes`, or `cilium_vlan_scope`. Those ignored port groups still appear under `OVN NB not_checked`. Exit status is 1 when `missing` is not 0, an ACL row fails, a southbound flow is missing, or `NB_Global.nb_cfg` is not equal to `SB_Global.nb_cfg`.
+
+## OVN-SB check
+
+ovn-northd does not copy the ACL table. It writes one `Logical_Flow` per emitted ACL. The script derives that flow from the Northbound row and checks it.
+
+| NB column | SB Logical_Flow |
+|---|---|
+| `_uuid` first group | `external_ids:stage-hint`, 8 hex digits |
+| `direction` `from-lport` | stage `ls_in_acl_eval` |
+| `direction` `to-lport` | stage `ls_out_acl_eval` |
+| `priority` | SB priority is that number plus 1000 (`OVN_ACL_PRI_OFFSET`) |
+| `allow-related` | action contains `reg8[16] = 1` |
+| `drop` | action contains `reg8[17] = 1` |
+| `label` | `reg3` or `ct_label.label` equals that integer when it is not 0 |
+
+The label integer is the one already stored on the ACL. Flow packed it from the rule `unique_id`, the direction bit, and the mode bits. Outbound allow for unique_id 27044 is 92580. Outbound deny for unique_id 27048 is 223656. A generated default deny keeps its own unique_id on the ACL label column. The check reads that column.
+
+A port-group ACL is emitted only on a logical switch that contains a member port of that port group. The script reads SB `Port_Group.ports`. An empty port group is `not_emitted`. That is the expected result. The check fails only when the port group has ports and no Logical_Flow has that hint, stage, and priority.
+
+`NB_Global.nb_cfg` must equal `SB_Global.nb_cfg`. `hv_cfg` is printed and is not a failure by itself.
+
+```
+ovn-nbctl --columns=_uuid,priority,direction,action,label,match list ACL
+ovn-sbctl --db=unix:/var/run/ovn/ovnsb_db.sock --columns=priority,actions,external_ids,match list Logical_Flow
+ovn-sbctl --db=unix:/var/run/ovn/ovnsb_db.sock --columns=name,ports list Port_Group
+```
+
+```
+OVN cfg: nb_cfg=<nb> sb_nb_cfg=<sb> hv_cfg=<hv>
+OVN SB acl: checked=<n> emitted=<n> verified=<n> not_emitted=<n> failed=<n>
+```
+
+A failed row is `sb_missing`, `sb_verdict`, `sb_label`, `sb_match`, or `sb_unparsed`, and it names the ACL uuid and the port-set uuid.
 
 ## Completed OVN-NB check
 
