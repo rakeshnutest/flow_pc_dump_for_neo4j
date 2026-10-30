@@ -30,6 +30,12 @@ reg8[17] = 1 is drop, reg8[18] = 1 is reject.
 
 One ovn-nbctl process reads the port groups and their ACLs. One ovn-sbctl
 process reads the winning flows and the port bindings used for ovs_host.
+
+On CMSP, AtlasClient on the PC supplies each port set's generated IPv4 and
+IPv6 address set. On SMSP that same call runs inside the flow-cluster atlas
+pod, port sets and NIC addresses are read from the flow-cluster IDF, and
+OVN is reached with the flow kubeconfig. An all-zero generated UUID is not
+an address set. IPv4 uses the IPv4 UUID; IPv6 uses the IPv6 UUID.
 """
 
 import csv
@@ -337,13 +343,18 @@ def _kubectl_bin():
 
 
 def _kubectl_prefix(kubeconfig=""):
+    """kubectl for this process. A flow kubeconfig is used as given.
+
+    The local probe is only for the PC's own cluster. SMSP passes the flow
+    kubeconfig, so that path does not try sudo against the PC.
+    """
     kubectl = _kubectl_bin()
+    if kubeconfig:
+        return [kubectl, "--kubeconfig", kubeconfig]
     prefix = [kubectl]
     rc, _out, _err = _run(prefix + ["get", "ns"], 15)
     if rc != 0:
         prefix = ["sudo", "-n", kubectl]
-    if kubeconfig:
-        prefix = list(prefix) + ["--kubeconfig", kubeconfig]
     return list(prefix)
 
 
@@ -398,6 +409,9 @@ def _find_pod(app, preferred, namespace="", kubeconfig=""):
         return "", "", "no Running pod %s" % preferred
     for ns, name in matches:
         if name == preferred:
+            return ns, name, ""
+    for ns, name in matches:
+        if name.endswith("-0"):
             return ns, name, ""
     return matches[0][0], matches[0][1], ""
 
@@ -601,6 +615,33 @@ def fetch_idf_port_sets(info, timeout):
     raise SystemExit("idfcli port_set returned no entities\n" + "\n".join(errors))
 
 
+def _idf_inner(entity, key=""):
+    """idfcli argv inside a flow pod. key limits the get to one entity."""
+    select = "-e %s --all" % entity
+    if key:
+        select = "-e %s -k %s" % (entity, key)
+    bins = (
+        "idfcli",
+        "/usr/local/nutanix/bin/idfcli",
+        "/home/nutanix/bin/idfcli",
+    )
+    return " || ".join("%s get entity %s -o json" % (binary, select) for binary in bins)
+
+
+def _smsp_idf_pod(kubeconfig):
+    """Atlas port sets live in the flow-cluster IDF, often beside atlas."""
+    found_pod = ("", "", "no pod")
+    for app, preferred in (
+            ("atlas", "atlas-0"), ("insights", "insights-0"), ("idf", "idf-0")):
+        ns, pod, err = _find_pod(app, preferred, "ntnx-flow", kubeconfig)
+        if not pod:
+            ns, pod, err = _find_pod(app, preferred, "", kubeconfig)
+        if pod:
+            return ns, pod, ""
+        found_pod = (ns, pod, err)
+    return found_pod
+
+
 def _fetch_idf_smsp(info, timeout):
     tmp = tempfile.mkdtemp(prefix="nic_ovn_kube_")
     kubeconfig = ""
@@ -608,21 +649,20 @@ def _fetch_idf_smsp(info, timeout):
         kubeconfig, kube_err = _flow_kubeconfig(tmp)
         if not kubeconfig:
             return {}, kube_err or "smsp kubeconfig failed"
-        ns, pod, err = _find_pod("insights", "insights-0", "ntnx-flow", kubeconfig)
-        if not pod:
-            ns, pod, err = _find_pod("idf", "idf-0", "ntnx-flow", kubeconfig)
+        ns, pod, err = _smsp_idf_pod(kubeconfig)
         if not pod:
             return {}, err or "smsp idf pod missing"
+        last = "empty"
         for entity in IDF_ENTITIES:
-            inner = "idfcli get entity -e %s --all -o json" % entity
             _rc, out, err = _kubectl(
-                ["exec", "-n", ns, pod, "--", "bash", "-lc", inner],
+                ["exec", "-n", ns, pod, "--", "bash", "-lc", _idf_inner(entity)],
                 timeout, kubeconfig=kubeconfig)
             found = parse_idf_stdout(out)
             if found:
                 LOG.info("idfcli %s via %s/%s count=%s", entity, ns, pod, len(found))
                 return found, ""
-        return {}, (err or "empty")[:200]
+            last = (err or out or "empty").strip().replace("\n", " ")[:300]
+        return {}, "smsp idfcli %s/%s: %s" % (ns, pod, last)
     finally:
         if kubeconfig:
             try:
@@ -661,6 +701,8 @@ def _run_atlas_pod(info, script, timeout):
         if not kubeconfig:
             raise SystemExit(err or "mspctl kubeconfig failed")
         ns, pod, err = _find_pod("atlas", "atlas-0", "ntnx-flow", kubeconfig)
+        if not pod:
+            ns, pod, err = _find_pod("atlas", "atlas-0", "", kubeconfig)
         if not pod:
             raise SystemExit(err or "atlas pod not found")
         py = _pod_bin(
@@ -718,30 +760,78 @@ def _attr_values(entity, name):
     return []
 
 
-def fetch_nic_macs(nics, timeout):
+def _nic_from_idf_text(text, nic):
+    payload = _json_loads(text)
+    entities = []
+    if isinstance(payload, dict):
+        raw = payload.get("entity") or []
+        entities = raw if isinstance(raw, list) else [raw]
+    for entity in entities:
+        if not isinstance(entity, dict):
+            continue
+        mac = ""
+        for item in _attr_values(entity, "mac_address"):
+            mac = item.lower()
+            break
+        if not mac and not _attr_values(entity, "ipv4_addresses"):
+            continue
+        return {
+            "mac": mac,
+            "ipv4": _attr_values(entity, "ipv4_addresses"),
+            "ipv6": _attr_values(entity, "ipv6_addresses"),
+        }
+    return {}
+
+
+def _fetch_nic_mac_smsp(nic, timeout):
+    """virtual_nic from the flow-cluster IDF. PC IDF is the fallback."""
+    tmp = tempfile.mkdtemp(prefix="nic_ovn_vnic_")
+    kubeconfig = ""
+    try:
+        kubeconfig, _err = _flow_kubeconfig(tmp)
+        if not kubeconfig:
+            return {}
+        ns, pod, _err = _smsp_idf_pod(kubeconfig)
+        if not pod:
+            return {}
+        _rc, out, _err = _kubectl(
+            ["exec", "-n", ns, pod, "--", "bash", "-lc",
+             _idf_inner("virtual_nic", nic)],
+            timeout, kubeconfig=kubeconfig)
+        return _nic_from_idf_text(out, nic)
+    finally:
+        if kubeconfig:
+            try:
+                os.remove(kubeconfig)
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmp)
+        except OSError:
+            pass
+
+
+def fetch_nic_macs(info, nics, timeout):
+    """MAC and addresses for these virtual_nic UUIDs.
+
+    SMSP reads the flow-cluster IDF first. A miss falls back to idfcli on
+    the PC, which is where the NIC entity lives on CMSP.
+    """
     binary = idfcli_bin()
-    if not binary:
-        return {}
     found = {}
+    smsp = (info or {}).get("platform") == "smsp"
     for nic in nics or []:
         nic = str(nic or "").strip()
         if not nic:
             continue
-        _rc, text, _err = _run(
-            [binary, "get", "entity", "-e", "virtual_nic", "-k", nic, "-o", "json"],
-            timeout)
-        payload = _json_loads(text)
-        entities = payload.get("entity") if isinstance(payload, dict) else []
-        for entity in entities or []:
-            mac = ""
-            for item in _attr_values(entity, "mac_address"):
-                mac = item.lower()
-                break
-            found[nic.lower()] = {
-                "mac": mac,
-                "ipv4": _attr_values(entity, "ipv4_addresses"),
-                "ipv6": _attr_values(entity, "ipv6_addresses"),
-            }
+        rec = _fetch_nic_mac_smsp(nic, timeout) if smsp else {}
+        if not rec and binary:
+            _rc, text, _err = _run(
+                [binary, "get", "entity", "-e", "virtual_nic", "-k", nic, "-o", "json"],
+                timeout)
+            rec = _nic_from_idf_text(text, nic)
+        if rec:
+            found[nic.lower()] = rec
     return found
 
 
@@ -1216,7 +1306,7 @@ def traffic_main(info, args):
     addr_thread, addr_box = _spawn(
         fetch_port_set_address_sets, (info, wanted, min(int(args.timeout), 300)))
     mac_thread, mac_box = _spawn(
-        fetch_nic_macs, ([args.src, args.dst], min(int(args.timeout), 120)))
+        fetch_nic_macs, (info, [args.src, args.dst], min(int(args.timeout), 120)))
     nb_rows = load_acls_for_port_sets(info, wanted, min(int(args.timeout), 180))
     address_map = _join(addr_thread, addr_box)
     macs = _join(mac_thread, mac_box)
@@ -1270,6 +1360,53 @@ def self_test():
         [allow, ip6], [src_set], [dst_set], [], [], "tcp", 80, family="ip6")
     if verdict != "deny" or not outgoing["acl"].startswith("241d9ec4"):
         raise SystemExit("ip6 packet missed the ip6 deny")
+    peer_as = "cccccccc-3333-4333-8333-cccccccccccc"
+    peer_token = peer_as.replace("-", "_")
+    specific = {
+        "acl": "33333333-3333-4333-8333-333333333333",
+        "priority": "1100", "direction": "from-lport", "action": "allow-related",
+        "label": 1,
+        "match": (
+            "inport == @port_group_aaaaaaaa_1111_4111_8111_aaaaaaaaaaaa && "
+            "ip4.dst == $address_set_%s && tcp && tcp.dst == 22" % peer_token),
+    }
+    generic = {
+        "acl": "44444444-4444-4444-8444-444444444444",
+        "priority": "1045", "direction": "from-lport", "action": "drop",
+        "label": 2,
+        "match": "inport == @port_group_aaaaaaaa_1111_4111_8111_aaaaaaaaaaaa && ip4",
+    }
+    outgoing, _incoming, verdict, _sr, _dr = traffic_verdict(
+        [generic, specific], [src_set], [dst_set], [], [peer_as],
+        "tcp", 22, family="ip4")
+    if verdict != "allow" or not outgoing["acl"].startswith("33333333"):
+        raise SystemExit("address set peer was not selected: %s" % outgoing)
+    outgoing, _incoming, verdict, _sr, _dr = traffic_verdict(
+        [generic, specific], [src_set], [dst_set], [], [ZERO],
+        "tcp", 22, family="ip4")
+    if verdict != "deny" or not outgoing["acl"].startswith("44444444"):
+        raise SystemExit("zero address set counted as a peer: %s" % outgoing)
+    ip6_as = "dddddddd-4444-4444-8444-dddddddddddd"
+    ip6_specific = {
+        "acl": "55555555-5555-4555-8555-555555555555",
+        "priority": "1100", "direction": "to-lport", "action": "allow-related",
+        "label": 3,
+        "match": (
+            "ip6.src == $address_set_%s && tcp && tcp.dst == 22 && "
+            "outport == @port_group_bbbbbbbb_2222_4222_8222_bbbbbbbbbbbb"
+            % ip6_as.replace("-", "_")),
+    }
+    _outgoing, incoming, verdict, _sr, _dr = traffic_verdict(
+        [ip6_specific, generic], [src_set], [dst_set], [ip6_as], [],
+        "tcp", 22, family="ip6")
+    if verdict != "allow" or not incoming["acl"].startswith("55555555"):
+        raise SystemExit("ipv6 address set peer was not selected: %s" % incoming)
+    if _family_addrs({dst_set: {"ipv4": ZERO, "ipv6": ip6_as}}, [dst_set], "ip4"):
+        raise SystemExit("zero ipv4 address set was used")
+    if _family_addrs({dst_set: {"ipv4": ZERO, "ipv6": ip6_as}}, [dst_set], "ip6") != [ip6_as]:
+        raise SystemExit("ipv6 address set fallback failed")
+    if "virtual_nic" not in _idf_inner("virtual_nic", src_set):
+        raise SystemExit("smsp idf command")
     monitor = {
         "acl": "22222222-2222-4222-8222-222222222222",
         "priority": "1017", "direction": "from-lport", "action": "drop",
