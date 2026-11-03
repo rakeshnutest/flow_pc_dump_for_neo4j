@@ -69,7 +69,7 @@ ZERO = "00000000-0000-0000-0000-000000000000"
 
 DEFAULT_PROJECT = ZERO
 
-SALUS_SERVICE_NAME = "salus"
+SALUS_SERVICE_NAME = "Salus"
 
 GLOBAL_SCOPE_UNIQUE_ID = "global-scope-unique-id"
 
@@ -178,25 +178,39 @@ def generate_port_set_id(entity_type, refs, unique_uuid, project_uuid=None,
         body = body + ":project:" + project_uuid
     return str(uuid_lib.uuid5(uuid_lib.UUID(str(unique_uuid)), body)), body
 
-def scope_unique_uuid(scope, is_flex, vlan_uuid, global_uuid, vpc_uuids):
+def scope_unique_uuid(scope, is_flex, vlan_uuid, global_uuid, vpc_uuids,
+                      scope_refs=None):
     if scope in GLOBAL_SCOPES:
         return GLOBAL_SCOPE_UNIQUE_ID if is_flex else global_uuid
     if scope in VLAN_SCOPES:
         return VLAN_SCOPE_UNIQUE_ID if is_flex else vlan_uuid
-    if scope in VPC_CAT_SCOPES or scope in VPC_LIST_SCOPES:
+    if scope in VPC_CAT_SCOPES:
+        refs = scope_refs or []
+        return refs[0] if refs else ""
+    if scope in VPC_LIST_SCOPES:
         return vpc_uuids[0] if vpc_uuids else ""
     return vlan_uuid if not is_flex else VLAN_SCOPE_UNIQUE_ID
 
-def policy_vpc_uuids(policy):
+def _uuid_fields(policy, keys):
     out = []
-    for key in ("vpc_uuid_list", "vpc_uuids", "target_vpc_uuid",
-                "vpc_reference", "scope_vpc_uuid", "vpc_references",
-                "scope_references"):
+    for key in keys:
         for item in values(policy, key):
             text = str(item or "").strip()
             if text and text not in out:
                 out.append(text)
     return out
+
+def policy_vpc_uuids(policy):
+    return _uuid_fields(policy, (
+        "vpc_uuid", "vpc_uuid_list", "vpc_uuids", "target_vpc_uuid",
+        "vpc_reference", "scope_vpc_uuid", "vpc_references",
+        "scope_references"))
+
+def policy_scope_refs(policy):
+    """VPC-as-category scope id. flow_cli stores it in reference_uuid_list."""
+    return _uuid_fields(policy, (
+        "reference_uuid_list", "scope_reference_uuid_list",
+        "scope_references", "policy_category"))
 
 def as_uuid_list(items):
     out = []
@@ -255,6 +269,11 @@ def component_refs(comp):
         return "VPC", vpcs, ""
     if values(comp, "address_group_uuid") or values(comp, "ip_subnet"):
         return None, [], ""
+    if isinstance(comp, dict):
+        for key in ("endpoint_entity", "secured_entity"):
+            child = comp.get(key)
+            if isinstance(child, dict):
+                return component_refs(child)
     return None, [], "no entity refs"
 
 def idf_json_value(value):
@@ -388,6 +407,11 @@ def walk_components(node, sink, role=None):
         elif isinstance(val, list):
             for item in val:
                 if isinstance(item, dict):
+                    if child_key == "isolation_group_list":
+                        group = dict(item)
+                        group["_key"] = "secured_group"
+                        sink.append(group)
+                        continue
                     walk_components(item, sink, child_key)
 
 def rule_is_flex(rule, policy_type):
@@ -395,8 +419,27 @@ def rule_is_flex(rule, policy_type):
         return True
     return str(policy_type or "") in ("kFlex", "FLEX")
 
+ENDPOINT_ROLES = frozenset(("endpoint", "src_endpoint", "dest_endpoint"))
+
+
+def _eg_flag(refs, eg_map, flag):
+    if not eg_map or not refs:
+        return False
+    return all((eg_map.get(str(uid).lower()) or {}).get(flag) for uid in refs)
+
+
+def _address_egs(refs, eg_map):
+    """True when every ref is an address-group entity group."""
+    return _eg_flag(refs, eg_map, "address")
+
+
+def _kube_egs(refs, eg_map):
+    """True when every ref is a Kubernetes entity group. Those are not port sets."""
+    return _eg_flag(refs, eg_map, "kube")
+
+
 def annotate_component(comp, unique_uuid, project_uuid, is_flex, include_project,
-                        has_ipv6=False):
+                        has_ipv6=False, eg_map=None):
     """Port-set hash, or the address-set uuid5 when the peer is an address group."""
     entity_type, refs, skip = component_refs(comp)
     role = comp.get("_key") or ""
@@ -415,9 +458,16 @@ def annotate_component(comp, unique_uuid, project_uuid, is_flex, include_project
         for uid in groups:
             row["address_sets"].extend(address_set_ids(uid, has_ipv6))
         return row
+    if role in ENDPOINT_ROLES and _address_egs(refs, eg_map):
+        row["kind"] = "address_set"
+        for uid in refs:
+            row["address_sets"].extend(address_set_ids(uid, has_ipv6))
+        return row
+    if _kube_egs(refs, eg_map):
+        return row
     if skip or not refs or not unique_uuid:
         return row
-    project = project_uuid if include_project else None
+    project = project_uuid
     hashed, _body = generate_port_set_id(
         entity_type, refs, unique_uuid, project, is_flex=is_flex)
     row["kind"] = "port_set"
@@ -437,7 +487,7 @@ def iter_rules(policy):
                         rule["_key"] = rkey
                     yield rkey, rule
 
-def annotate_policy(policy, vlan_uuid, global_uuid, include_project):
+def annotate_policy(policy, vlan_uuid, global_uuid, include_project, eg_map=None):
     name = first(policy, "name")
     policy_uuid = first(policy, "uuid")
     scope = first(policy, "scope") or "kAllVlan"
@@ -445,13 +495,14 @@ def annotate_policy(policy, vlan_uuid, global_uuid, include_project):
     policy_type = first(policy, "policy_type")
     project = first(policy, "project_uuid") or ZERO
     vpc_uuids = policy_vpc_uuids(policy)
+    scope_refs = policy_scope_refs(policy)
     rules_out = []
     save_mode = str(mode) in ("kSave", "SAVE")
     if not save_mode:
         for rkey, rule in iter_rules(policy):
             is_flex = rule_is_flex(rule, policy_type) or rkey == "flex_policy_rule"
             unique = scope_unique_uuid(
-                scope, is_flex, vlan_uuid, global_uuid, vpc_uuids)
+                scope, is_flex, vlan_uuid, global_uuid, vpc_uuids, scope_refs)
             info = first(rule, "rule_info") or {}
             if not isinstance(info, dict):
                 info = {}
@@ -467,7 +518,8 @@ def annotate_policy(policy, vlan_uuid, global_uuid, include_project):
                     continue
                 seen.add(marker)
                 component_rows.append(annotate_component(
-                    comp, unique, project, is_flex, include_project, has_ipv6))
+                    comp, unique, project, is_flex, include_project, has_ipv6,
+                    eg_map))
             rules_out.append({
                 "rule_kind": rkey or rule.get("_key"),
                 "rule_uuid": rule_uuid,
@@ -601,16 +653,25 @@ def _kubectl_bin():
         "/usr/bin/kubectl", "/usr/local/bin/kubectl",
         "/home/nutanix/bin/kubectl", "kubectl")
 
+_KUBECTL_PREFIX = {}
+
+
 def _kubectl_prefix(kubeconfig=""):
+    key = kubeconfig or ""
+    cached = _KUBECTL_PREFIX.get(key)
+    if cached:
+        return list(cached)
     kubectl = _kubectl_bin()
-    for prefix in (["sudo", "-n", kubectl], ["sudo", kubectl], [kubectl]):
-        rc, _out, _err = _run(prefix + ["get", "ns"], 20)
+    # Plain kubectl works on CMSP. sudo without -n waits on a password.
+    prefix = [kubectl]
+    for candidate in ([kubectl], ["sudo", "-n", kubectl]):
+        rc, _out, _err = _run(candidate + ["get", "ns"], 20)
         if rc == 0:
+            prefix = candidate
             break
-    else:
-        prefix = ["sudo", "-n", kubectl]
     if kubeconfig:
         prefix = list(prefix) + ["--kubeconfig", kubeconfig]
+    _KUBECTL_PREFIX[key] = list(prefix)
     return list(prefix)
 
 def _kubectl(extra, timeout, kubeconfig="", input_text=None):
@@ -927,6 +988,112 @@ def _policy_runner(info):
 
     return runner, cleanup
 
+def _eg_spec(payload):
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    group = data.get("network_entity_group") if isinstance(data, dict) else None
+    if isinstance(group, dict):
+        spec = group.get("spec")
+        return spec if isinstance(spec, dict) else group
+    return data if isinstance(data, dict) else None
+
+
+def _eg_select(spec, prefix):
+    if not isinstance(spec, dict):
+        return False
+    for ent in spec.get("allowed_entities") or []:
+        if not isinstance(ent, dict):
+            continue
+        if str(ent.get("select_type_enum") or "").startswith(prefix):
+            return True
+    return False
+
+
+def _eg_is_address(spec):
+    return _eg_select(spec, "kAddressGroup")
+
+
+def _eg_is_kube(spec):
+    return _eg_select(spec, "kKube")
+
+
+def collect_entity_group_uuids(policies):
+    found = []
+    seen = set()
+    keys = (
+        "entity_group_uuid_list", "entity_group_uuid",
+        "applied_to_entity_group_uuid_list", "applied_to_entity_group_uuid",
+    )
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key in keys:
+                if key not in node:
+                    continue
+                for uid in as_uuid_list(values(node, key)):
+                    if uid not in seen:
+                        seen.add(uid)
+                        found.append(uid)
+            for val in node.values():
+                walk(val)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(policies)
+    return found
+
+
+def fetch_entity_groups(info, policies, workers=8, timeout=300):
+    """uuid -> {address: True} for address-group entity groups."""
+    uuids = collect_entity_group_uuids(policies)
+    if not uuids:
+        return {}
+    runner, cleanup = _policy_runner(info)
+    out = {}
+    try:
+        per = max(15, min(45, int(timeout)))
+
+        def _one(uid):
+            one, _text = runner(["entity_group.get", uid], per, log_cmd=False)
+            if isinstance(one, dict) and one.get("status") not in (None, 0, "0"):
+                raise RuntimeError("status=%s" % one.get("status"))
+            spec = _eg_spec(one)
+            return uid, _eg_is_address(spec), _eg_is_kube(spec)
+
+        from concurrent.futures import ThreadPoolExecutor, wait
+        get_workers = max(1, min(int(workers), len(uuids)))
+        with ThreadPoolExecutor(max_workers=get_workers) as pool:
+            fmap = {pool.submit(_one, uid): uid for uid in uuids}
+            done, pending = wait(fmap.keys(), timeout=timeout)
+            for fut in done:
+                uid = fmap[fut]
+                try:
+                    got, address, kube = fut.result(timeout=1)
+                except Exception as err:
+                    LOG.warning("entity_group.get %s: %s", uid, err)
+                    continue
+                if address or kube:
+                    out[str(got).lower()] = {
+                        "address": bool(address), "kube": bool(kube)}
+            for fut in pending:
+                LOG.warning("entity_group.get %s timed out", fmap[fut])
+                fut.cancel()
+        LOG.info(
+            "address entity groups=%s kube=%s of %s",
+            sum(1 for rec in out.values() if rec.get("address")),
+            sum(1 for rec in out.values() if rec.get("kube")),
+            len(uuids))
+        return out
+    except Exception as err:
+        LOG.warning("entity_group fetch skipped: %s", err)
+        return out
+    finally:
+        for fn in cleanup:
+            fn()
+
+
 def fetch_policies(info, workers=8, timeout=1800):
     runner, cleanup = _policy_runner(info)
     try:
@@ -1038,9 +1205,10 @@ def _field_present(node, key):
 def flex_extra_selectors(rule):
     """FLEX fields that are not src/dest/secured components.
 
-    applied_to is its own port set. should_allow_any_* and a rule with no
-    selector hash as the empty FLEX VM list (Salus "[]"). A missing
-    applied_to field is UI Global and is not hashed.
+    applied_to is one port set of every entity group on the rule.
+    should_allow_any_* hashes as the empty FLEX VM list (Salus "[]").
+    A missing applied_to field is that same empty list: the global
+    port set.
     """
     applied = []
     has_applied_key = False
@@ -1051,7 +1219,9 @@ def flex_extra_selectors(rule):
             has_applied_key = True
             applied.extend(as_uuid_list(values(rule, key)))
     if applied:
-        yield ("applied_to", "EG", [applied[0]])
+        yield ("applied_to", "EG", applied)
+    elif not has_applied_key:
+        yield ("applied_to", "VM", [])
     for flag, endpoint_key, role in (
             ("should_allow_any_src", "src_endpoint", "src_allow_any"),
             ("should_allow_any_dst", "dest_endpoint", "dest_allow_any")):
@@ -1476,6 +1646,99 @@ def _prio_num(value):
         return -1
 
 
+# Salus services/salus/policy_priority_allocator. Hermes copies the number
+# Salus already computed and does not add ACL_PRIORITY_OFFSET.
+# constants.go gflag defaults, CalculateTierZoneBoundaries, calculateFixedZone,
+# CalculatePriorityAndTier, handleSpillover.
+FLEX_RULES_PER_ZONE = 25
+FLEX_RULES_PER_POLICY = 250
+FLEX_ZONE_MIN = 0
+FLEX_TIER_MAX = (30999, 31999, 31999, 31999)
+FLEX_TIER3_MIN = 2000
+# Section slot offset and how many policies that section can hold.
+# Critical, CoreInfrastructure, Zone, Workload. constants.go iota order.
+FLEX_SECTIONS = {
+    "kCritical": (0, 10),
+    "kCoreInfrastructure": (10, 70),
+    "kZone": (80, 70),
+    "kWorkload": (150, 350),
+}
+
+
+def _flex_field(rule, keys):
+    info = rule.get("rule_info") if isinstance(rule, dict) else None
+    if not isinstance(info, dict):
+        info = {}
+    nodes = (info, rule if isinstance(rule, dict) else {})
+    for node in nodes:
+        for key in keys:
+            if key in node and node.get(key) not in (None, ""):
+                value = node.get(key)
+                if isinstance(value, list):
+                    value = value[0] if value else ""
+                return value
+    return ""
+
+
+def _flex_policy_priority(policy):
+    for key in ("policy_priority", "policyPriority"):
+        value = first(policy, key, None)
+        if value not in (None, ""):
+            return value
+    return ""
+
+
+def _flex_rank_key(rule, index):
+    """Lower rule_priority is the higher OVN priority. unique_id breaks ties."""
+    prio = _prio_num(_flex_field(rule, ("rule_priority", "priority")))
+    uid = _prio_num(_flex_field(rule, ("unique_id", "uniqueId")))
+    if prio < 0:
+        prio = 10 ** 9
+    if uid < 0:
+        uid = index
+    return (prio, uid, index)
+
+
+def flex_zone_id(policy_type, policy_priority):
+    """First zone of this flex policy. None when the section or priority is unknown."""
+    section = FLEX_SECTIONS.get(str(policy_type or ""))
+    prio = _prio_num(policy_priority)
+    if section is None or prio < 1 or prio > section[1]:
+        return None
+    span = (FLEX_RULES_PER_POLICY + FLEX_RULES_PER_ZONE - 1) // FLEX_RULES_PER_ZONE
+    return FLEX_ZONE_MIN + (section[0] + prio - 1) * span
+
+
+def flex_acl_priority(zone_id, rule_rank):
+    """OVN-NB priority for one flex rule. -1 when the zone is unknown."""
+    if zone_id is None or rule_rank is None or rule_rank < 0:
+        return -1
+    rules = FLEX_RULES_PER_ZONE
+    widths = (
+        (FLEX_TIER_MAX[0] + 1) // rules,
+        (FLEX_TIER_MAX[1] + 1) // rules,
+        (FLEX_TIER_MAX[2] + 1) // rules,
+        (FLEX_TIER_MAX[3] - FLEX_TIER3_MIN + 1) // rules,
+    )
+    start = 0
+    tier = 3
+    for index, width in enumerate(widths):
+        if zone_id < start + width:
+            tier = index
+            break
+        start += width
+    priority = FLEX_TIER_MAX[tier] - ((zone_id - start) * rules + rule_rank)
+    if tier == 0 and priority < 0:
+        return FLEX_TIER_MAX[1] - (-priority) + 1
+    if tier == 1 and priority < 0:
+        return FLEX_TIER_MAX[2] - (-priority) + 1
+    if tier == 2 and priority < 0:
+        return FLEX_TIER_MAX[3] - (-priority) + 1
+    if tier == 3 and priority < FLEX_TIER3_MIN:
+        return FLEX_TIER3_MIN
+    return priority
+
+
 def _address_peers(comps, direction):
     incoming, outgoing = [], []
     for comp in comps:
@@ -1506,8 +1769,17 @@ def _owner_categories(comps, owners):
     return cats
 
 
+def _flex_directions(direction):
+    text = str(direction or "")
+    if text in IN_DIRECTIONS:
+        return ("incoming",)
+    if text in OUT_DIRECTIONS:
+        return ("outgoing",)
+    return ("incoming", "outgoing")
+
+
 def policy_edges(policies, vlan_uuid, global_uuid, include_project=False, sg_map=None,
-                 quar=None):
+                 quar=None, eg_map=None):
     """One edge per policy port set and each incoming or outgoing peer.
 
     The policy field is the policy UUID. An address-group peer is the
@@ -1518,7 +1790,7 @@ def policy_edges(policies, vlan_uuid, global_uuid, include_project=False, sg_map
     quar = quar or {}
     for policy in policies or []:
         annotated, _extra = annotate_policy(
-            policy, vlan_uuid, global_uuid, include_project)
+            policy, vlan_uuid, global_uuid, include_project, eg_map)
         if annotated.get("skipped_save"):
             continue
         policy_uuid = str(annotated.get("uuid") or "").lower()
@@ -1526,18 +1798,29 @@ def policy_edges(policies, vlan_uuid, global_uuid, include_project=False, sg_map
         mode = annotated.get("mode") or ""
         policy_type = annotated.get("policy_type") or ""
         raw_rules = list(iter_rules(policy))
+        ann_rules = list(annotated.get("rules") or [])
         project = first(policy, "project_uuid") or ZERO
-        project_arg = project if include_project else None
         vpc_uuids = policy_vpc_uuids(policy)
-        for (rkey, raw), arule in zip(raw_rules, annotated.get("rules") or []):
+        scope_refs = policy_scope_refs(policy)
+        flex_rank = {}
+        flex_zone = None
+        if any(rule.get("is_flex") for rule in ann_rules):
+            flex_idxs = [i for i, rule in enumerate(ann_rules) if rule.get("is_flex")]
+            flex_idxs.sort(key=lambda i: _flex_rank_key(raw_rules[i][1], i))
+            flex_rank = {idx: rank for rank, idx in enumerate(flex_idxs)}
+            flex_zone = flex_zone_id(policy_type, _flex_policy_priority(policy))
+        for idx, ((rkey, raw), arule) in enumerate(zip(raw_rules, ann_rules)):
             comps = list(arule.get("components") or [])
             if arule.get("is_flex"):
                 unique = scope_unique_uuid(
                     annotated.get("scope") or "kAllVlan", True,
-                    vlan_uuid, global_uuid, vpc_uuids)
+                    vlan_uuid, global_uuid, vpc_uuids, scope_refs)
                 for role, entity_type, refs in flex_extra_selectors(raw):
+                    if entity_type == "EG" and (
+                            _address_egs(refs, eg_map) or _kube_egs(refs, eg_map)):
+                        continue
                     hashed, _body = generate_port_set_id(
-                        entity_type, refs, unique, project_arg, is_flex=True)
+                        entity_type, refs, unique, project, is_flex=True)
                     comps.append({
                         "role": role, "kind": "port_set", "port_set": hashed,
                         "refs": refs})
@@ -1553,8 +1836,10 @@ def policy_edges(policies, vlan_uuid, global_uuid, include_project=False, sg_map
                 first(raw, "action"),
                 _owner_categories(comps, owners_for_role), quar)
             if arule.get("is_flex"):
-                expected = priority if _prio_num(priority) >= 0 else ""
-                role = role or "flex"
+                # The flex rule is the ACL. Do not add a traditional default-deny.
+                ovn = flex_acl_priority(flex_zone, flex_rank.get(idx))
+                expected = "" if ovn < 0 else str(ovn)
+                role = "flex"
             else:
                 expected = ovn_priority(role, mode)
                 expected = "" if expected < 0 else str(expected)
@@ -1596,16 +1881,24 @@ def policy_edges(policies, vlan_uuid, global_uuid, include_project=False, sg_map
             for owner in owners:
                 if not owner:
                     continue
+                emitted = False
                 for peer in incoming:
                     if peer != owner:
                         emit(owner, "incoming", peer, "port_set", "", role)
+                        emitted = True
                 for peer in outgoing:
                     if peer != owner:
                         emit(owner, "outgoing", peer, "port_set", "", role)
+                        emitted = True
                 for peer in addr_in:
                     emit(owner, "incoming", peer, "address_set", peer, role)
+                    emitted = True
                 for peer in addr_out:
                     emit(owner, "outgoing", peer, "address_set", peer, role)
+                    emitted = True
+                if arule.get("is_flex") and not emitted:
+                    for way in _flex_directions(direction):
+                        emit(owner, way, "", "port_set", "", role)
                 if role.endswith("_intra_deny") or role.endswith("_intra_allow"):
                     emit(owner, "incoming", "", "intra", "", role)
                     emit(owner, "outgoing", "", "intra", "", role)
@@ -2345,7 +2638,8 @@ def _side_check(edge, groups, by_owner):
             found = cover_priority(acls, edge.get("ports") or [])
             if found is None:
                 ovn = "service_missing"
-            elif _prio_num(found) < 0:
+            elif _prio_num(found) < 0 or (
+                    edge.get("role") == "flex" and expected in (None, "")):
                 ovn = "priority_missing"
             elif expected not in (None, "") and str(found) != str(expected):
                 ovn = "priority_mismatch"
@@ -2904,6 +3198,23 @@ def self_test():
         raise SystemExit("service group name: %s" % built)
     if any(row["policy"] == "Iso" for row in built):
         raise SystemExit("policy edge used a name: %s" % built)
+    if flex_acl_priority(flex_zone_id("kCritical", 1), 0) != 30999:
+        raise SystemExit("flex critical first rule")
+    if flex_acl_priority(flex_zone_id("kCritical", 1), 3) != 30996:
+        raise SystemExit("flex critical fourth rule")
+    if flex_acl_priority(flex_zone_id("kWorkload", 350), 0) != 2249:
+        raise SystemExit("flex workload rule")
+    if flex_zone_id("kCritical", 1) != 0 or flex_zone_id("kWorkload", 350) != 4990:
+        raise SystemExit("flex zone")
+    flex_rules = [
+        {"rule_priority": 1, "unique_id": 1},
+        {"rule_priority": 250, "unique_id": 2},
+        {"rule_priority": 2, "unique_id": 144},
+        {"rule_priority": 3, "unique_id": 145},
+    ]
+    order = sorted(range(4), key=lambda i: _flex_rank_key(flex_rules[i], i))
+    if order != [0, 2, 3, 1]:
+        raise SystemExit("flex rule order: %s" % order)
     if ovn_priority("app_allow", "kApply") != 1050:
         raise SystemExit("app allow priority")
     if ovn_priority("app_default_deny", "kApply") != 1045:
@@ -3193,6 +3504,16 @@ def self_test():
         raise SystemExit("cfg resample: %s" % picked)
     if write_cfg(picked, sink):
         raise SystemExit("cfg resample failed")
+    if scope_unique_uuid(
+            "kVpcAsCategory", False, "v", "g", ["vpc"],
+            ["95c73585-bfc1-5a89-9d0d-8ede2ddf420c"]) != (
+            "95c73585-bfc1-5a89-9d0d-8ede2ddf420c"):
+        raise SystemExit("vpc category scope id")
+    if scope_unique_uuid(
+            "kVpcList", False, "v", "g",
+            ["a3295f80-035b-4d55-b2f6-fd2b4eaaf7e8"]) != (
+            "a3295f80-035b-4d55-b2f6-fd2b4eaaf7e8"):
+        raise SystemExit("vpc list scope id")
     print("self-test ok edges=%s" % len(built))
 
 
@@ -3834,11 +4155,13 @@ def main(argv=None):
     policies = fetch_policies(info, workers=args.workers, timeout=args.timeout)
     if not policies:
         raise SystemExit("no policies from flow_cli")
+    eg_map = fetch_entity_groups(
+        info, policies, workers=args.workers, timeout=min(int(args.timeout), 300))
     sg_map = fetch_service_groups(info, min(int(args.timeout), 300))
     quar = fetch_quarantine_categories(info, min(int(args.timeout), 120))
     edges = policy_edges(
         policies, vlan_uuid, global_uuid, include_project=args.include_project,
-        sg_map=sg_map, quar=quar)
+        sg_map=sg_map, quar=quar, eg_map=eg_map)
     atlas_map = fetch_idf_port_sets(info, min(int(args.timeout), 300))
     address_map = fetch_port_set_address_sets(
         info, list(atlas_map), min(int(args.timeout), 300))

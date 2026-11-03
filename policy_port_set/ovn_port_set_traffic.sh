@@ -113,6 +113,89 @@ pg_to_uuid() {
     printf '%s\n' "${name//_/-}"
 }
 
+# NIC to Atlas port-set UUIDs, filled on the PC before the OVN pod runs.
+# Flex SMSP port groups can exist with an empty ports list, so the logical
+# switch port name port_<nic> is not there to join on.
+NIC_PORTSETS="${NIC_PORTSETS:-}"
+
+resolve_nic_port_sets() {
+    local bin="" cand
+    for cand in \
+        /home/docker/msp_controller/bootstrap/msp_tools/cmsp-scripts/idfcli \
+        /home/nutanix/bin/idfcli \
+        /usr/local/nutanix/bin/idfcli
+    do
+        if [ -x "$cand" ]; then
+            bin="$cand"
+            break
+        fi
+    done
+    if [ -z "$bin" ]; then
+        bin=$(command -v idfcli 2>/dev/null || true)
+    fi
+    [ -n "$bin" ] || return 0
+    NIC_PORTSETS=$(python3 - "$bin" "$@" <<'PY'
+import json, subprocess, sys
+binary, nics = sys.argv[1], set(sys.argv[2:])
+try:
+    raw = subprocess.check_output(
+        [binary, "get", "entity", "-e", "atlas_port_set", "--all", "-o", "json"],
+        stderr=subprocess.DEVNULL)
+except Exception:
+    sys.exit(0)
+try:
+    payload = json.loads(raw.decode("utf-8", "replace"))
+except Exception:
+    sys.exit(0)
+ents = payload.get("entity") or payload.get("entities") or []
+if isinstance(ents, dict):
+    ents = [ents]
+rows = []
+for nic in nics:
+    sets = []
+    for ent in ents:
+        if not isinstance(ent, dict):
+            continue
+        guid = (ent.get("entity_guid") or {}).get("entity_id") or ""
+        nlist = []
+        adm = ent.get("attribute_data_map") or []
+        if isinstance(adm, dict):
+            adm = [{"name": k, "value": v} for k, v in adm.items()]
+        for item in adm:
+            if not isinstance(item, dict):
+                continue
+            if item.get("name") not in (
+                    "virtual_nic_uuid_list", "vnic_uuid_list", "virtual_nic_uuids"):
+                continue
+            value = item.get("value") or {}
+            inner = value.get("str_list") if isinstance(value, dict) else None
+            if isinstance(inner, dict):
+                nlist = inner.get("value_list") or []
+            elif isinstance(value, dict) and "str_value" in value:
+                nlist = [value.get("str_value")]
+        if str(nic).lower() in [str(item).lower() for item in nlist]:
+            sets.append(str(guid).lower())
+    if sets:
+        rows.append(nic + "=" + ",".join(sets))
+sys.stdout.write(";".join(rows))
+PY
+)
+    [ -n "$NIC_PORTSETS" ] && log "IDF port sets: $NIC_PORTSETS"
+}
+
+port_sets_for_nic() {
+    local nic="$1" row item
+    IFS=';' read -ra row <<< "$NIC_PORTSETS"
+    for item in "${row[@]}"; do
+        case "$item" in
+            "$nic"=*)
+                printf '%s\n' "${item#*=}" | tr ',' '\n'
+                return 0
+                ;;
+        esac
+    done
+}
+
 declare -A AS_CACHE=()
 declare -A LSP_IPS=()
 
@@ -884,11 +967,34 @@ run_inside() {
         if [ "$found" -eq 0 ]; then
             log "LSP not found for $nic (expected port_${nic})"
             echo "  LSP: not found"
+            while IFS= read -r ps; do
+                ps=$(trim "$ps")
+                [ -n "$ps" ] || continue
+                pg="port_group_${ps//-/_}"
+                hit=$(ovn --data=bare --no-heading --columns=name find Port_Group "name=${pg}" 2>/dev/null | head -n 1 || true)
+                hit=$(trim "$hit")
+                [ -n "$hit" ] || continue
+                found=1
+                echo "  PORT SET: $ps    $hit"
+                log "  PORT SET: $ps $hit (atlas_port_set)"
+                printf '%s %s\n' "$nic" "$ps" >> "$WORK/nicmap"
+                case "$seen" in
+                    *" $hit "*) ;;
+                    *)
+                        seen="${seen}${hit} "
+                        groups+=("$hit")
+                        ;;
+                esac
+            done < <(port_sets_for_nic "$nic")
         fi
     done
     echo ""
     if [ "${#groups[@]}" -eq 0 ]; then
-        die "no port set contains the given NIC $(tr '\n' ' ' < "$WORK/pg.err" 2>/dev/null | cut -c1-220)"
+        detail=""
+        if [ -f "$WORK/pg.err" ]; then
+            detail=$(tr '\n' ' ' < "$WORK/pg.err" | cut -c1-220)
+        fi
+        die "no port set contains the given NIC ${detail}"
     fi
 
     log "Loading ACLs for ${#groups[@]} port set(s)"
@@ -929,6 +1035,7 @@ detect_platform() {
     PLATFORM="cmsp"
     SMSP_UUID=""
     local out
+    export PATH="$PATH:/usr/local/nutanix/cluster/bin:/home/nutanix/cluster/bin"
     if ! command -v mspctl >/dev/null 2>&1; then
         log "PLATFORM: cmsp (mspctl not installed)"
         return
@@ -1181,7 +1288,7 @@ run_remote() {
     if [ -n "$DST_NIC" ]; then
         verdict_args+=(--dst "$DST_NIC" --port "$DST_PORT" --proto "$PROTO")
     fi
-    "${exec_cmd[@]}" -- env INSIDE_OVN=1 COLUMNS=1000000 bash -s -- "$@" "${verdict_args[@]}" < "$0"
+    "${exec_cmd[@]}" -- env INSIDE_OVN=1 NIC_PORTSETS="$NIC_PORTSETS" COLUMNS=1000000 bash -s -- "$@" "${verdict_args[@]}" < "$0"
 }
 
 is_uuid() {
@@ -1257,6 +1364,7 @@ main() {
     [ "${#nics[@]}" -ge 1 ] || usage
 
     require_pc_leader "${orig[@]}"
+    resolve_nic_port_sets "${nics[@]}"
 
     if [ -S "${NB_DB#unix:}" ] && command -v ovn-nbctl >/dev/null 2>&1; then
         log "PLATFORM: local-ovn"
