@@ -57,7 +57,7 @@ import uuid as uuid_lib
 
 ZERO = "00000000-0000-0000-0000-000000000000"
 DEFAULT_PROJECT = ZERO
-SALUS_SERVICE_NAME = "salus"
+SALUS_SERVICE_NAME = "Salus"
 GLOBAL_SCOPE_UNIQUE_ID = "global-scope-unique-id"
 VLAN_SCOPE_UNIQUE_ID = "vlan-scope-unique-id"
 _U_QUOTE = re.compile(r"'[a-z0-9A-Z\-]+'")
@@ -159,26 +159,42 @@ def generate_port_set_id(entity_type, refs, unique_uuid, project_uuid=None,
     return str(uuid_lib.uuid5(uuid_lib.UUID(str(unique_uuid)), body)), body
 
 
-def scope_unique_uuid(scope, is_flex, vlan_uuid, global_uuid, vpc_uuids):
+def scope_unique_uuid(scope, is_flex, vlan_uuid, global_uuid, vpc_uuids,
+                      scope_refs=None):
     if scope in GLOBAL_SCOPES:
         return GLOBAL_SCOPE_UNIQUE_ID if is_flex else global_uuid
     if scope in VLAN_SCOPES:
         return VLAN_SCOPE_UNIQUE_ID if is_flex else vlan_uuid
-    if scope in VPC_CAT_SCOPES or scope in VPC_LIST_SCOPES:
+    if scope in VPC_CAT_SCOPES:
+        refs = scope_refs or []
+        return refs[0] if refs else ""
+    if scope in VPC_LIST_SCOPES:
         return vpc_uuids[0] if vpc_uuids else ""
     return vlan_uuid if not is_flex else VLAN_SCOPE_UNIQUE_ID
 
 
-def policy_vpc_uuids(policy):
+def _uuid_fields(policy, keys):
     out = []
-    for key in ("vpc_uuid_list", "vpc_uuids", "target_vpc_uuid",
-                "vpc_reference", "scope_vpc_uuid", "vpc_references",
-                "scope_references"):
+    for key in keys:
         for item in values(policy, key):
             text = str(item or "").strip()
             if text and text not in out:
                 out.append(text)
     return out
+
+
+def policy_vpc_uuids(policy):
+    return _uuid_fields(policy, (
+        "vpc_uuid", "vpc_uuid_list", "vpc_uuids", "target_vpc_uuid",
+        "vpc_reference", "scope_vpc_uuid", "vpc_references",
+        "scope_references"))
+
+
+def policy_scope_refs(policy):
+    """VPC-as-category scope id. flow_cli stores it in reference_uuid_list."""
+    return _uuid_fields(policy, (
+        "reference_uuid_list", "scope_reference_uuid_list",
+        "scope_references", "policy_category"))
 
 
 def as_uuid_list(items):
@@ -240,6 +256,11 @@ def component_refs(comp):
         return "VPC", vpcs, ""
     if values(comp, "address_group_uuid") or values(comp, "ip_subnet"):
         return None, [], ""
+    if isinstance(comp, dict):
+        for key in ("endpoint_entity", "secured_entity"):
+            child = comp.get(key)
+            if isinstance(child, dict):
+                return component_refs(child)
     return None, [], "no entity refs"
 def idf_json_value(value):
     if value is None:
@@ -372,6 +393,11 @@ def walk_components(node, sink, role=None):
         elif isinstance(val, list):
             for item in val:
                 if isinstance(item, dict):
+                    if child_key == "isolation_group_list":
+                        group = dict(item)
+                        group["_key"] = "secured_group"
+                        sink.append(group)
+                        continue
                     walk_components(item, sink, child_key)
 
 
@@ -382,7 +408,27 @@ def rule_is_flex(rule, policy_type):
 
 
 
-def annotate_component(comp, unique_uuid, project_uuid, is_flex, include_project):
+ENDPOINT_ROLES = frozenset(("endpoint", "src_endpoint", "dest_endpoint"))
+
+
+def _eg_flag(refs, eg_map, flag):
+    if not eg_map or not refs:
+        return False
+    return all((eg_map.get(uid) or {}).get(flag) for uid in refs)
+
+
+def _address_egs(refs, eg_map):
+    """True when every ref is an address-group entity group."""
+    return _eg_flag(refs, eg_map, "address")
+
+
+def _kube_egs(refs, eg_map):
+    """True when every ref is a Kubernetes entity group. Those are not port sets."""
+    return _eg_flag(refs, eg_map, "kube")
+
+
+def annotate_component(comp, unique_uuid, project_uuid, is_flex, include_project,
+                       eg_map=None):
     """Port-set hash only. Address groups are not port sets."""
     entity_type, refs, skip = component_refs(comp)
     role = comp.get("_key") or ""
@@ -397,9 +443,14 @@ def annotate_component(comp, unique_uuid, project_uuid, is_flex, include_project
     if as_uuid_list(values(comp, "address_group_uuid")) or values(comp, "ip_subnet"):
         row["kind"] = "address_set"
         return row
+    if role in ENDPOINT_ROLES and _address_egs(refs, eg_map):
+        row["kind"] = "address_set"
+        return row
+    if _kube_egs(refs, eg_map):
+        return row
     if skip or not refs or not unique_uuid:
         return row
-    project = project_uuid if include_project else None
+    project = project_uuid
     hashed, _body = generate_port_set_id(
         entity_type, refs, unique_uuid, project, is_flex=is_flex)
     row["kind"] = "port_set"
@@ -421,7 +472,7 @@ def iter_rules(policy):
                     yield rkey, rule
 
 
-def annotate_policy(policy, vlan_uuid, global_uuid, include_project):
+def annotate_policy(policy, vlan_uuid, global_uuid, include_project, eg_map=None):
     name = first(policy, "name")
     policy_uuid = first(policy, "uuid")
     scope = first(policy, "scope") or "kAllVlan"
@@ -429,13 +480,14 @@ def annotate_policy(policy, vlan_uuid, global_uuid, include_project):
     policy_type = first(policy, "policy_type")
     project = first(policy, "project_uuid") or ZERO
     vpc_uuids = policy_vpc_uuids(policy)
+    scope_refs = policy_scope_refs(policy)
     rules_out = []
     save_mode = str(mode) in ("kSave", "SAVE")
     if not save_mode:
         for rkey, rule in iter_rules(policy):
             is_flex = rule_is_flex(rule, policy_type) or rkey == "flex_policy_rule"
             unique = scope_unique_uuid(
-                scope, is_flex, vlan_uuid, global_uuid, vpc_uuids)
+                scope, is_flex, vlan_uuid, global_uuid, vpc_uuids, scope_refs)
             info = first(rule, "rule_info") or {}
             if not isinstance(info, dict):
                 info = {}
@@ -450,7 +502,7 @@ def annotate_policy(policy, vlan_uuid, global_uuid, include_project):
                     continue
                 seen.add(marker)
                 component_rows.append(annotate_component(
-                    comp, unique, project, is_flex, include_project))
+                    comp, unique, project, is_flex, include_project, eg_map))
             rules_out.append({
                 "rule_kind": rkey or rule.get("_key"),
                 "rule_uuid": rule_uuid,
@@ -592,16 +644,25 @@ def _kubectl_bin():
         "/home/nutanix/bin/kubectl", "kubectl")
 
 
+_KUBECTL_PREFIX = {}
+
+
 def _kubectl_prefix(kubeconfig=""):
+    key = kubeconfig or ""
+    cached = _KUBECTL_PREFIX.get(key)
+    if cached:
+        return list(cached)
     kubectl = _kubectl_bin()
-    for prefix in (["sudo", "-n", kubectl], ["sudo", kubectl], [kubectl]):
-        rc, _out, _err = _run(prefix + ["get", "ns"], 20)
+    # Plain kubectl works on CMSP. sudo without -n waits on a password.
+    prefix = [kubectl]
+    for candidate in ([kubectl], ["sudo", "-n", kubectl]):
+        rc, _out, _err = _run(candidate + ["get", "ns"], 20)
         if rc == 0:
+            prefix = candidate
             break
-    else:
-        prefix = ["sudo", "-n", kubectl]
     if kubeconfig:
         prefix = list(prefix) + ["--kubeconfig", kubeconfig]
+    _KUBECTL_PREFIX[key] = list(prefix)
     return list(prefix)
 
 
@@ -985,6 +1046,111 @@ def fetch_policies(info, workers=8, timeout=1800):
             fn()
 
 
+def _eg_spec(payload):
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    group = data.get("network_entity_group") if isinstance(data, dict) else None
+    if isinstance(group, dict):
+        spec = group.get("spec")
+        return spec if isinstance(spec, dict) else group
+    return data if isinstance(data, dict) else None
+
+
+def _eg_select(spec, prefix):
+    if not isinstance(spec, dict):
+        return False
+    for ent in spec.get("allowed_entities") or []:
+        if not isinstance(ent, dict):
+            continue
+        if str(ent.get("select_type_enum") or "").startswith(prefix):
+            return True
+    return False
+
+
+def _eg_is_address(spec):
+    return _eg_select(spec, "kAddressGroup")
+
+
+def _eg_is_kube(spec):
+    return _eg_select(spec, "kKube")
+
+
+def collect_entity_group_uuids(policies):
+    found = []
+    seen = set()
+    keys = (
+        "entity_group_uuid_list", "entity_group_uuid",
+        "applied_to_entity_group_uuid_list", "applied_to_entity_group_uuid",
+    )
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key in keys:
+                if key not in node:
+                    continue
+                for uid in as_uuid_list(values(node, key)):
+                    if uid not in seen:
+                        seen.add(uid)
+                        found.append(uid)
+            for val in node.values():
+                walk(val)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(policies)
+    return found
+
+
+def fetch_entity_groups(info, policies, workers=8, timeout=300):
+    """uuid -> {address: True} for address-group entity groups."""
+    uuids = collect_entity_group_uuids(policies)
+    if not uuids:
+        return {}
+    runner, cleanup = _policy_runner(info)
+    out = {}
+    try:
+        per = max(15, min(45, int(timeout)))
+
+        def _one(uid):
+            one, _text = runner(["entity_group.get", uid], per, log_cmd=False)
+            if isinstance(one, dict) and one.get("status") not in (None, 0, "0"):
+                raise RuntimeError("status=%s" % one.get("status"))
+            spec = _eg_spec(one)
+            return uid, _eg_is_address(spec), _eg_is_kube(spec)
+
+        from concurrent.futures import ThreadPoolExecutor, wait
+        get_workers = max(1, min(int(workers), len(uuids)))
+        with ThreadPoolExecutor(max_workers=get_workers) as pool:
+            fmap = {pool.submit(_one, uid): uid for uid in uuids}
+            done, pending = wait(fmap.keys(), timeout=timeout)
+            for fut in done:
+                uid = fmap[fut]
+                try:
+                    got, address, kube = fut.result(timeout=1)
+                except Exception as err:
+                    LOG.warning("entity_group.get %s: %s", uid, err)
+                    continue
+                if address or kube:
+                    out[got] = {"address": bool(address), "kube": bool(kube)}
+            for fut in pending:
+                LOG.warning("entity_group.get %s timed out", fmap[fut])
+                fut.cancel()
+        LOG.info(
+            "address entity groups=%s kube=%s of %s",
+            sum(1 for rec in out.values() if rec.get("address")),
+            sum(1 for rec in out.values() if rec.get("kube")),
+            len(uuids))
+        return out
+    except Exception as err:
+        LOG.warning("entity_group fetch skipped: %s", err)
+        return out
+    finally:
+        for fn in cleanup:
+            fn()
+
+
 def scope_uuids_for_platform(platform, pc_global, pc_vlan, atlas_global, atlas_vlan):
     """SMSP port-set scope ids come from Atlas ZK, not the PC zkcat copy."""
     if platform == "smsp":
@@ -1052,9 +1218,10 @@ def _field_present(node, key):
 def flex_extra_selectors(rule):
     """FLEX fields that are not src/dest/secured components.
 
-    applied_to is its own port set. should_allow_any_* and a rule with no
-    selector hash as the empty FLEX VM list (Salus "[]"). A missing
-    applied_to field is UI Global and is not hashed.
+    applied_to is one port set of every entity group on the rule.
+    should_allow_any_* hashes as the empty FLEX VM list (Salus "[]").
+    A missing applied_to field is that same empty list: the global
+    port set.
     """
     applied = []
     has_applied_key = False
@@ -1065,7 +1232,9 @@ def flex_extra_selectors(rule):
             has_applied_key = True
             applied.extend(as_uuid_list(values(rule, key)))
     if applied:
-        yield ("applied_to", "EG", [applied[0]])
+        yield ("applied_to", "EG", applied)
+    elif not has_applied_key:
+        yield ("applied_to", "VM", [])
     for flag, endpoint_key, role in (
             ("should_allow_any_src", "src_endpoint", "src_allow_any"),
             ("should_allow_any_dst", "dest_endpoint", "dest_allow_any")):
@@ -1096,22 +1265,30 @@ def _remember(computed, idf_map, uid, **fields):
     slot["components"] += 1
 
 
-def _skip_idf_only(rec):
+def _skip_idf_only(rec, policy_names=None):
     name = str((rec or {}).get("name") or "")
+    nics = (rec or {}).get("nics") or []
     if name.startswith("K8s_"):
         return True
-    if name.startswith("Quarantine") and not (rec or {}).get("nics"):
+    if name.startswith("Quarantine") and not nics:
+        return True
+    # Atlas keeps a nic-less port set after the policy is deleted.
+    if policy_names is not None and name and name not in policy_names and not nics:
         return True
     return False
 
 
-def mismatch_rows(policies, vlan_uuid, global_uuid, idf_map, include_project=False):
+def mismatch_rows(policies, vlan_uuid, global_uuid, idf_map, include_project=False,
+                  eg_map=None):
     """One row per port_set UUID that is missing on either side."""
     idf_map = idf_map or {}
+    eg_map = eg_map or {}
     computed = {}
+    policy_names = set()
     for policy in policies or []:
+        policy_names.add(str(first(policy, "name") or ""))
         annotated, _extra = annotate_policy(
-            policy, vlan_uuid, global_uuid, include_project)
+            policy, vlan_uuid, global_uuid, include_project, eg_map)
         if annotated.get("skipped_save"):
             continue
         for rule in annotated.get("rules") or []:
@@ -1130,8 +1307,8 @@ def mismatch_rows(policies, vlan_uuid, global_uuid, idf_map, include_project=Fal
                     scope=annotated.get("scope") or "",
                     refs=",".join(str(item) for item in refs))
         project = first(policy, "project_uuid") or ZERO
-        project_arg = project if include_project else None
         vpc_uuids = policy_vpc_uuids(policy)
+        scope_refs = policy_scope_refs(policy)
         for rkey, rule in iter_rules(policy):
             is_flex = (
                 rule_is_flex(rule, annotated.get("policy_type"))
@@ -1145,10 +1322,13 @@ def mismatch_rows(policies, vlan_uuid, global_uuid, idf_map, include_project=Fal
                 first(info, "uuid") or first(rule, "uuid") or "")
             unique = scope_unique_uuid(
                 annotated.get("scope") or "kAllVlan", True,
-                vlan_uuid, global_uuid, vpc_uuids)
+                vlan_uuid, global_uuid, vpc_uuids, scope_refs)
             for role, entity_type, refs in flex_extra_selectors(rule):
+                if entity_type == "EG" and (
+                        _address_egs(refs, eg_map) or _kube_egs(refs, eg_map)):
+                    continue
                 hashed, _body = generate_port_set_id(
-                    entity_type, refs, unique, project_arg, is_flex=True)
+                    entity_type, refs, unique, project, is_flex=True)
                 _remember(
                     computed, idf_map, hashed,
                     policy=annotated.get("name") or "",
@@ -1174,7 +1354,7 @@ def mismatch_rows(policies, vlan_uuid, global_uuid, idf_map, include_project=Fal
         if uid in computed:
             continue
         rec = idf_map[uid]
-        if _skip_idf_only(rec):
+        if _skip_idf_only(rec, policy_names):
             continue
         nics = [str(nic) for nic in (rec.get("nics") or []) if nic]
         rows.append({
@@ -1225,6 +1405,15 @@ def write_rows(rows, handle):
 
 
 def self_test():
+    strict, _body = generate_port_set_id(
+        "EG", ["15ae6907-1069-49b7-bbf0-0ae0f8d3d956"],
+        GLOBAL_SCOPE_UNIQUE_ID, is_flex=True)
+    if strict != "aaa68b7f-8f06-ad22-ea45-6fb0667e9c17":
+        raise SystemExit("Salus strict hash %s" % strict)
+    empty, _body = generate_port_set_id(
+        "VM", [], GLOBAL_SCOPE_UNIQUE_ID, is_flex=True)
+    if empty != "1a6c2142-bf53-3439-69ba-8500d05b2ab6":
+        raise SystemExit("Salus global empty hash %s" % empty)
     global_uuid = "702970d3-d72d-41b9-9655-50c40ffd96f4"
     vlan_uuid = "29332a4d-9133-4c73-a219-ce82ea53d532"
     eg = "407982f9-5504-4504-a42d-78143d09f3fe"
@@ -1371,6 +1560,118 @@ def self_test():
         raise SystemExit("ipv6-only address set was reported missing")
     if not missing_address_sets(present, {other_hash: {"ipv4": ZERO, "ipv6": ""}}):
         raise SystemExit("zero address set was accepted")
+    iso_cat = "03cf8007-4f92-36fb-ad6b-9f255b74b5b2"
+    iso_hash, _body = generate_port_set_id("VM", [iso_cat], global_uuid)
+    vpc = "a3295f80-035b-4d55-b2f6-fd2b4eaaf7e8"
+    scope_cat = "95c73585-bfc1-5a89-9d0d-8ede2ddf420c"
+    se_eg = "3abb1c1c-c74a-45bb-9145-a41716278751"
+    cat_hash, _body = generate_port_set_id(None, [se_eg], scope_cat)
+    proj = "ff550402-f70a-44c3-bd2a-e29d3fe864a0"
+    qcat = "4c313d99-ad50-5480-ae34-6c29ee35ed92"
+    q_hash, _body = generate_port_set_id("VM", [qcat], global_uuid, proj)
+    kube_eg = "57a0e031-bb94-450a-9094-f8c1d21c2256"
+    extra_idf = dict(idf_map)
+    extra_idf[iso_hash] = {"uuid": iso_hash, "name": "iso", "nics": ["n"]}
+    extra_idf[cat_hash] = {"uuid": cat_hash, "name": "vpc-cat", "nics": ["n"]}
+    extra_idf[q_hash] = {"uuid": q_hash, "name": "q", "nics": ["n"]}
+    scope_policies = [
+        {
+            "uuid": "88888888-8888-4888-8888-888888888888",
+            "name": "Iso",
+            "mode": "kApply",
+            "policy_type": "kIsolation",
+            "scope": "kGlobal",
+            "project_uuid": ZERO,
+            "rules_list": [{
+                "multi_env_isolation_rule": {
+                    "rule_info": {"uuid": "99999999-9999-4999-8999-999999999999"},
+                    "all_to_all_isolation_group": {"isolation_group_list": [{
+                        "category_uuid_list": [iso_cat],
+                        "category_selection_type": "kVM",
+                    }]},
+                }
+            }],
+        },
+        {
+            "name": "VpcCat",
+            "uuid": "12121212-1212-4121-8121-121212121212",
+            "mode": "kApply",
+            "policy_type": "kApplication",
+            "scope": "kVpcAsCategory",
+            "project_uuid": ZERO,
+            "reference_uuid_list": [scope_cat],
+            "rules_list": [{
+                "application_rule": {
+                    "rule_info": {"uuid": "13131313-1313-4131-8131-131313131313"},
+                    "secured_group": {"entity_group_uuid_list": [se_eg]},
+                }
+            }],
+        },
+        {
+            "name": "Kube",
+            "uuid": "14141414-1414-4141-8141-141414141414",
+            "mode": "kApply",
+            "policy_type": "kApplication",
+            "scope": "kVpcList",
+            "project_uuid": ZERO,
+            "vpc_uuid": vpc,
+            "rules_list": [{
+                "application_rule": {
+                    "rule_info": {"uuid": "15151515-1515-4151-8151-151515151515"},
+                    "secured_group": {"entity_group_uuid_list": [kube_eg]},
+                }
+            }],
+        },
+        {
+            "name": "Quarantine Strict Policy",
+            "uuid": "16161616-1616-4161-8161-161616161616",
+            "mode": "kApply",
+            "policy_type": "kQuarantine",
+            "scope": "kGlobal",
+            "project_uuid": proj,
+            "rules_list": [{
+                "quarantine_rule": {
+                    "rule_info": {"uuid": "17171717-1717-4171-8171-171717171717"},
+                    "secured_group": {
+                        "category_uuid_list": [qcat],
+                        "category_selection_type": "kVM",
+                    },
+                }
+            }],
+        },
+    ]
+    extra_rows, extra_matched = mismatch_rows(
+        scope_policies, vlan_uuid, global_uuid, extra_idf,
+        eg_map={kube_eg: {"kube": True}})
+    missed = {row["port_set"] for row in extra_rows}
+    if iso_hash in missed or cat_hash in missed or q_hash in missed:
+        raise SystemExit("scope hash missed atlas: %s" % extra_rows)
+    if any(row.get("policy") == "Kube" for row in extra_rows):
+        raise SystemExit("kube entity group was hashed: %s" % extra_rows)
+    matched_ids = {rec["port_set"] for rec in extra_matched}
+    if not {iso_hash, cat_hash, q_hash} <= matched_ids:
+        raise SystemExit("scope hashes not matched: %s" % extra_matched)
+    nested = annotate_component({
+        "_key": "endpoint",
+        "endpoint_entity": {
+            "category_uuid_list": ["86b8e382-5b20-4b95-79a7-0cb3072712f2"],
+            "category_selection_type": "kVM",
+        },
+    }, "7cbdab1d-88d6-490f-b1c0-503d975b507b", ZERO, False, False)
+    if nested["port_set"] != "0bca504c-9c74-5d73-b0da-442e4f207e29":
+        raise SystemExit("nested endpoint %s" % nested)
+    gone = "abababab-abab-4aba-8aba-abababababab"
+    still = "acacacac-acac-4aca-8aca-acacacacacac"
+    orphan_idf = dict(idf_map)
+    orphan_idf[gone] = {"uuid": gone, "name": "DeletedPolicy", "nics": []}
+    orphan_idf[still] = {"uuid": still, "name": "T", "nics": []}
+    orphan_rows, _orphan_matched = mismatch_rows(
+        [policy], vlan_uuid, global_uuid, orphan_idf)
+    orphan_ids = {row["port_set"] for row in orphan_rows}
+    if gone in orphan_ids:
+        raise SystemExit("deleted empty port set was reported")
+    if still not in orphan_ids:
+        raise SystemExit("live empty port set was skipped")
     text = "".join(_render(rows))
     if "policy.json" in text or text.count("\n") != 1 + len(rows):
         raise SystemExit("unexpected output: %s" % text)
@@ -1393,7 +1694,7 @@ def parse_args():
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument(
         "--include-project", action="store_true",
-        help="Append :project:<uuid> when hashing (validator default is off)")
+        help="Accepted for older command lines. A non-default project is always part of the hash.")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
 
@@ -1512,9 +1813,12 @@ def main():
     if not policies:
         raise SystemExit("no policies from flow_cli")
     idf_map = fetch_idf_port_sets(info, timeout=min(int(args.timeout), 600))
+    eg_map = fetch_entity_groups(
+        info, policies, workers=args.workers,
+        timeout=min(int(args.timeout), 300))
     rows, matched = mismatch_rows(
         policies, vlan_uuid, global_uuid, idf_map,
-        include_project=args.include_project)
+        include_project=args.include_project, eg_map=eg_map)
     address_map = fetch_port_set_address_sets(
         info, [rec["port_set"] for rec in matched],
         min(int(args.timeout), 300))
