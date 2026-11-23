@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Policy port sets, their incoming and outgoing peers, then OVN-NB validation.
 
-Reads Flow policies and hashes every port set in this file.
+Reads policies from idfcli (network_security_policy), not flow_cli.
+Flow can be down. The rule body is the zlib protobuf in __zprotobuf__.
+Hashes every port set in this file.
 Records who may send in and who may be sent to.
 Standalone. Stdlib only. No other policy script is imported.
 Each row carries the OVN-NB ACL priority for that rule class.
@@ -48,8 +50,10 @@ or ALL when the rule has no service. priority is the priority on the OVN-NB
 ACL row. The ACL table is the check: every ACL is classified and verified.
 """
 
+import base64
 import csv
 import hashlib
+import zlib
 import io
 import json
 import logging
@@ -189,8 +193,9 @@ def scope_unique_uuid(scope, is_flex, vlan_uuid, global_uuid, vpc_uuids):
 
 def policy_vpc_uuids(policy):
     out = []
-    for key in ("vpc_uuid_list", "vpc_uuids", "target_vpc_uuid",
+    for key in ("vpc_uuid", "vpc_uuid_list", "vpc_uuids", "target_vpc_uuid",
                 "vpc_reference", "scope_vpc_uuid", "vpc_references",
+                "reference_uuid_list",
                 "scope_references"):
         for item in values(policy, key):
             text = str(item or "").strip()
@@ -323,13 +328,16 @@ def flatten_idf_entity(ent):
     if not items and not adm:
         row = dict(ent)
         row.pop("attribute_data_map", None)
-        row.pop("__zprotobuf__", None)
         return row
     for item in items:
         if not isinstance(item, dict):
             continue
         name = item.get("name") or ""
-        if not name or name == "__zprotobuf__":
+        if not name:
+            continue
+        if name == "__zprotobuf__":
+            raw = item.get("value") if isinstance(item.get("value"), dict) else {}
+            attrs[name] = _zprotobuf_bytes((raw or {}).get("bytes_value"))
             continue
         attrs[name] = idf_json_value(item.get("value"))
     return attrs or None
@@ -388,6 +396,11 @@ def walk_components(node, sink, role=None):
         elif isinstance(val, list):
             for item in val:
                 if isinstance(item, dict):
+                    if child_key == "isolation_group_list":
+                        group = dict(item)
+                        group["_key"] = "secured_group"
+                        sink.append(group)
+                        continue
                     walk_components(item, sink, child_key)
 
 def rule_is_flex(rule, policy_type):
@@ -864,23 +877,422 @@ def _fetch_idf_port_sets_smsp(info, timeout):
         except OSError:
             pass
 
-def _policy_runner(info):
-    """Return (runner, cleanup) for flow_cli policy.list/get. No JSON files."""
-    platform = (info or {}).get("platform") or "cmsp"
-    cleanup = []
-    if platform != "smsp":
-        binary = _flow_cli_bin()
+POLICY_IDF_ENTITIES = ("network_security_policy", "security_policy")
 
-        def runner(args, timeout, log_cmd=True, _binary=binary):
-            return _run_bash_cli(
-                _cli_join(_binary, args), timeout, log_cmd=log_cmd)
+# IDF ints. mode 1=MONITOR 2=ENFORCE. scope 1=ALL_VLAN 3=VPC 4=GLOBAL
+# 5=VPC_AS_CATEGORY. SAVE is 0 or 3. FLEX is a rule, not a policy type.
+POLICY_TYPE_NAME = {1: "kApplication", 2: "kIsolation", 3: "kQuarantine"}
+POLICY_MODE_NAME = {0: "kSave", 1: "kMonitor", 2: "kApply", 3: "kSave"}
+POLICY_SCOPE_NAME = {
+    1: "kAllVlan", 2: "kVpcList", 3: "kVpcList",
+    4: "kGlobal", 5: "kVpcAsCategory",
+}
+CAT_SEL_NAME = {1: "kVM", 2: "kVPC", 3: "kSubnet"}
+ALLOW_NAME = {1: "kTypeAll", 2: "kTypeNone"}
+_RULE_FIELDS = (
+    (1, "application_rule", "app"),
+    (2, "isolation_rule", "two"),
+    (3, "quarantine_rule", "app"),
+    (4, "secured_group_rule", "sg"),
+    (5, "multi_env_isolation_rule", "multi"),
+    (6, "shared_service_rule", "app"),
+    (7, "flex_policy_rule", "flex"),
+)
 
-        return runner, cleanup
 
+def _zprotobuf_bytes(value):
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if not isinstance(value, str) or not value:
+        return b""
+    try:
+        return base64.b64decode(value)
+    except Exception:
+        return b""
+
+
+def _zlib_decompress(data):
+    if not data:
+        return b""
+    for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS, zlib.MAX_WBITS | 16):
+        try:
+            return zlib.decompress(data, wbits)
+        except Exception:
+            continue
+    return data
+
+
+def _proto_read_varint(buf, idx):
+    value = 0
+    shift = 0
+    n = len(buf or b"")
+    while idx < n:
+        byte = buf[idx]
+        idx += 1
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value, idx
+        shift += 7
+        if shift > 63:
+            break
+    return None, idx
+
+
+def _proto_decode(buf):
+    """field number -> [(wire, value)]. Stdlib protobuf wire decoder."""
+    fields = {}
+    idx = 0
+    n = len(buf or b"")
+    while idx < n:
+        key, idx = _proto_read_varint(buf, idx)
+        if key is None:
+            break
+        field_n = key >> 3
+        wire = key & 7
+        if field_n <= 0:
+            break
+        if wire == 0:
+            val, idx = _proto_read_varint(buf, idx)
+            if val is None:
+                break
+        elif wire == 1:
+            if idx + 8 > n:
+                break
+            val = buf[idx:idx + 8]
+            idx += 8
+        elif wire == 2:
+            length, idx = _proto_read_varint(buf, idx)
+            if length is None or length < 0 or idx + length > n:
+                break
+            val = buf[idx:idx + length]
+            idx += length
+        elif wire == 5:
+            if idx + 4 > n:
+                break
+            val = buf[idx:idx + 4]
+            idx += 4
+        else:
+            break
+        fields.setdefault(field_n, []).append((wire, val))
+    return fields
+
+
+def _proto_varint(fields, number, default=0):
+    for wire, val in fields.get(number) or []:
+        if wire == 0 and val is not None:
+            return int(val)
+    return default
+
+
+def _proto_chunks(fields, number):
+    out = []
+    for wire, val in fields.get(number) or []:
+        if wire == 2 and isinstance(val, (bytes, bytearray)):
+            out.append(bytes(val))
+    return out
+
+
+def _proto_text(raw):
+    if not raw:
+        return ""
+    if len(raw) == 16:
+        try:
+            return str(uuid_lib.UUID(bytes=raw))
+        except Exception:
+            pass
+    try:
+        text = raw.decode("utf-8").strip()
+    except Exception:
+        return ""
+    if text and all(32 <= ord(ch) < 127 for ch in text):
+        return text
+    return ""
+
+
+def _proto_str(fields, number):
+    chunks = _proto_chunks(fields, number)
+    return _proto_text(chunks[0]) if chunks else ""
+
+
+def _proto_str_list(fields, number):
+    out = []
+    for raw in _proto_chunks(fields, number):
+        text = _proto_text(raw)
+        if text:
+            out.append(text)
+    return out
+
+
+def _secured_group_dict(raw):
+    if not raw:
+        return {}
+    fields = _proto_decode(raw)
+    out = {}
+    cats = _proto_str_list(fields, 1)
+    egs = _proto_str_list(fields, 4)
+    if cats:
+        out["category_uuid_list"] = cats
+        sel = _proto_varint(fields, 5, 1)
+        out["category_selection_type"] = CAT_SEL_NAME.get(sel, "kVM")
+    if egs:
+        out["entity_group_uuid_list"] = egs
+    return out
+
+
+def _endpoint_dict(raw):
+    if not raw:
+        return {}
+    fields = _proto_decode(raw)
+    out = {}
+    ents = _proto_chunks(fields, 1)
+    if ents:
+        ent = _proto_decode(ents[0])
+        cats = _proto_str_list(ent, 1)
+        if cats:
+            sel = _proto_varint(ent, 2, 1)
+            out["endpoint_entity"] = {
+                "category_uuid_list": cats,
+                "category_selection_type": CAT_SEL_NAME.get(sel, "kVM"),
+            }
+    subnet = _proto_str(fields, 2) or _proto_str(fields, 6)
+    if subnet:
+        out["ip_subnet"] = subnet
+    ag = _proto_str(fields, 3)
+    if ag:
+        out["address_group_uuid"] = ag
+    allow = _proto_varint(fields, 4, 0)
+    if allow:
+        out["allow_type"] = ALLOW_NAME.get(allow, str(allow))
+    egs = _proto_str_list(fields, 5)
+    if egs:
+        out["entity_group_uuid_list"] = egs
+    return out
+
+
+def _rule_info_dict(raw):
+    uid = _proto_str(_proto_decode(raw or b""), 1)
+    return {"uuid": uid} if uid else {}
+
+
+def _take_msg(fields, number):
+    chunks = _proto_chunks(fields, number)
+    return chunks[0] if chunks else b""
+
+
+def _app_rule_dict(raw):
+    fields = _proto_decode(raw or b"")
+    body = {"rule_info": _rule_info_dict(_take_msg(fields, 1))}
+    secured = _secured_group_dict(_take_msg(fields, 2))
+    if secured:
+        body["secured_group"] = secured
+    endpoint = _endpoint_dict(_take_msg(fields, 3))
+    if endpoint:
+        body["endpoint"] = endpoint
+    return body
+
+
+def _two_env_dict(raw):
+    fields = _proto_decode(raw or b"")
+    body = {"rule_info": _rule_info_dict(_take_msg(fields, 1))}
+    first = _secured_group_dict(_take_msg(fields, 2))
+    second = _secured_group_dict(_take_msg(fields, 3))
+    if first:
+        body["first_secured_group"] = first
+    if second:
+        body["second_secured_group"] = second
+    return body
+
+
+def _sg_rule_dict(raw):
+    fields = _proto_decode(raw or b"")
+    body = {"rule_info": _rule_info_dict(_take_msg(fields, 1))}
+    secured = _secured_group_dict(_take_msg(fields, 2))
+    if secured:
+        body["secured_group"] = secured
+    return body
+
+
+def _multi_dict(raw):
+    fields = _proto_decode(raw or b"")
+    body = {"rule_info": _rule_info_dict(_take_msg(fields, 1))}
+    groups = []
+    blob = _take_msg(fields, 3)
+    if blob:
+        for chunk in _proto_chunks(_proto_decode(blob), 1):
+            secured = _secured_group_dict(chunk)
+            if secured:
+                groups.append(secured)
+    if groups:
+        body["all_to_all_isolation_group"] = {"isolation_group_list": groups}
+    return body
+
+
+def _flex_side(endpoint, flag):
+    """Allow-any is a flag with no endpoint. Other selectors stay on the side."""
+    if not endpoint:
+        return {}
+    refs = (
+        endpoint.get("entity_group_uuid_list")
+        or endpoint.get("endpoint_entity")
+        or endpoint.get("address_group_uuid")
+        or endpoint.get("ip_subnet"))
+    if endpoint.get("allow_type") in SKIP_ALLOW and not refs:
+        return {flag: True}
+    return {}
+
+
+def _flex_rule_dict(raw):
+    fields = _proto_decode(raw or b"")
+    body = {"rule_info": _rule_info_dict(_take_msg(fields, 1))}
+    src = _endpoint_dict(_take_msg(fields, 2))
+    dst = _endpoint_dict(_take_msg(fields, 3))
+    src_flag = _flex_side(src, "should_allow_any_src")
+    dst_flag = _flex_side(dst, "should_allow_any_dst")
+    if src_flag:
+        body.update(src_flag)
+    elif src:
+        body["src_endpoint"] = src
+    if dst_flag:
+        body.update(dst_flag)
+    elif dst:
+        body["dest_endpoint"] = dst
+    if 10 in fields:
+        body["applied_to_entity_group_uuid_list"] = _proto_str_list(fields, 10)
+    return body
+
+
+def _rule_body(kind, raw):
+    if kind == "app":
+        return _app_rule_dict(raw)
+    if kind == "two":
+        return _two_env_dict(raw)
+    if kind == "sg":
+        return _sg_rule_dict(raw)
+    if kind == "multi":
+        return _multi_dict(raw)
+    return _flex_rule_dict(raw)
+
+
+def _rules_from_zprotobuf(raw):
+    data = _zprotobuf_bytes(raw)
+    if not data:
+        return []
+    top = _proto_decode(_zlib_decompress(data))
+    rules = []
+    for _wire, entry in top.get(6) or []:
+        if not isinstance(entry, (bytes, bytearray)):
+            continue
+        vals = _proto_chunks(_proto_decode(entry), 2)
+        if not vals:
+            continue
+        rule = _proto_decode(vals[0])
+        for number, name, kind in _RULE_FIELDS:
+            chunks = _proto_chunks(rule, number)
+            if not chunks:
+                continue
+            rules.append({name: _rule_body(kind, chunks[0])})
+            break
+    return rules
+
+
+def _idf_enum(value, table, default):
+    if value in (None, ""):
+        return default
+    text = str(value).strip()
+    if text in table.values() or text.startswith("k"):
+        return text
+    try:
+        return table.get(int(text), default)
+    except (TypeError, ValueError):
+        return default
+
+
+def policy_from_idf_row(row):
+    """IDF network_security_policy row -> the dict annotate_policy already walks."""
+    if not isinstance(row, dict):
+        return None
+    uid = str(row.get("uuid") or row.get("ext_id") or "").strip()
+    rules = _rules_from_zprotobuf(row.get("__zprotobuf__"))
+    if not uid and not rules:
+        return None
+    scope = _idf_enum(row.get("scope"), POLICY_SCOPE_NAME, "kAllVlan")
+    policy = {
+        "uuid": uid,
+        "name": str(row.get("name") or ""),
+        "mode": _idf_enum(row.get("mode"), POLICY_MODE_NAME, "kApply"),
+        "policy_type": _idf_enum(
+            row.get("policy_type"), POLICY_TYPE_NAME, "kApplication"),
+        "scope": scope,
+        "project_uuid": str(row.get("project_uuid") or ZERO),
+        "rules_list": rules,
+    }
+    vpc = str(row.get("vpc_uuid") or "").strip()
+    refs = as_str_list(row.get("reference_uuid_list"))
+    if scope == "kVpcAsCategory" and refs:
+        policy["vpc_uuid_list"] = refs
+    elif vpc and vpc != ZERO:
+        policy["vpc_uuid_list"] = [vpc]
+    return policy
+
+
+def _idf_rows_from_stdout(text):
+    payload = _json_loads(text)
+    if payload is None:
+        return []
+    return parse_idf_entities(payload)
+
+
+def _idfcli_commands(entity):
+    """get entity --all, then get entitytype. port_set rejects --all."""
+    bins = ("idfcli", "/usr/local/nutanix/bin/idfcli", "/home/nutanix/bin/idfcli")
+    commands = []
+    for binary in bins:
+        commands.append(
+            "%s get entity -e %s --all -o json" % (binary, entity))
+        commands.append(
+            "%s get entitytype -e %s -o json" % (binary, entity))
+    return " || ".join(commands)
+
+
+def _idfcli_argvs(binary, entity):
+    return (
+        [binary, "get", "entity", "-e", entity, "--all", "-o", "json"],
+        [binary, "get", "entitytype", "-e", entity, "-o", "json"],
+    )
+
+
+def _fetch_idf_rows_smsp(entities, timeout):
+    """Flow IDF on SMSP is inside the flow cluster, not on the PC."""
     tmp = tempfile.mkdtemp(prefix="port_set_kube_")
-    kubeconfig, kube_err = _flow_kubeconfig(tmp)
-
-    def _cleanup():
+    kubeconfig = ""
+    try:
+        kubeconfig, kube_err = _flow_kubeconfig(tmp)
+        if not kubeconfig:
+            return [], "smsp kubeconfig: %s" % (kube_err or "failed")
+        found_pod = ("", "", "no pod")
+        for app, preferred in (
+                ("atlas", "atlas-0"), ("insights", "insights-0"), ("idf", "idf-0")):
+            ns, pod, err = _find_pod(app, preferred, "ntnx-flow", kubeconfig)
+            if not pod:
+                ns, pod, err = _find_pod(app, preferred, "", kubeconfig)
+            if pod:
+                found_pod = (ns, pod, err)
+                break
+        ns, pod, err = found_pod
+        if not pod:
+            return [], "smsp idf pod: %s" % (err or "missing")
+        last = "empty"
+        for entity in entities:
+            _rc, out, err = _kubectl(
+                ["exec", "-n", ns, pod, "--", "bash", "-lc", _idfcli_commands(entity)],
+                timeout, kubeconfig=kubeconfig)
+            rows = _idf_rows_from_stdout(out)
+            if rows:
+                LOG.info("idfcli %s via %s/%s count=%s", entity, ns, pod, len(rows))
+                return rows, ""
+            last = (err or out or "empty").strip().replace("\n", " ")[:300]
+        return [], "smsp idfcli %s/%s: %s" % (ns, pod, last)
+    finally:
         if kubeconfig:
             try:
                 os.remove(kubeconfig)
@@ -891,89 +1303,56 @@ def _policy_runner(info):
         except OSError:
             pass
 
-    cleanup.append(_cleanup)
-    if kubeconfig:
-        ns, pod, err = _find_pod("kratos", "kratos-0", "ntnx-flow", kubeconfig)
-        if not pod:
-            ns, pod, err = _find_pod("kratos", "kratos-0", "", kubeconfig)
-        cli = ""
-        if pod:
-            cli = _pod_bin(
-                kubeconfig, ns, pod,
-                "command -v kratos_cli || command -v flow_cli || "
-                "ls /home/nutanix/flow/bin/kratos_cli "
-                "/home/nutanix/flow/bin/flow_cli 2>/dev/null | head -1")
-        if pod and cli:
-            def runner(args, timeout, log_cmd=True, _cli=cli, _ns=ns, _pod=pod):
-                return _run_kratos_cli(
-                    kubeconfig, _ns, _pod, _cli_join(_cli, args),
-                    timeout, log_cmd=log_cmd)
 
-            return runner, cleanup
-        LOG.warning("kratos cli missing (%s)", err or "no cli")
-    smsp_uuid = (info or {}).get("smsp_cluster_uuid") or ""
-    if not smsp_uuid:
-        _cleanup()
+def fetch_idf_rows(info, entities, timeout, required=True):
+    """Flattened idfcli rows. SMSP uses the flow-cluster idfcli."""
+    errors = []
+    if (info or {}).get("platform") == "smsp":
+        rows, detail = _fetch_idf_rows_smsp(entities, timeout)
+        if rows:
+            return rows
+        if detail:
+            errors.append(detail)
+    binary = idfcli_bin()
+    for entity in entities:
+        for argv in _idfcli_argvs(binary, entity):
+            _rc, out, err = _run(argv, timeout)
+            rows = _idf_rows_from_stdout(out)
+            if rows:
+                LOG.info("idfcli %s count=%s", " ".join(argv), len(rows))
+                return rows
+            detail = (err or out or "empty").strip().replace("\n", " ")[:300]
+            errors.append("%s: %s" % (" ".join(argv), detail))
+    if required:
         raise SystemExit(
-            "SMSP policy fetch failed: %s" % (kube_err or "no ClusterUUID"))
-    binary = _flow_cli_bin()
-    ws = "ws://smsp-%s.ntnx-ikat.svc:2051/flow_cli" % smsp_uuid
+            "idfcli %s returned no entities\n%s" % (
+                ",".join(entities), "\n".join(errors)))
+    if errors:
+        LOG.warning("idfcli %s: %s", ",".join(entities), errors[0])
+    return []
 
-    def runner(args, timeout, log_cmd=True, _binary=binary, _ws=ws):
-        return _run_bash_cli(
-            "%s -u '%s' -o json %s" % (
-                _binary, _ws, " ".join(str(arg) for arg in args)),
-            timeout, log_cmd=log_cmd)
-
-    return runner, cleanup
 
 def fetch_policies(info, workers=8, timeout=1800):
-    runner, cleanup = _policy_runner(info)
-    try:
-        list_timeout = max(60, min(300, int(timeout)))
-        per = max(15, min(45, int(timeout)))
-        parsed, _text = runner(["policy.list"], list_timeout)
-        if isinstance(parsed, dict) and parsed.get("status") not in (None, 0, "0"):
-            raise SystemExit("policy.list status=%s" % parsed.get("status"))
-        uuids = _uuids_from_rows(_list_rows(parsed))
-        gets = {}
-        if not uuids:
-            return []
-        get_workers = max(1, min(int(workers), len(uuids)))
+    """Policies from idfcli. workers is accepted and unused."""
+    del workers
+    rows = fetch_idf_rows(
+        info, POLICY_IDF_ENTITIES, min(int(timeout), 600), required=True)
+    policies = []
+    decoded = 0
+    for row in rows:
+        policy = policy_from_idf_row(row)
+        if not policy:
+            continue
+        if policy.get("rules_list"):
+            decoded += 1
+        policies.append(policy)
+    LOG.info("idf policies=%s with_rules=%s", len(policies), decoded)
+    if policies and not decoded:
+        raise SystemExit(
+            "idfcli policies had no decodable rules (__zprotobuf__)")
+    return policies
 
-        def _one(uid):
-            one, _text = runner(["policy.get", uid], per, log_cmd=False)
-            if isinstance(one, dict) and one.get("status") not in (None, 0, "0"):
-                raise RuntimeError("status=%s" % one.get("status"))
-            return one
 
-        failed = []
-        from concurrent.futures import ThreadPoolExecutor, wait
-        with ThreadPoolExecutor(max_workers=get_workers) as pool:
-            fmap = {pool.submit(_one, uid): uid for uid in uuids}
-            done, pending = wait(fmap.keys(), timeout=timeout)
-            for fut in done:
-                uid = fmap[fut]
-                try:
-                    gets[uid] = fut.result(timeout=1)
-                except Exception as err:
-                    failed.append("%s" % err)
-            for fut in pending:
-                failed.append(fmap[fut])
-                fut.cancel()
-        if failed and not gets:
-            raise SystemExit("policy.get failed: %s" % failed[0])
-        if failed:
-            LOG.warning("policy.get failed %s of %s", len(failed), len(uuids))
-        policies = []
-        for rec in gets.values():
-            policy = unwrap_policy(rec)
-            if policy:
-                policies.append(policy)
-        return policies
-    finally:
-        for fn in cleanup:
-            fn()
 
 def scope_uuids_for_platform(platform, pc_global, pc_vlan, atlas_global, atlas_vlan):
     """SMSP port-set scope ids come from Atlas ZK, not the PC zkcat copy."""
@@ -3833,7 +4212,7 @@ def main(argv=None):
         raise SystemExit("missing vlan/global unique uuid (zkcat / atlas ZK)")
     policies = fetch_policies(info, workers=args.workers, timeout=args.timeout)
     if not policies:
-        raise SystemExit("no policies from flow_cli")
+        raise SystemExit("no policies from idfcli")
     sg_map = fetch_service_groups(info, min(int(args.timeout), 300))
     quar = fetch_quarantine_categories(info, min(int(args.timeout), 120))
     edges = policy_edges(
