@@ -801,6 +801,10 @@ POLICY_SCOPE_NAME = {
 }
 CAT_SEL_NAME = {1: "kVM", 2: "kVPC", 3: "kSubnet"}
 ALLOW_NAME = {1: "kTypeAll", 2: "kTypeNone"}
+# Application rule field 5. 1 is inbound, 2 is outbound.
+RULE_DIRECTION_NAME = {1: "kIn", 2: "kOut"}
+# Service message field 1. Only kAll showed up as a bare protocol.
+SERVICE_PROTO_NAME = {1: "kAll", 2: "kICMP", 3: "kTCP", 4: "kUDP", 5: "kICMPv6"}
 _RULE_FIELDS = (
     (1, "application_rule", "app"),
     (2, "isolation_rule", "two"),
@@ -991,6 +995,55 @@ def _take_msg(fields, number):
     return chunks[0] if chunks else b""
 
 
+def _rule_direction(fields, number=5):
+    value = _proto_varint(fields, number, 0)
+    return RULE_DIRECTION_NAME.get(value, "")
+
+
+def _rule_action(fields, number):
+    """Bool action. Field absent means the caller should leave it unset."""
+    for wire, val in fields.get(number) or []:
+        if wire == 0 and val is not None:
+            return bool(int(val))
+    return None
+
+
+def _service_dict(raw):
+    sub = _proto_decode(raw or b"")
+    uid = _proto_str(sub, 4)
+    if uid:
+        return {"service_group_uuid": uid}
+    proto = _proto_varint(sub, 1, 0)
+    if proto in SERVICE_PROTO_NAME:
+        return {"protocol": SERVICE_PROTO_NAME[proto]}
+    if proto:
+        return {"protocol": str(proto)}
+    return {}
+
+
+def _rule_services(fields, number=4):
+    out = []
+    for raw in _proto_chunks(fields, number):
+        svc = _service_dict(raw)
+        if svc:
+            out.append(svc)
+    return out
+
+
+def _attach_rule_meta(body, fields, action_field=None):
+    direction = _rule_direction(fields)
+    if direction:
+        body["direction"] = direction
+    if action_field is not None:
+        action = _rule_action(fields, action_field)
+        if action is not None:
+            body["action"] = action
+    services = _rule_services(fields)
+    if services:
+        body["services"] = services
+    return body
+
+
 def _app_rule_dict(raw):
     fields = _proto_decode(raw or b"")
     body = {"rule_info": _rule_info_dict(_take_msg(fields, 1))}
@@ -1000,7 +1053,7 @@ def _app_rule_dict(raw):
     endpoint = _endpoint_dict(_take_msg(fields, 3))
     if endpoint:
         body["endpoint"] = endpoint
-    return body
+    return _attach_rule_meta(body, fields)
 
 
 def _two_env_dict(raw):
@@ -1021,7 +1074,8 @@ def _sg_rule_dict(raw):
     secured = _secured_group_dict(_take_msg(fields, 2))
     if secured:
         body["secured_group"] = secured
-    return body
+    # Field 3 is the intra-group action. 0 is deny, 1 is allow.
+    return _attach_rule_meta(body, fields, action_field=3)
 
 
 def _multi_dict(raw):
