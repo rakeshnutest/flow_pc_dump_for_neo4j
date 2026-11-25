@@ -5,9 +5,9 @@ Expected UUIDs use the same algorithm as neo4j_db_insert.generate_port_set_id
 (uuid5 for application rules, MD5 for FLEX). A FLEX rule also hashes
 applied_to (the applied entity group) and an allow-any side (empty Go
 list). UI Global applied_to, where that field is absent, is not a port set.
---idf-cli (default) reads policies from idfcli. The rule body is the
-zlib protobuf in __zprotobuf__. --flow-cli reads them with flow_cli
-policy.list and policy.get. Flow must be up for that path.
+--flow-cli (default) reads policies with flow_cli policy.list and
+policy.get. Flow must be up for that path. --idf-cli reads them from
+idfcli. The rule body is the zlib protobuf in __zprotobuf__.
 
   idfcli get entity -e network_security_policy --all -o json
   idfcli get entity -e atlas_port_set --all -o json
@@ -39,8 +39,8 @@ SMSP reads port_set with idfcli in the flow cluster and uses the Atlas
 ZK scope UUIDs. CMSP uses the local idfcli and zkcat.
 
   python3 validate_port_sets.py
-  python3 validate_port_sets.py --idf_cli
   python3 validate_port_sets.py --flow_cli
+  python3 validate_port_sets.py --idf_cli
   python3 validate_port_sets.py --idf_cli --port-set-entity port_set
   python3 validate_port_sets.py --port-set-entity atlas_port_set
   python3 validate_port_sets.py --self-test
@@ -1465,15 +1465,15 @@ def fetch_policies_flow_cli(info, workers=8, timeout=1800):
 
 
 def policy_backend(flow_cli=False, idf_cli=False):
-    """--flow-cli or --idf-cli. Neither flag means idf_cli."""
+    """--flow-cli or --idf-cli. Neither flag means flow_cli."""
     if flow_cli and idf_cli:
         raise SystemExit("pass only one of --flow-cli or --idf-cli")
-    if flow_cli:
-        return "flow_cli"
-    return "idf_cli"
+    if idf_cli:
+        return "idf_cli"
+    return "flow_cli"
 
 
-def fetch_policies(info, workers=8, timeout=1800, backend="idf_cli"):
+def fetch_policies(info, workers=8, timeout=1800, backend="flow_cli"):
     """Policies from idfcli or flow_cli."""
     if backend == "flow_cli":
         return fetch_policies_flow_cli(info, workers, timeout)
@@ -2077,10 +2077,10 @@ def self_test():
         raise SystemExit("port_set option")
     if port_set_entities("atlas_port_set") != ("atlas_port_set",):
         raise SystemExit("atlas_port_set option")
-    if policy_backend() != "idf_cli" or policy_backend(False, True) != "idf_cli":
+    if policy_backend() != "flow_cli" or policy_backend(True, False) != "flow_cli":
         raise SystemExit("default backend")
-    if policy_backend(True, False) != "flow_cli":
-        raise SystemExit("flow_cli backend")
+    if policy_backend(False, True) != "idf_cli":
+        raise SystemExit("idf_cli backend")
     try:
         port_set_entities("other")
     except SystemExit:
@@ -2362,17 +2362,17 @@ def parse_args():
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument(
         "--cli",
-        default="idf_cli",
-        choices=("idf_cli", "flow_cli"),
+        default="flow_cli",
+        choices=("flow_cli", "idf_cli"),
         help="Policy source (default: %(default)s). idf_cli does not need Flow.")
     parser.add_argument(
         "--flow-cli", "--flow_cli",
         action="store_const", const="flow_cli", dest="cli",
-        help="Same as --cli flow_cli.")
+        help="Same as --cli flow_cli. This is the default.")
     parser.add_argument(
         "--idf-cli", "--idf_cli",
         action="store_const", const="idf_cli", dest="cli",
-        help="Same as --cli idf_cli. This is the default.")
+        help="Same as --cli idf_cli. Use this when Flow is down.")
     parser.add_argument(
         "--port-set-entity",
         default="auto",
@@ -2493,7 +2493,7 @@ def main():
     if not global_uuid or not vlan_uuid:
         raise SystemExit(
             "missing vlan/global unique uuid (zkcat / atlas ZK)")
-    backend = args.cli or "idf_cli"
+    backend = args.cli or "flow_cli"
     LOG.info("policy source=%s", backend)
     policies = fetch_policies(
         info, workers=args.workers, timeout=args.timeout, backend=backend)
