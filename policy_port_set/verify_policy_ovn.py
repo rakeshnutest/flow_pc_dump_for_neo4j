@@ -3010,11 +3010,26 @@ def _cfg_rows_agree(rows):
     return bool(rows)
 
 
+def _cfg_detail(nb_cfg, sb_cfg, hv_cfg, expected=None):
+    """Name every cfg that is not the expected number."""
+    parts = []
+    target = nb_cfg if expected is None else expected
+    if nb_cfg != target:
+        parts.append("nb_cfg=%s expected=%s" % (nb_cfg, target))
+    if sb_cfg != target:
+        parts.append("sb_cfg=%s expected=%s" % (sb_cfg, target))
+    if hv_cfg != target:
+        parts.append("hv_cfg=%s expected=%s" % (hv_cfg, target))
+    return " ".join(parts)
+
+
 def write_cfg(cfg, handle):
     """Pass when every NB_Global uuid agrees, and every chassis uuid matches it.
 
-    A dict without rows or chassis is the single NB_Global triple. That path
-    stays for the self-test. chassis present means those UUIDs are required.
+    A failure line names the uuid and each cfg that is not the expected
+    number. A dict without rows or chassis is the single NB_Global triple.
+    That path stays for the self-test. chassis present means those UUIDs
+    are required.
     """
     if isinstance(cfg, dict) and cfg.get("rows"):
         rows = list(cfg["rows"])
@@ -3022,7 +3037,7 @@ def write_cfg(cfg, handle):
         rows = [cfg or {}]
     chassis = cfg.get("chassis") if isinstance(cfg, dict) and "chassis" in cfg else None
     first = None
-    matched = True
+    matched = bool(rows)
     named = False
     for row in rows:
         ok, nb_cfg, sb_cfg, hv_cfg = _cfg_row_ok(row)
@@ -3037,6 +3052,11 @@ def write_cfg(cfg, handle):
             handle.write(
                 "OVN cfg: uuid=%s nb_cfg=%s sb_cfg=%s hv_cfg=%s match=%s\n" % (
                     uid, nb_cfg, sb_cfg, hv_cfg, "yes" if ok else "no"))
+            if not ok:
+                detail = _cfg_detail(nb_cfg, sb_cfg, hv_cfg, first)
+                handle.write(
+                    "OVN cfg fail: uuid=%s nb_cfg=%s sb_cfg=%s hv_cfg=%s %s\n" % (
+                        uid, nb_cfg, sb_cfg, hv_cfg, detail))
     if not named:
         nb_cfg = _cfg_value(rows[0] if rows else {}, "nb_cfg")
         sb_cfg = _cfg_value(rows[0] if rows else {}, "sb_cfg", "sb_nb_cfg")
@@ -3047,6 +3067,11 @@ def write_cfg(cfg, handle):
         handle.write(
             "OVN cfg: nb_cfg=%s sb_cfg=%s hv_cfg=%s match=%s\n" % (
                 nb_cfg, sb_cfg, hv_cfg, "yes" if one else "no"))
+        if not one:
+            handle.write(
+                "OVN cfg fail: nb_cfg=%s sb_cfg=%s hv_cfg=%s %s\n" % (
+                    nb_cfg, sb_cfg, hv_cfg,
+                    _cfg_detail(nb_cfg, sb_cfg, hv_cfg, nb_cfg if nb_cfg >= 0 else None)))
     if chassis is not None:
         lag = []
         for rec in chassis:
@@ -3055,17 +3080,20 @@ def write_cfg(cfg, handle):
             except (TypeError, ValueError):
                 nb_cfg = -1
             if first is None or nb_cfg != first:
-                lag.append(rec)
+                lag.append((rec, nb_cfg))
         chassis_ok = bool(chassis) and not lag and matched
         handle.write(
             "OVN cfg chassis: checked=%s matched=%s match=%s\n" % (
                 len(chassis), len(chassis) - len(lag),
                 "yes" if chassis_ok else "no"))
-        for rec in lag:
+        if not chassis:
             handle.write(
-                "OVN cfg chassis lag: uuid=%s name=%s nb_cfg=%s\n" % (
+                "OVN cfg chassis fail: checked=0 detail=no Chassis_Private uuid\n")
+        for rec, nb_cfg in lag:
+            handle.write(
+                "OVN cfg chassis fail: uuid=%s name=%s nb_cfg=%s expected=%s\n" % (
                     rec.get("uuid") or "", rec.get("name") or "",
-                    rec.get("nb_cfg")))
+                    nb_cfg, first if first is not None else ""))
         matched = chassis_ok
     return not matched
 
@@ -4417,8 +4445,22 @@ sb_cfg_timestamp    : 1697911009028
     if write_cfg({"rows": agreed, "chassis": hosts}, sink):
         raise SystemExit("all uuids should match")
     hosts[1]["nb_cfg"] = 6
-    if not write_cfg({"rows": agreed, "chassis": hosts}, sink):
+    lag_out = io.StringIO()
+    if not write_cfg({"rows": agreed, "chassis": hosts}, lag_out):
         raise SystemExit("lagging chassis uuid should fail")
+    lag_text = lag_out.getvalue()
+    if ("OVN cfg chassis fail: uuid=dddddddd-dddd-4ddd-8ddd-dddddddddddd "
+            "name=h2 nb_cfg=6 expected=7") not in lag_text:
+        raise SystemExit("chassis fail detail: %s" % lag_text)
+    bad_out = io.StringIO()
+    if not write_cfg({"rows": two, "chassis": []}, bad_out):
+        raise SystemExit("disagreeing global should fail")
+    bad_text = bad_out.getvalue()
+    if ("OVN cfg fail: uuid=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb "
+            "nb_cfg=7 sb_cfg=8 hv_cfg=7 sb_cfg=8 expected=7") not in bad_text:
+        raise SystemExit("global fail detail: %s" % bad_text)
+    if "OVN cfg chassis fail: checked=0 detail=no Chassis_Private uuid" not in bad_text:
+        raise SystemExit("empty chassis detail: %s" % bad_text)
     if scope_unique_uuid(
             "kVpcAsCategory", False, "v", "g", ["vpc"],
             ["95c73585-bfc1-5a89-9d0d-8ede2ddf420c"]) != (
