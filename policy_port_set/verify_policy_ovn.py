@@ -9,7 +9,7 @@ Standalone. Stdlib only. No other policy script is imported.
 Each row carries the OVN-NB ACL priority for that rule class.
 An address-group peer is uuid5(address_group, "IPv4"|"IPv6").
 A port-set peer is that port set's generated address set.
-The OVN check prints NB_Global nb_cfg, sb_cfg, and hv_cfg. They must be the same number.
+The OVN check prints every NB_Global uuid. On each row nb_cfg, sb_cfg, and hv_cfg must be the same number, and every Chassis_Private uuid must carry that nb_cfg.
 The last lines are the OVN-NB check, then the derived OVN-SB check.
 Each Northbound ACL that northd should emit must have a Logical_Flow at
 the ACL priority plus 1000, in ls_in_acl_eval or ls_out_acl_eval.
@@ -2920,15 +2920,153 @@ def _cfg_value(cfg, *keys):
     return -1
 
 
+def _cfg_rows(text):
+    """Every NB_Global row. A full list is one block per _uuid.
+
+    CSV from --columns=_uuid,nb_cfg,sb_cfg,hv_cfg is one row per line.
+    Three bare numbers are a single row with no uuid.
+    """
+    raw = text or ""
+    if re.search(r"(?m)^[ \t]*_uuid[ \t]*:", raw):
+        rows = []
+        chunks = re.split(r"(?m)^(?=[ \t]*_uuid[ \t]*:)", raw)
+        for chunk in chunks:
+            fields = _cfg_named(chunk)
+            if not fields:
+                continue
+            uid = ""
+            match = re.search(
+                r"(?m)^[ \t]*_uuid[ \t]*:[ \t]*(" + UUID_RE.pattern + ")",
+                chunk)
+            if match:
+                uid = match.group(1).lower()
+            rows.append({
+                "uuid": uid,
+                "nb_cfg": fields.get("nb_cfg", -1),
+                "sb_cfg": fields.get("sb_cfg", -1),
+                "hv_cfg": fields.get("hv_cfg", -1),
+            })
+        return rows
+    rows = []
+    for line in raw.splitlines():
+        parts = [item.strip() for item in line.split(",") if item.strip()]
+        if len(parts) >= 4 and UUID_RE.fullmatch(parts[0]):
+            try:
+                rows.append({
+                    "uuid": parts[0].lower(),
+                    "nb_cfg": int(parts[1]),
+                    "sb_cfg": int(parts[2]),
+                    "hv_cfg": int(parts[3]),
+                })
+            except ValueError:
+                continue
+            continue
+        if len(parts) >= 3 and all(item.lstrip("-").isdigit() for item in parts[:3]):
+            rows.append({
+                "uuid": "",
+                "nb_cfg": int(parts[0]),
+                "sb_cfg": int(parts[1]),
+                "hv_cfg": int(parts[2]),
+            })
+    return rows
+
+
+def _chassis_rows(text):
+    """Chassis_Private rows: uuid, name, nb_cfg."""
+    rows = []
+    for line in (text or "").splitlines():
+        parts = [item.strip() for item in line.split(",")]
+        if len(parts) < 3 or not UUID_RE.fullmatch(parts[0]):
+            continue
+        try:
+            nb_cfg = int(parts[-1])
+        except ValueError:
+            continue
+        rows.append({
+            "uuid": parts[0].lower(),
+            "name": parts[1],
+            "nb_cfg": nb_cfg,
+        })
+    return rows
+
+
+def _cfg_row_ok(row):
+    nb_cfg = _cfg_value(row, "nb_cfg")
+    sb_cfg = _cfg_value(row, "sb_cfg", "sb_nb_cfg")
+    hv_cfg = _cfg_value(row, "hv_cfg")
+    return nb_cfg >= 0 and nb_cfg == sb_cfg == hv_cfg, nb_cfg, sb_cfg, hv_cfg
+
+
+def _cfg_rows_agree(rows):
+    first = None
+    for row in rows or []:
+        ok, nb_cfg, _sb, _hv = _cfg_row_ok(row)
+        if not ok:
+            return False
+        if first is None:
+            first = nb_cfg
+        elif nb_cfg != first:
+            return False
+    return bool(rows)
+
+
 def write_cfg(cfg, handle):
-    """Pass when NB_Global nb_cfg, sb_cfg, and hv_cfg are the same number."""
-    nb_cfg = _cfg_value(cfg, "nb_cfg")
-    sb_cfg = _cfg_value(cfg, "sb_cfg", "sb_nb_cfg")
-    hv_cfg = _cfg_value(cfg, "hv_cfg")
-    matched = nb_cfg >= 0 and nb_cfg == sb_cfg == hv_cfg
-    handle.write(
-        "OVN cfg: nb_cfg=%s sb_cfg=%s hv_cfg=%s match=%s\n" % (
-            nb_cfg, sb_cfg, hv_cfg, "yes" if matched else "no"))
+    """Pass when every NB_Global uuid agrees, and every chassis uuid matches it.
+
+    A dict without rows or chassis is the single NB_Global triple. That path
+    stays for the self-test. chassis present means those UUIDs are required.
+    """
+    if isinstance(cfg, dict) and cfg.get("rows"):
+        rows = list(cfg["rows"])
+    else:
+        rows = [cfg or {}]
+    chassis = cfg.get("chassis") if isinstance(cfg, dict) and "chassis" in cfg else None
+    first = None
+    matched = True
+    named = False
+    for row in rows:
+        ok, nb_cfg, sb_cfg, hv_cfg = _cfg_row_ok(row)
+        if first is None:
+            first = nb_cfg
+        elif nb_cfg != first:
+            ok = False
+        matched = matched and ok
+        uid = str((row or {}).get("uuid") or "")
+        if uid:
+            named = True
+            handle.write(
+                "OVN cfg: uuid=%s nb_cfg=%s sb_cfg=%s hv_cfg=%s match=%s\n" % (
+                    uid, nb_cfg, sb_cfg, hv_cfg, "yes" if ok else "no"))
+    if not named:
+        nb_cfg = _cfg_value(rows[0] if rows else {}, "nb_cfg")
+        sb_cfg = _cfg_value(rows[0] if rows else {}, "sb_cfg", "sb_nb_cfg")
+        hv_cfg = _cfg_value(rows[0] if rows else {}, "hv_cfg")
+        one = nb_cfg >= 0 and nb_cfg == sb_cfg == hv_cfg
+        matched = one
+        first = nb_cfg
+        handle.write(
+            "OVN cfg: nb_cfg=%s sb_cfg=%s hv_cfg=%s match=%s\n" % (
+                nb_cfg, sb_cfg, hv_cfg, "yes" if one else "no"))
+    if chassis is not None:
+        lag = []
+        for rec in chassis:
+            try:
+                nb_cfg = int(rec.get("nb_cfg"))
+            except (TypeError, ValueError):
+                nb_cfg = -1
+            if first is None or nb_cfg != first:
+                lag.append(rec)
+        chassis_ok = bool(chassis) and not lag and matched
+        handle.write(
+            "OVN cfg chassis: checked=%s matched=%s match=%s\n" % (
+                len(chassis), len(chassis) - len(lag),
+                "yes" if chassis_ok else "no"))
+        for rec in lag:
+            handle.write(
+                "OVN cfg chassis lag: uuid=%s name=%s nb_cfg=%s\n" % (
+                    rec.get("uuid") or "", rec.get("name") or "",
+                    rec.get("nb_cfg")))
+        matched = chassis_ok
     return not matched
 
 
@@ -2973,24 +3111,82 @@ def _cfg_from_text(nb_text, sb_text=""):
     }
 
 
-def read_cfg(info, timeout, attempts=5):
-    """Read NB_Global until nb_cfg, sb_cfg, and hv_cfg are one number.
+def read_chassis_cfg(info, timeout):
+    """nb_cfg for every Chassis_Private uuid.
 
-    One `list NB_Global` holds all three. Repeating covers northd or a
-    chassis that has not copied the latest nb_cfg yet.
+    The Chassis.nb_cfg column stays 0 after OVN moved the value. Use it
+    only when Chassis_Private is empty and some Chassis nb_cfg is set.
     """
-    samples = []
+    text = ""
+    try:
+        _rc, text, _err = _ovn_sb(
+            info,
+            ["--columns=_uuid,name,nb_cfg", "list", "Chassis_Private"],
+            timeout)
+    except SystemExit:
+        text = ""
+    rows = _chassis_rows(text)
+    if rows:
+        return rows
+    try:
+        _rc, text, _err = _ovn_sb(
+            info,
+            ["--columns=_uuid,name,nb_cfg", "list", "Chassis"],
+            timeout)
+    except SystemExit:
+        return []
+    rows = _chassis_rows(text)
+    live = [row for row in rows if row["nb_cfg"] > 0]
+    return live
+
+
+def _chassis_agree(rows, chassis):
+    if not rows or not chassis:
+        return False
+    _ok, nb_cfg, _sb, _hv = _cfg_row_ok(rows[0])
+    if nb_cfg < 0:
+        return False
+    for rec in chassis:
+        try:
+            if int(rec.get("nb_cfg")) != nb_cfg:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
+def read_cfg(info, timeout, attempts=5):
+    """Read every NB_Global uuid and every Chassis_Private uuid.
+
+    Each global row must have one nb_cfg, sb_cfg, and hv_cfg. Every chassis
+    nb_cfg must be that same number. Repeating covers a chassis that has
+    not copied the latest nb_cfg yet.
+    """
+    last = {
+        "nb_cfg": -1, "sb_cfg": -1, "hv_cfg": -1,
+        "rows": [], "chassis": [],
+    }
     for _ in range(max(1, int(attempts))):
         _rc, nb_text, _err = _ovn_nb(
             info,
-            ["--columns=nb_cfg,sb_cfg,hv_cfg", "list", "NB_Global"],
+            ["--columns=_uuid,nb_cfg,sb_cfg,hv_cfg", "list", "NB_Global"],
             timeout)
-        cfg = _cfg_from_text(nb_text)
-        samples.append(cfg)
-        if (cfg["nb_cfg"] >= 0 and
-                cfg["nb_cfg"] == cfg["sb_cfg"] == cfg["hv_cfg"]):
+        rows = _cfg_rows(nb_text)
+        if not rows:
+            one = _cfg_from_text(nb_text)
+            rows = [one] if one.get("nb_cfg", -1) >= 0 else []
+        chassis = read_chassis_cfg(info, timeout)
+        cfg = rows[0] if rows else {"nb_cfg": -1, "sb_cfg": -1, "hv_cfg": -1}
+        last = {
+            "nb_cfg": cfg.get("nb_cfg", -1),
+            "sb_cfg": cfg.get("sb_cfg", -1),
+            "hv_cfg": cfg.get("hv_cfg", -1),
+            "rows": rows,
+            "chassis": chassis,
+        }
+        if _cfg_rows_agree(rows) and _chassis_agree(rows, chassis):
             break
-    return pick_cfg(samples)
+    return last
 
 
 def load_sb(info, timeout):
@@ -4194,6 +4390,35 @@ sb_cfg_timestamp    : 1697911009028
         raise SystemExit("cfg resample: %s" % picked)
     if write_cfg(picked, sink):
         raise SystemExit("cfg resample failed")
+    two = _cfg_rows(
+        "_uuid               : aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n"
+        "nb_cfg              : 7\n"
+        "sb_cfg              : 7\n"
+        "hv_cfg              : 7\n"
+        "\n"
+        "_uuid               : bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n"
+        "nb_cfg              : 7\n"
+        "sb_cfg              : 8\n"
+        "hv_cfg              : 7\n")
+    if len(two) != 2 or two[1]["sb_cfg"] != 8:
+        raise SystemExit("two nb_global rows: %s" % two)
+    if _cfg_rows_agree(two):
+        raise SystemExit("disagreeing nb_global rows passed")
+    agreed = [
+        {"uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+         "nb_cfg": 7, "sb_cfg": 7, "hv_cfg": 7},
+        {"uuid": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+         "nb_cfg": 7, "sb_cfg": 7, "hv_cfg": 7},
+    ]
+    hosts = [
+        {"uuid": "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "name": "h1", "nb_cfg": 7},
+        {"uuid": "dddddddd-dddd-4ddd-8ddd-dddddddddddd", "name": "h2", "nb_cfg": 7},
+    ]
+    if write_cfg({"rows": agreed, "chassis": hosts}, sink):
+        raise SystemExit("all uuids should match")
+    hosts[1]["nb_cfg"] = 6
+    if not write_cfg({"rows": agreed, "chassis": hosts}, sink):
+        raise SystemExit("lagging chassis uuid should fail")
     if scope_unique_uuid(
             "kVpcAsCategory", False, "v", "g", ["vpc"],
             ["95c73585-bfc1-5a89-9d0d-8ede2ddf420c"]) != (
