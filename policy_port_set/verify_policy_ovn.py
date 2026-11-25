@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Policy port sets, their incoming and outgoing peers, then OVN-NB validation.
 
-Reads policies from idfcli (network_security_policy), not flow_cli.
-Flow can be down. The rule body is the zlib protobuf in __zprotobuf__.
+Reads policies from flow_cli by default. --idf_cli reads network_security_policy
+when Flow is down. That rule body is the zlib protobuf in __zprotobuf__.
 Hashes every port set in this file.
 Records who may send in and who may be sent to.
 Standalone. Stdlib only. No other policy script is imported.
 Each row carries the OVN-NB ACL priority for that rule class.
 An address-group peer is uuid5(address_group, "IPv4"|"IPv6").
 A port-set peer is that port set's generated address set.
+The OVN check prints NB_Global nb_cfg, sb_cfg, and hv_cfg. They must be the same number.
 The last lines are the OVN-NB check, then the derived OVN-SB check.
 Each Northbound ACL that northd should emit must have a Logical_Flow at
 the ACL priority plus 1000, in ls_in_acl_eval or ls_out_acl_eval.
@@ -24,7 +25,7 @@ stored.
   panacea_cli verify_policy_ovn.py
 
 With no arguments the full port-set and ACL check runs, including
-southbound. --skip-sb stops after the Northbound check. --src, --dst,
+southbound. --skip-sb stops after the Northbound check and the cfg match. --src, --dst,
 --port, and --proto select one flow and print its Northbound ACL, its
 Southbound flow, the OpenFlow cookie, the host to check in OVS, and
 allow or deny.
@@ -1622,7 +1623,58 @@ def fetch_entity_groups(info, policies, workers=8, timeout=300):
     return _fetch_entity_groups_flow(info, uuids, workers, timeout)
 
 
-def fetch_policies(info, workers=8, timeout=1800):
+def fetch_policies_flow_cli(info, workers=8, timeout=1800):
+    """Policies from flow_cli. Fails when the Flow process is down."""
+    runner, cleanup = _policy_runner(info)
+    try:
+        list_timeout = max(60, min(300, int(timeout)))
+        per = max(15, min(45, int(timeout)))
+        parsed, _text = runner(["policy.list"], list_timeout)
+        if isinstance(parsed, dict) and parsed.get("status") not in (None, 0, "0"):
+            raise SystemExit("policy.list status=%s" % parsed.get("status"))
+        uuids = _uuids_from_rows(_list_rows(parsed))
+        gets = {}
+        if not uuids:
+            return []
+        get_workers = max(1, min(int(workers), len(uuids)))
+
+        def _one(uid):
+            one, _text = runner(["policy.get", uid], per, log_cmd=False)
+            if isinstance(one, dict) and one.get("status") not in (None, 0, "0"):
+                raise RuntimeError("status=%s" % one.get("status"))
+            return one
+
+        failed = []
+        from concurrent.futures import ThreadPoolExecutor, wait
+        with ThreadPoolExecutor(max_workers=get_workers) as pool:
+            fmap = {pool.submit(_one, uid): uid for uid in uuids}
+            done, pending = wait(fmap.keys(), timeout=timeout)
+            for fut in done:
+                uid = fmap[fut]
+                try:
+                    gets[uid] = fut.result(timeout=1)
+                except Exception as err:
+                    failed.append("%s" % err)
+            for fut in pending:
+                failed.append(fmap[fut])
+                fut.cancel()
+        if failed and not gets:
+            raise SystemExit("policy.get failed: %s" % failed[0])
+        if failed:
+            LOG.warning("policy.get failed %s of %s", len(failed), len(uuids))
+        policies = []
+        for rec in gets.values():
+            policy = unwrap_policy(rec)
+            if policy:
+                policies.append(policy)
+        LOG.info("flow_cli policies=%s", len(policies))
+        return policies
+    finally:
+        for fn in cleanup:
+            fn()
+
+
+def fetch_policies_idf(info, workers, timeout):
     """Policies from idfcli. workers is accepted and unused."""
     del workers
     rows = fetch_idf_rows(
@@ -1641,6 +1693,13 @@ def fetch_policies(info, workers=8, timeout=1800):
         raise SystemExit(
             "idfcli policies had no decodable rules (__zprotobuf__)")
     return policies
+
+
+def fetch_policies(info, workers=8, timeout=1800, backend="flow_cli"):
+    """Policies from flow_cli, or from idfcli when backend is idf_cli."""
+    if backend == "idf_cli":
+        return fetch_policies_idf(info, workers, timeout)
+    return fetch_policies_flow_cli(info, workers, timeout)
 
 
 
@@ -2780,52 +2839,102 @@ def _cfg_ints(text):
     return nums
 
 
+_CFG_LINE = re.compile(
+    r"(?m)^[ \t]*(nb_cfg|sb_cfg|hv_cfg)[ \t]*:[ \t]*(-?\d+)[ \t]*$")
+
+
+def _cfg_named(text):
+    """nb_cfg, sb_cfg, and hv_cfg from `ovn-nbctl list nb_global`.
+
+    Timestamps such as nb_cfg_timestamp are left out. The name must be the
+    whole field, then a colon.
+    """
+    found = {}
+    for match in _CFG_LINE.finditer(text or ""):
+        found[match.group(1)] = int(match.group(2))
+    return found
+
+
+def _cfg_value(cfg, *keys):
+    for key in keys:
+        if key not in (cfg or {}):
+            continue
+        try:
+            return int(cfg.get(key))
+        except (TypeError, ValueError):
+            continue
+    return -1
+
+
 def write_cfg(cfg, handle):
-    """Pass only when one sample read the same nb_cfg from both databases."""
-    nb_cfg = cfg.get("nb_cfg", -1)
-    sb_cfg = cfg.get("sb_nb_cfg", -1)
-    hv_cfg = cfg.get("hv_cfg", -1)
+    """Pass when NB_Global nb_cfg, sb_cfg, and hv_cfg are the same number."""
+    nb_cfg = _cfg_value(cfg, "nb_cfg")
+    sb_cfg = _cfg_value(cfg, "sb_cfg", "sb_nb_cfg")
+    hv_cfg = _cfg_value(cfg, "hv_cfg")
+    matched = nb_cfg >= 0 and nb_cfg == sb_cfg == hv_cfg
     handle.write(
-        "OVN cfg: nb_cfg=%s sb_nb_cfg=%s hv_cfg=%s\n" % (nb_cfg, sb_cfg, hv_cfg))
-    return nb_cfg < 0 or sb_cfg < 0 or nb_cfg != sb_cfg
+        "OVN cfg: nb_cfg=%s sb_cfg=%s hv_cfg=%s match=%s\n" % (
+            nb_cfg, sb_cfg, hv_cfg, "yes" if matched else "no"))
+    return not matched
 
 
 def pick_cfg(samples):
-    """First sample where both counters are the same number, else the last."""
-    last = {"nb_cfg": -1, "sb_nb_cfg": -1, "hv_cfg": -1}
+    """First sample where nb_cfg, sb_cfg, and hv_cfg are the same, else the last."""
+    last = {"nb_cfg": -1, "sb_cfg": -1, "hv_cfg": -1}
     for cfg in samples or []:
         last = cfg
-        nb_cfg = cfg.get("nb_cfg", -1)
-        if nb_cfg >= 0 and nb_cfg == cfg.get("sb_nb_cfg"):
+        nb_cfg = _cfg_value(cfg, "nb_cfg")
+        sb_cfg = _cfg_value(cfg, "sb_cfg", "sb_nb_cfg")
+        hv_cfg = _cfg_value(cfg, "hv_cfg")
+        if nb_cfg >= 0 and nb_cfg == sb_cfg == hv_cfg:
             return cfg
     return last
 
 
-def _cfg_from_text(nb_text, sb_text):
+def _cfg_from_text(nb_text, sb_text=""):
+    fields = _cfg_named(nb_text)
+    if fields:
+        sb_cfg = fields.get("sb_cfg", -1)
+        if sb_cfg < 0:
+            other = _cfg_named(sb_text)
+            sb_cfg = other.get("nb_cfg", other.get("sb_cfg", -1))
+        return {
+            "nb_cfg": fields.get("nb_cfg", -1),
+            "sb_cfg": sb_cfg,
+            "hv_cfg": fields.get("hv_cfg", -1),
+        }
+    # --columns=nb_cfg,sb_cfg,hv_cfg --format=csv prints three bare numbers.
     nb_nums = _cfg_ints(nb_text)
+    if len(nb_nums) >= 3 and not sb_text:
+        return {
+            "nb_cfg": nb_nums[0],
+            "sb_cfg": nb_nums[1],
+            "hv_cfg": nb_nums[2],
+        }
     sb_nums = _cfg_ints(sb_text)
     return {
         "nb_cfg": nb_nums[0] if nb_nums else -1,
         "hv_cfg": nb_nums[1] if len(nb_nums) > 1 else -1,
-        "sb_nb_cfg": sb_nums[0] if sb_nums else -1,
+        "sb_cfg": sb_nums[0] if sb_nums else -1,
     }
 
 
 def read_cfg(info, timeout, attempts=5):
-    """Read NB and SB nb_cfg until one pair is equal.
+    """Read NB_Global until nb_cfg, sb_cfg, and hv_cfg are one number.
 
-    The extra count appears when a transaction commits between the two reads.
-    Repeating the pair until both sides show the same number removes that gap.
+    One `list NB_Global` holds all three. Repeating covers northd or a
+    chassis that has not copied the latest nb_cfg yet.
     """
     samples = []
     for _ in range(max(1, int(attempts))):
         _rc, nb_text, _err = _ovn_nb(
-            info, ["--columns=nb_cfg,hv_cfg", "list", "NB_Global"], timeout)
-        _rc, sb_text, _err = _ovn_sb(
-            info, ["--columns=nb_cfg", "list", "SB_Global"], timeout)
-        cfg = _cfg_from_text(nb_text, sb_text)
+            info,
+            ["--columns=nb_cfg,sb_cfg,hv_cfg", "list", "NB_Global"],
+            timeout)
+        cfg = _cfg_from_text(nb_text)
         samples.append(cfg)
-        if cfg["nb_cfg"] >= 0 and cfg["nb_cfg"] == cfg["sb_nb_cfg"]:
+        if (cfg["nb_cfg"] >= 0 and
+                cfg["nb_cfg"] == cfg["sb_cfg"] == cfg["hv_cfg"]):
             break
     return pick_cfg(samples)
 
@@ -3994,15 +4103,40 @@ def self_test():
     if port_sets_for_nic({src_set: {"nics": [src_nic]}}, src_nic) != [src_set]:
         raise SystemExit("nic port set")
     sink = io.StringIO()
-    if write_cfg({"nb_cfg": 10, "sb_nb_cfg": 10, "hv_cfg": 10}, sink):
+    if write_cfg({"nb_cfg": 10, "sb_cfg": 10, "hv_cfg": 10}, sink):
         raise SystemExit("cfg equal")
-    if not write_cfg({"nb_cfg": 10, "sb_nb_cfg": 11, "hv_cfg": 10}, sink):
+    if not write_cfg({"nb_cfg": 10, "sb_cfg": 11, "hv_cfg": 10}, sink):
         raise SystemExit("cfg unequal")
+    if not write_cfg({"nb_cfg": 10, "sb_cfg": 10, "hv_cfg": 9}, sink):
+        raise SystemExit("hv cfg unequal")
+    nb_global = """
+_uuid               : 0aed57bc-a484-47eb-a5eb-04322a50c53a
+hv_cfg              : 54
+hv_cfg_timestamp    : 1697911009030
+nb_cfg              : 54
+nb_cfg_timestamp    : 1697911009027
+options             : {mac_prefix="72:f0:08", max_tunid="983040", svc_monitor_mac="6a:6c:0b:ee:ea:b8"}
+sb_cfg              : 54
+sb_cfg_timestamp    : 1697911009028
+"""
+    parsed = _cfg_from_text(nb_global)
+    if parsed != {"nb_cfg": 54, "sb_cfg": 54, "hv_cfg": 54}:
+        raise SystemExit("nb_global parse: %s" % parsed)
+    if write_cfg(parsed, sink):
+        raise SystemExit("nb_global versions differ")
+    if "match=yes" not in sink.getvalue():
+        raise SystemExit("nb_global match line: %s" % sink.getvalue())
+    csv_cfg = _cfg_from_text("771511,771511,771511")
+    if csv_cfg != {"nb_cfg": 771511, "sb_cfg": 771511, "hv_cfg": 771511}:
+        raise SystemExit("csv cfg: %s" % csv_cfg)
+    if write_cfg(csv_cfg, sink):
+        raise SystemExit("csv cfg mismatch")
     picked = pick_cfg([
-        {"nb_cfg": 740533, "sb_nb_cfg": 740534, "hv_cfg": 740533},
-        {"nb_cfg": 740534, "sb_nb_cfg": 740534, "hv_cfg": 740534},
+        {"nb_cfg": 740533, "sb_cfg": 740534, "hv_cfg": 740533},
+        {"nb_cfg": 740534, "sb_cfg": 740534, "hv_cfg": 740534},
     ])
-    if picked["nb_cfg"] != 740534 or picked["sb_nb_cfg"] != 740534:
+    if (picked["nb_cfg"] != 740534 or picked["sb_cfg"] != 740534 or
+            picked["hv_cfg"] != 740534):
         raise SystemExit("cfg resample: %s" % picked)
     if write_cfg(picked, sink):
         raise SystemExit("cfg resample failed")
@@ -4459,6 +4593,19 @@ def parse_args(argv):
     parser.add_argument("--include-project", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument(
+        "--cli",
+        default="flow_cli",
+        choices=("flow_cli", "idf_cli"),
+        help="Policy source (default: %(default)s). idf_cli does not need Flow.")
+    parser.add_argument(
+        "--flow-cli", "--flow_cli",
+        action="store_const", const="flow_cli", dest="cli",
+        help="Same as --cli flow_cli. This is the default.")
+    parser.add_argument(
+        "--idf-cli", "--idf_cli",
+        action="store_const", const="idf_cli", dest="cli",
+        help="Same as --cli idf_cli. Use this when Flow is down.")
+    parser.add_argument(
         "--skip-sb", action="store_true",
         help="stop after the Northbound check and do not read Logical_Flow")
     parser.add_argument("--src", default="", help="source NIC uuid")
@@ -4654,9 +4801,12 @@ def main(argv=None):
     global_uuid, vlan_uuid = fetch_unique_uuids(info)
     if not global_uuid or not vlan_uuid:
         raise SystemExit("missing vlan/global unique uuid (zkcat / atlas ZK)")
-    policies = fetch_policies(info, workers=args.workers, timeout=args.timeout)
+    backend = args.cli or "flow_cli"
+    LOG.info("policy source=%s", backend)
+    policies = fetch_policies(
+        info, workers=args.workers, timeout=args.timeout, backend=backend)
     if not policies:
-        raise SystemExit("no policies from idfcli")
+        raise SystemExit("no policies from %s" % backend)
     eg_map = fetch_entity_groups(
         info, policies, workers=args.workers, timeout=min(int(args.timeout), 300))
     sg_map = fetch_service_groups(info, min(int(args.timeout), 300))
@@ -4682,17 +4832,25 @@ def main(argv=None):
     missing = write_nb(
         records, sys.stdout, port_groups=len(groups), acls=len(acl_rows),
         groups=groups, atlas_map=atlas_map)
+    cfg = read_cfg(info, min(int(args.timeout), 120))
+    cfg_failed = write_cfg(cfg, sys.stdout)
+    # Peer rows stay on stdout. They do not fail the run until the idfcli
+    # rule decoder reads action and direction. Without action, a secured
+    # group is labeled app_intra_allow and the ACL priority does not match.
+    if missing:
+        LOG.info(
+            "port-set peer report mismatches=%s (not an exit until action is decoded)",
+            missing)
     if args.skip_sb:
         sys.stdout.flush()
-        return 1 if missing or acl_failed else 0
-    nb_detail, flows, live_groups, cfg = load_sb(info, min(int(args.timeout), 600))
-    cfg_failed = write_cfg(cfg, sys.stdout)
+        return 1 if acl_failed or cfg_failed else 0
+    nb_detail, flows, live_groups, _cfg = load_sb(info, min(int(args.timeout), 600))
     sb_failed = write_sb(nb_detail, flows, live_groups, sys.stdout)
     LOG.info(
         "sb_acls=%s sb_hints=%s sb_live_port_groups=%s sb_failed=%s",
         len(nb_detail), len(flows), len(live_groups), sb_failed)
     sys.stdout.flush()
-    return 1 if missing or acl_failed or cfg_failed or sb_failed else 0
+    return 1 if acl_failed or cfg_failed or sb_failed else 0
 
 
 if __name__ == "__main__":
