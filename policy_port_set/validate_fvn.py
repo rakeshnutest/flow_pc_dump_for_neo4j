@@ -1183,7 +1183,6 @@ def collect(timeout):
     router_text = grab(
         "nb_router",
         lambda: ovn_csv("nb", "name,static_routes", "Logical_Router", timeout), "")
-    router_map = _route_maps(router_text, route_ids)
     scaleout = _scaleout_ports(grab(
         "nb_router_ports",
         lambda: ovn_csv("nb", "name,ports", "Logical_Router", timeout), ""))
@@ -1210,6 +1209,12 @@ def collect(timeout):
         "sb_private",
         lambda: ovn_csv("sb", "_uuid,name,nb_cfg", "Chassis_Private", timeout), ""))
     learned = _learned_rows(prefix_text)
+    learned_uuids = set(row.get("route_uuid", "").lower() for row in learned)
+    static_route_ids = "\n".join(
+        line for line in (route_ids or "").splitlines()
+        if line.strip() and line.split(",", 1)[0].strip().strip('"').lower()
+        not in learned_uuids)
+    router_map = _route_maps(router_text, static_route_ids)
     ic_text = grab(
         "ic",
         lambda: ovn_ic_csv("_uuid,ip_prefix,nexthop,origin", "Route", timeout), "")
