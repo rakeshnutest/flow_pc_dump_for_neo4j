@@ -44,8 +44,9 @@ names. CVM vnet devices are not taps. Each stale tap is a row in the
 output and a miss.
 
 An empty BGP or L2 gateway table is a pass. Stdout is the summary plus
-tables for cfg, learned routes, and stale taps. Exit 0 when nothing is
-missing.
+tables for cfg, learned routes, and stale taps. A failed fetch or a
+failed host is one error line for that check. The other checks still
+run. Exit 0 when nothing is missing.
 
   python3 validate_fvn.py
   python3 validate_fvn.py --self-test
@@ -867,8 +868,37 @@ def write_cfg_table(rows, chassis, handle):
     return len(misses)
 
 
-def write_learned_tables(learned, ic_prefixes, ic_rows, owners, vpc_names, handle):
-    """Print every installed learned route, then IC routes no router learned."""
+def write_learned_tables(learned, ic_prefixes, ic_rows, owners, vpc_names, handle, ic_error=""):
+    """Print every installed learned route, then IC routes no router learned.
+
+    An IC fetch failure is one miss. It does not mark every installed
+    route as a prefix mismatch.
+    """
+    if ic_error:
+        handle.write(
+            "FVN learned: installed=%s ic=0 not_installed=0 missing=1\n" % len(learned or []))
+        handle.write("learned note: IC fetch failed: %s\n" % ic_error)
+        skipped = []
+        for row in learned or []:
+            router = owners.get(row.get("route_uuid") or "", "")
+            vpc = _vpc_from_router(router)
+            skipped.append({
+                "router": router,
+                "vpc": vpc,
+                "vpc_name": vpc_names.get(vpc, ""),
+                "prefix": row.get("prefix") or "",
+                "nexthop": row.get("nexthop") or "",
+                "origin": row.get("origin") or "",
+                "route_uuid": row.get("route_uuid") or "",
+                "ic_route": row.get("ic_route") or "",
+                "ic_prefix": "",
+                "match": "not_checked",
+                "detail": ic_error,
+            })
+        _tsv(handle, [
+            "router", "vpc", "vpc_name", "prefix", "nexthop", "origin",
+            "route_uuid", "ic_route", "ic_prefix", "match", "detail"], skipped)
+        return 1
     records, mismatches = learned_records(learned, ic_prefixes, owners, vpc_names)
     installed = set(row.get("ic_route") or "" for row in records)
     extra = [row for row in ic_rows or [] if row.get("ic_route") not in installed]
@@ -1009,6 +1039,24 @@ def _bridges(text, wanted):
 
 def _scan_host(item, timeout):
     name, ip = item
+    try:
+        return _scan_host_ok(item, timeout)
+    except (Exception, SystemExit) as err:
+        detail = "host check failed: %s" % str(err).split("\n", 1)[0][:200]
+        LOG.warning("tap %s %s %s", name, ip, detail)
+        return name, ip, 0, [{
+            "host": name,
+            "ip": ip,
+            "tap": "",
+            "bridge": "",
+            "state": "",
+            "mac": "",
+            "detail": detail,
+        }]
+
+
+def _scan_host_ok(item, timeout):
+    name, ip = item
     link = _bugtool_member(
         ip, "networking-lite", "commands/ip_-s_link.stdout",
         HEALTH_CERT, HEALTH_KEY, min(timeout, 60))
@@ -1037,11 +1085,18 @@ def _scan_host(item, timeout):
 
 
 def scan_taps(timeout):
-    """Taps present on a host and absent from every VM NIC on that host."""
+    """Taps present on a host and absent from every VM NIC on that host.
+
+    A missing cert or a failed host list is an error string. One host
+    that fails is one row. The other hosts are still checked.
+    """
     for path in (HEALTH_CERT, HEALTH_KEY, GENESIS_CERT, GENESIS_KEY):
         if not os.path.isfile(path):
-            raise SystemExit("AHV Gateway cert missing: %s" % path)
-    hosts = _ncli_hosts(timeout)
+            return [], [], "AHV Gateway cert missing: %s" % path
+    try:
+        hosts = _ncli_hosts(timeout)
+    except (Exception, SystemExit) as err:
+        return [], [], str(err).split("\n", 1)[0][:300]
     rows = []
     LOG.info("tap hosts=%s", len(hosts))
     with ThreadPoolExecutor(max_workers=4) as pool:
@@ -1051,10 +1106,14 @@ def scan_taps(timeout):
             LOG.info("tap %s %s devices=%s stale=%s", name, ip, count, len(stale))
             rows.extend(stale)
     rows.sort(key=lambda row: (row["host"], row["tap"]))
-    return hosts, rows
+    return hosts, rows, ""
 
 
-def write_tap_table(hosts, rows, handle):
+def write_tap_table(hosts, rows, handle, error=""):
+    if error:
+        handle.write("FVN tap: hosts=%s missing=1\n" % len(hosts))
+        handle.write("tap note: %s\n" % error)
+        return 1
     handle.write(
         "FVN tap: hosts=%s missing=%s\n" % (len(hosts), len(rows)))
     handle.write(
@@ -1064,64 +1123,120 @@ def write_tap_table(hosts, rows, handle):
     return len(rows)
 
 
+def _catch(errors, key, fn, default):
+    """Run one fetch. A failure is recorded and the other fetches still run."""
+    try:
+        return fn()
+    except (Exception, SystemExit) as err:
+        errors[key] = str(err).split("\n", 1)[0][:240]
+        LOG.warning("%s failed: %s", key, errors[key])
+        return default
+
+
 def collect(timeout):
-    subnets = idf_entities("atlas_subnet", timeout)
-    routers = idf_entities("atlas_virtual_network", timeout)
-    routes = idf_entities("atlas_route_table", timeout)
-    stretches = idf_entities("layer2_stretch", timeout)
-    if not stretches:
-        stretches = idf_entities("atlas_layer2_stretch", timeout)
-    sessions = idf_entities("bgp_session", timeout)
-    if not sessions:
-        sessions = idf_entities("atlas_bgp_session", timeout)
+    errors = {}
+
+    def grab(key, fn, default):
+        return _catch(errors, key, fn, default)
+
+    subnets = grab("idf_subnet", lambda: idf_entities("atlas_subnet", timeout), [])
+    routers = grab(
+        "idf_router", lambda: idf_entities("atlas_virtual_network", timeout), [])
+    routes = grab("idf_route", lambda: idf_entities("atlas_route_table", timeout), [])
+    stretches = grab("idf_l2", lambda: idf_entities("layer2_stretch", timeout), [])
+    if not stretches and "idf_l2" not in errors:
+        stretches = grab(
+            "idf_l2", lambda: idf_entities("atlas_layer2_stretch", timeout), [])
+    sessions = grab("idf_bgp", lambda: idf_entities("bgp_session", timeout), [])
+    if not sessions and "idf_bgp" not in errors:
+        sessions = grab(
+            "idf_bgp", lambda: idf_entities("atlas_bgp_session", timeout), [])
     atlas = {
-        "subnet": _uuids_from(atlas_rows("subnet.list", timeout), "uuid"),
-        "router": _uuids_from(atlas_rows("network.list", timeout), "uuid"),
-        "route": _uuids_from(atlas_rows("route_table.list", timeout), "uuid"),
-        "l2gw": _uuids_from(atlas_rows("layer2_stretch.list", timeout), "uuid"),
-        "bgp": _uuids_from(atlas_rows("bgp_session.list", timeout), "uuid"),
+        "subnet": grab(
+            "atlas_subnet",
+            lambda: _uuids_from(atlas_rows("subnet.list", timeout), "uuid"), set()),
+        "router": grab(
+            "atlas_router",
+            lambda: _uuids_from(atlas_rows("network.list", timeout), "uuid"), set()),
+        "route": grab(
+            "atlas_route",
+            lambda: _uuids_from(atlas_rows("route_table.list", timeout), "uuid"), set()),
+        "l2gw": grab(
+            "atlas_l2",
+            lambda: _uuids_from(atlas_rows("layer2_stretch.list", timeout), "uuid"), set()),
+        "bgp": grab(
+            "atlas_bgp",
+            lambda: _uuids_from(atlas_rows("bgp_session.list", timeout), "uuid"), set()),
     }
-    switches = set(name.lower() for name in _names(ovn_csv(
-        "nb", "name", "Logical_Switch", timeout)))
-    prefix_text = ovn_csv(
-        "nb", "_uuid,ip_prefix,nexthop,options,external_ids",
-        "Logical_Router_Static_Route", timeout)
-    # _route_maps still keys prefixes by route uuid. Fetch that pair too.
-    route_ids = ovn_csv(
-        "nb", "_uuid,ip_prefix", "Logical_Router_Static_Route", timeout)
-    router_text = ovn_csv("nb", "name,static_routes", "Logical_Router", timeout)
+    switches = set(name.lower() for name in _names(grab(
+        "nb_switch", lambda: ovn_csv("nb", "name", "Logical_Switch", timeout), "")))
+    prefix_text = grab(
+        "nb_learned",
+        lambda: ovn_csv(
+            "nb", "_uuid,ip_prefix,nexthop,options,external_ids",
+            "Logical_Router_Static_Route", timeout),
+        "")
+    route_ids = grab(
+        "nb_route_id",
+        lambda: ovn_csv("nb", "_uuid,ip_prefix", "Logical_Router_Static_Route", timeout),
+        "")
+    router_text = grab(
+        "nb_router",
+        lambda: ovn_csv("nb", "name,static_routes", "Logical_Router", timeout), "")
     router_map = _route_maps(router_text, route_ids)
-    scaleout = _scaleout_ports(ovn_csv("nb", "name,ports", "Logical_Router", timeout))
-    lrp_names = _lrp_names(ovn_csv("nb", "_uuid,name", "Logical_Router_Port", timeout))
-    rc_by_name = _rc_by_name(ovn_csv(
-        "nb", "name,options,status", "Logical_Router_Port", timeout))
-    sb_text = ovn_csv("sb", "external_ids", "Datapath_Binding", timeout)
+    scaleout = _scaleout_ports(grab(
+        "nb_router_ports",
+        lambda: ovn_csv("nb", "name,ports", "Logical_Router", timeout), ""))
+    lrp_names = _lrp_names(grab(
+        "nb_lrp_name",
+        lambda: ovn_csv("nb", "_uuid,name", "Logical_Router_Port", timeout), ""))
+    rc_by_name = _rc_by_name(grab(
+        "nb_lrp_opt",
+        lambda: ovn_csv("nb", "name,options,status", "Logical_Router_Port", timeout), ""))
+    sb_text = grab(
+        "sb_dp", lambda: ovn_csv("sb", "external_ids", "Datapath_Binding", timeout), "")
     sb_names = _sb_names(sb_text)
-    binding_text = ovn_csv(
-        "sb", "logical_port,chassis,options", "Port_Binding", timeout)
+    binding_text = grab(
+        "sb_bind",
+        lambda: ovn_csv("sb", "logical_port,chassis,options", "Port_Binding", timeout), "")
     sb_gateway = _sb_gateway(binding_text)
     sb_redirect = _sb_redirect(binding_text)
-    chassis_names = _chassis_names(ovn_csv("sb", "_uuid,name", "Chassis", timeout))
-    cfg_rows = _cfg_rows(ovn_csv(
-        "nb", "_uuid,nb_cfg,sb_cfg,hv_cfg", "NB_Global", timeout))
-    chassis_rows = _chassis_rows(ovn_csv(
-        "sb", "_uuid,name,nb_cfg", "Chassis_Private", timeout))
+    chassis_names = _chassis_names(grab(
+        "sb_chassis", lambda: ovn_csv("sb", "_uuid,name", "Chassis", timeout), ""))
+    cfg_rows = _cfg_rows(grab(
+        "nb_global",
+        lambda: ovn_csv("nb", "_uuid,nb_cfg,sb_cfg,hv_cfg", "NB_Global", timeout), ""))
+    chassis_rows = _chassis_rows(grab(
+        "sb_private",
+        lambda: ovn_csv("sb", "_uuid,name,nb_cfg", "Chassis_Private", timeout), ""))
     learned = _learned_rows(prefix_text)
-    ic_prefixes, ic_rows = _ic_routes(ovn_ic_csv(
-        "_uuid,ip_prefix,nexthop,origin", "Route", timeout))
+    ic_text = grab(
+        "ic",
+        lambda: ovn_ic_csv("_uuid,ip_prefix,nexthop,origin", "Route", timeout), "")
+    if "ic" in errors:
+        ic_prefixes, ic_rows = {}, []
+    else:
+        ic_prefixes, ic_rows = _ic_routes(ic_text)
     route_owners = _route_owners(router_text)
-    tap_hosts, taps = scan_taps(timeout)
+    tap_hosts, taps, tap_error = scan_taps(timeout)
+    if tap_error:
+        errors["tap"] = tap_error
     LOG.info(
-        "rc ports=%s learned=%s ic=%s cfg=%s chassis=%s taps=%s",
+        "rc ports=%s learned=%s ic=%s cfg=%s chassis=%s taps=%s errors=%s",
         len(rc_by_name), len(learned), len(ic_prefixes),
-        len(cfg_rows), len(chassis_rows), len(taps))
+        len(cfg_rows), len(chassis_rows), len(taps), len(errors))
     nb_extra = ""
     sb_extra = sb_text
     if stretches or sessions:
-        nb_extra = ovn_csv("nb", "name,external_ids", "Logical_Switch_Port", timeout)
+        nb_extra = grab(
+            "nb_lsp",
+            lambda: ovn_csv("nb", "name,external_ids", "Logical_Switch_Port", timeout),
+            "")
         nb_extra += "\n" + router_text
-        sb_extra += "\n" + ovn_csv(
-            "sb", "logical_port,external_ids", "Port_Binding", timeout)
+        sb_extra += "\n" + grab(
+            "sb_port",
+            lambda: ovn_csv("sb", "logical_port,external_ids", "Port_Binding", timeout),
+            "")
     return {
         "subnets": subnets,
         "routers": routers,
@@ -1149,50 +1264,154 @@ def collect(timeout):
         "vpc_names": _vpc_names(routers),
         "tap_hosts": tap_hosts,
         "taps": taps,
+        "errors": errors,
     }
+
+
+def _limit(misses, kind, errors, mapping):
+    """Drop per-object misses for a fetch that failed, and keep one error."""
+    out = []
+    noted = set()
+    for miss in misses:
+        key = mapping.get(miss.get("where"))
+        if key and errors.get(key):
+            if key not in noted:
+                noted.add(key)
+                out.append(_miss(kind, "", "", miss.get("where"), "", errors[key]))
+            continue
+        out.append(miss)
+    for where, key in mapping.items():
+        if errors.get(key) and key not in noted:
+            noted.add(key)
+            out.append(_miss(kind, "", "", where, "", errors[key]))
+    return out
+
+
+def _safe(handle, label, fn):
+    try:
+        return fn()
+    except (Exception, SystemExit) as err:
+        handle.write(
+            "FVN %s: missing=1 error=%s\n" % (
+                label, str(err).split("\n", 1)[0][:240]))
+        return 1
 
 
 def run_checks(data, handle):
     atlas = data["atlas"]
+    errors = data.get("errors") or {}
     total = 0
-    total += write_report(
-        "subnet", _count(data["subnets"]), len(atlas["subnet"]),
-        check_subnets(data["subnets"], atlas["subnet"], data["switches"], data["sb_names"]),
-        handle)
-    total += write_report(
-        "router", _count(data["routers"]), len(atlas["router"]),
-        check_routers(data["routers"], atlas["router"], data["router_map"], data["sb_names"]),
-        handle)
-    total += write_report(
-        "route", _count(data["routes"]), len(atlas["route"]),
-        check_routes(data["routes"], atlas["route"], data["router_map"], data["sb_names"]),
-        handle)
-    total += write_report(
-        "l2gw", _count(data["stretches"]), len(atlas["l2gw"]),
-        check_named(
-            "l2gw", data["stretches"], atlas["l2gw"], data["nb_extra"], data["sb_extra"],
-            "Logical_Switch_Port", "Port_Binding"),
-        handle)
-    total += write_report(
-        "bgp", _count(data["sessions"]), len(atlas["bgp"]),
-        check_named(
-            "bgp", data["sessions"], atlas["bgp"], data["nb_extra"], data["sb_extra"],
-            "Logical_Router", "Datapath_Binding"),
-        handle)
-    rc_misses, rc_checked = check_rc(
-        data["routers"], data["lrp_names"], data["rc_by_name"],
-        data["sb_gateway"], data["scaleout"])
-    transit_misses, transit_checked = check_transit(
-        data["rc_by_name"], data["sb_redirect"], data["chassis_names"])
-    rc_misses.extend(transit_misses)
-    rc_checked += transit_checked
-    total += write_report("rc", rc_checked, rc_checked, rc_misses, handle)
-    total += write_cfg_table(data["cfg_rows"], data["chassis_rows"], handle)
-    total += write_learned_tables(
-        data["learned"], data["ic_prefixes"], data.get("ic_rows") or [],
-        data.get("route_owners") or {}, data.get("vpc_names") or {}, handle)
-    total += write_tap_table(
-        data.get("tap_hosts") or [], data.get("taps") or [], handle)
+
+    def subnet():
+        if errors.get("idf_subnet"):
+            handle.write("FVN subnet: idf=0 atlas=0 missing=1\n")
+            handle.write("FVN subnet fetch: error=%s\n" % errors["idf_subnet"])
+            return 1
+        misses = _limit(
+            check_subnets(
+                data["subnets"], atlas["subnet"], data["switches"], data["sb_names"]),
+            "subnet", errors,
+            {"atlas": "atlas_subnet", "nb": "nb_switch", "sb": "sb_dp"})
+        return write_report(
+            "subnet", _count(data["subnets"]), len(atlas["subnet"]), misses, handle)
+
+    def router():
+        if errors.get("idf_router"):
+            handle.write("FVN router: idf=0 atlas=0 missing=1\n")
+            handle.write("FVN router fetch: error=%s\n" % errors["idf_router"])
+            return 1
+        misses = _limit(
+            check_routers(
+                data["routers"], atlas["router"], data["router_map"], data["sb_names"]),
+            "router", errors,
+            {"atlas": "atlas_router", "nb": "nb_router", "sb": "sb_dp"})
+        return write_report(
+            "router", _count(data["routers"]), len(atlas["router"]), misses, handle)
+
+    def route():
+        if errors.get("idf_route"):
+            handle.write("FVN route: idf=0 atlas=0 missing=1\n")
+            handle.write("FVN route fetch: error=%s\n" % errors["idf_route"])
+            return 1
+        nb_key = "nb_route_id" if errors.get("nb_route_id") else "nb_router"
+        misses = _limit(
+            check_routes(
+                data["routes"], atlas["route"], data["router_map"], data["sb_names"]),
+            "route", errors,
+            {"atlas": "atlas_route", "nb": nb_key, "sb": "sb_dp"})
+        return write_report(
+            "route", _count(data["routes"]), len(atlas["route"]), misses, handle)
+
+    def named(label, rows, atlas_key, idf_key, atlas_err, nb_expect, sb_expect, nb_key, sb_key):
+        if errors.get(idf_key):
+            handle.write("FVN %s: idf=0 atlas=0 missing=1\n" % label)
+            handle.write("FVN %s fetch: error=%s\n" % (label, errors[idf_key]))
+            return 1
+        misses = _limit(
+            check_named(
+                label, rows, atlas[atlas_key], data["nb_extra"], data["sb_extra"],
+                nb_expect, sb_expect),
+            label, errors, {"atlas": atlas_err, "nb": nb_key, "sb": sb_key})
+        return write_report(label, _count(rows), len(atlas[atlas_key]), misses, handle)
+
+    def rc():
+        blocked = [errors[key] for key in (
+            "idf_router", "nb_lrp_name", "nb_lrp_opt", "nb_router_ports")
+            if errors.get(key)]
+        if blocked:
+            handle.write("FVN rc: idf=0 atlas=0 missing=1\n")
+            handle.write("FVN rc fetch: error=%s\n" % blocked[0])
+            return 1
+        misses, checked = check_rc(
+            data["routers"], data["lrp_names"], data["rc_by_name"],
+            data["sb_gateway"], data["scaleout"])
+        transit_misses, transit_checked = check_transit(
+            data["rc_by_name"], data["sb_redirect"], data["chassis_names"])
+        misses.extend(transit_misses)
+        if errors.get("sb_bind"):
+            misses = [m for m in misses if "l3gateway-chassis" not in m.get("detail", "")]
+            misses.append(_miss("rc", "", "", "sb", "", errors["sb_bind"]))
+        if errors.get("sb_chassis"):
+            misses = [m for m in misses if "cr-lrp chassis" not in m.get("detail", "")]
+            misses.append(_miss("rc", "", "", "sb", "", errors["sb_chassis"]))
+        return write_report("rc", checked + transit_checked, checked + transit_checked, misses, handle)
+
+    def cfg():
+        blocked = [errors[key] for key in ("nb_global", "sb_private") if errors.get(key)]
+        if blocked:
+            handle.write("FVN cfg: nb_global=0 chassis=0 missing=1\n")
+            handle.write("FVN cfg fetch: error=%s\n" % blocked[0])
+            return 1
+        return write_cfg_table(data["cfg_rows"], data["chassis_rows"], handle)
+
+    def learned():
+        if errors.get("nb_learned"):
+            handle.write("FVN learned: installed=0 ic=0 not_installed=0 missing=1\n")
+            handle.write("FVN learned fetch: error=%s\n" % errors["nb_learned"])
+            return 1
+        return write_learned_tables(
+            data["learned"], data["ic_prefixes"], data.get("ic_rows") or [],
+            data.get("route_owners") or {}, data.get("vpc_names") or {}, handle,
+            ic_error=errors.get("ic") or "")
+
+    def tap():
+        return write_tap_table(
+            data.get("tap_hosts") or [], data.get("taps") or [], handle,
+            error=errors.get("tap") or "")
+
+    total += _safe(handle, "subnet", subnet)
+    total += _safe(handle, "router", router)
+    total += _safe(handle, "route", route)
+    total += _safe(handle, "l2gw", lambda: named(
+        "l2gw", data["stretches"], "l2gw", "idf_l2", "atlas_l2",
+        "Logical_Switch_Port", "Port_Binding", "nb_lsp", "sb_port"))
+    total += _safe(handle, "bgp", lambda: named(
+        "bgp", data["sessions"], "bgp", "idf_bgp", "atlas_bgp",
+        "Logical_Router", "Datapath_Binding", "nb_router", "sb_dp"))
+    total += _safe(handle, "rc", rc)
+    total += _safe(handle, "cfg", cfg)
+    total += _safe(handle, "learned", learned)
+    total += _safe(handle, "tap", tap)
     return total
 
 
@@ -1296,6 +1515,36 @@ def self_test():
     for token in ("vpc-1", "192.0.2.1/32", "169.254.3.2", learned, "router_" + vpc):
         if token not in clean:
             raise SystemExit("learned route detail missing %s:\n%s" % (token, clean))
+    isolated, iso_subnet, _vpc, _node, _learned, _chassis = _sample()
+    isolated["errors"] = {
+        "nb_switch": "ovn-nbctl Logical_Switch failed",
+        "tap": "AHV Gateway cert missing",
+    }
+    isolated["switches"] = set()
+    buf = io.StringIO()
+    if run_checks(isolated, buf) < 2:
+        raise SystemExit("a failed fetch should count for that check only:\n%s" % buf.getvalue())
+    isolated_text = buf.getvalue()
+    if iso_subnet in isolated_text:
+        raise SystemExit("switch fetch failure became a per-subnet miss:\n%s" % isolated_text)
+    if "Logical_Switch failed" not in isolated_text or "AHV Gateway cert missing" not in isolated_text:
+        raise SystemExit("failed checks were not reported:\n%s" % isolated_text)
+    if "FVN router: idf=1 atlas=1 missing=0" not in isolated_text:
+        raise SystemExit("router check was affected by the switch failure:\n%s" % isolated_text)
+    if "192.0.2.1/32" not in isolated_text:
+        raise SystemExit("learned routes were dropped after the switch failure:\n%s" % isolated_text)
+    saved = _scan_host_ok
+
+    def boom(item, timeout):
+        raise RuntimeError("gateway timeout")
+
+    globals()["_scan_host_ok"] = boom
+    try:
+        name, ip, count, rows = _scan_host(("flashfire02-3", "10.116.29.174"), 1)
+    finally:
+        globals()["_scan_host_ok"] = saved
+    if count != 0 or not rows or "gateway timeout" not in rows[0]["detail"]:
+        raise SystemExit("one host failure was not contained: %s" % (rows,))
     data, _subnet, _vpc, _node, _learned, _chassis = _sample()
     data["ic_rows"] = [{
         "ic_route": "77777777-7777-4777-8777-777777777777",
@@ -1356,7 +1605,12 @@ def main(argv):
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         stream=sys.stderr)
-    data = collect(args.timeout)
+    try:
+        data = collect(args.timeout)
+    except (Exception, SystemExit) as err:
+        sys.stdout.write(
+            "FVN collect: missing=1 error=%s\n" % str(err).split("\n", 1)[0][:240])
+        return 1
     missing = run_checks(data, sys.stdout)
     sys.stdout.flush()
     return 1 if missing else 0

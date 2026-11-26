@@ -34,7 +34,7 @@ python3 validate_fvn.py --self-test
 
 Stdout is one summary line per check, then one JSON object per learned route, then one JSON object per miss. Logging goes to stderr. Exit status is 0 when no miss is printed, and 1 when any miss is printed. Learned routes with `match` `yes` are printed and are not misses. An empty L2 gateway table or an empty BGP table is a pass.
 
-The check direction for subnets, routers, and static routes is IDF toward Atlas, Northbound, and Southbound. An Atlas object that IDF does not list is not a failure. An IC route that no router learned is a failure. A missing IDF entity type (`NotFound`) is an empty list. An Atlas command whose status is not 0 stops the run.
+The check direction for subnets, routers, and static routes is IDF toward Atlas, Northbound, and Southbound. An Atlas object that IDF does not list is not a failure. An IC route that no router learned is a failure. A missing IDF entity type (`NotFound`) is an empty list. A failed command is one error on the check that needed it. That check does not turn the failed fetch into a miss for every object, and the other checks still print. One hypervisor that fails the tap scan is one tap row. The other hosts are still checked.
 
 ## Where the commands run
 
