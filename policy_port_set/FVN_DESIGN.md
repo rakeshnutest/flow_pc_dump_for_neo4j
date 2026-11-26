@@ -185,8 +185,9 @@ The match is:
 Every learned route is printed, including the ones that match. A row with `match` `no` is a miss and makes the process exit 1. The learned prefix is not required to be in the IDF route table. An IC route that no Northbound router has installed is not a failure. Origin is printed and is not compared.
 
 ```
-FVN learned: idf=680 atlas=740 missing=0
-{"detail":"","ic_prefix":"192.168.210.190/32","ic_route":"f18ade14-b838-4ffc-a8b1-871dcdf119cc","kind":"learned","match":"yes","nexthop":"169.254.3.2","origin":"loadbalancer","prefix":"192.168.210.190/32","route_uuid":"6c647006-0415-4503-9b6d-e4cf68f0161e","router":"router_f1a6fb6d-02a7-4225-97d4-8fc2b725022b","vpc":"f1a6fb6d-02a7-4225-97d4-8fc2b725022b","vpc_name":"VPC_California_SJ_Pheonix_Customer_41"}
+FVN learned: installed=680 ic=740 not_installed=60 missing=0
+router	vpc	vpc_name	prefix	nexthop	origin	route_uuid	ic_route	ic_prefix	match	detail
+router_f1a6fb6d-02a7-4225-97d4-8fc2b725022b	f1a6fb6d-02a7-4225-97d4-8fc2b725022b	VPC_California_SJ_Pheonix_Customer_41	192.168.210.190/32	169.254.3.2	loadbalancer	6c647006-0415-4503-9b6d-e4cf68f0161e	f18ade14-b838-4ffc-a8b1-871dcdf119cc	192.168.210.190/32	yes
 ```
 
 | Field | Meaning |
@@ -200,17 +201,21 @@ FVN learned: idf=680 atlas=740 missing=0
 
 ## Stale tap interfaces
 
-This is a host check, separate from the IDF-to-OVN script. A tap is stale when the host still has the device and OVS still has the port, but no VM NIC on that host names it.
+The same run prints stale taps. A tap is stale when `ip -s link` on the hypervisor still has `tap<number>` and no VM NIC on that host has `status.backend.tapname` set to that name. CVM NICs are `vnet<number>` and are not counted.
 
-For each of the 32 hypervisors from `ncli host list`:
+For each hypervisor from `ncli host list`:
 
-1. AHV Gateway `networking-lite` gives `ip -s link`. Every `tap<number>` in that output is a live netdev.
-2. The same host's full `networking` bugtool gives `ovs-vsctl show`. Every `Interface tap<number>` is an OVS port. An `error:` line on that interface is a tap whose netdev is already gone.
-3. AHV Gateway `GET /api/vmm/v1/vms` and `GET /api/vmm/v1/vms/<id>` give each NIC `status.backend.tapname`. Those names are the taps a running VM still owns.
+1. AHV Gateway `networking-lite` is `ip -s link`. Every `tap<number>` there is a live netdev.
+2. `GET /api/vmm/v1/vms` and `GET /api/vmm/v1/vms/<id>` give each NIC `tapname`.
+3. A name in the first set and not the second is a miss. For those names only, `ovs-vsctl show` from the networking bugtool supplies the bridge.
 
-OVS tap names and `ip link` tap names were equal on all 32 hosts, and no interface had an `error:` line. The stale set is therefore `ip link` taps minus VM `tapname` values. CVM NICs are named `vnet<number>` (three per host, `vnet6`–`vnet8` or `vnet9`–`vnet11`). They are not taps and are not counted.
+```
+FVN tap: hosts=32 missing=1
+host	ip	tap	bridge	state	mac	detail
+flashfire02-3	10.116.29.174	tap291	brAtlas	DOWN	fe:6b:8d:59:1b:81	no VM NIC has tapname tap291
+```
 
-One host failed that set difference. `flashfire02-3` (`10.116.29.174`) has `tap291` on bridge `brAtlas`. `ip -s link` shows it `DOWN`, `NO-CARRIER`, zero RX and TX packets, MAC `fe:6b:8d:59:1b:81`. No VM NIC on that host has `tapname` `tap291`. The other 31 hosts have every `tap<number>` owned by a VM NIC.
+`tap291` is `DOWN` with `NO-CARRIER` and zero packets. The other 31 hosts had every `tap<number>` owned by a VM NIC. `missing` here is the number of stale taps, and it makes the process exit 1.
 
 ## What the check does not decide
 
@@ -222,7 +227,7 @@ One host failed that set difference. `flashfire02-3` (`10.116.29.174`) has `tap2
 
 ## Result on one CMSP PC
 
-Exit status 0.
+Subnet, router, route, L2 gateway, BGP, and redirect chassis had nothing missing. Cfg was even on that read (`missing=0`). Learned routes matched (`missing=0`) with 60 IC routes not installed. The tap table had one miss, so the process exited 1.
 
 ```
 FVN subnet: idf=1883 atlas=1883 missing=0
@@ -233,10 +238,36 @@ FVN bgp: idf=0 atlas=0 missing=0
 FVN rc: idf=210 atlas=210 missing=0
 FVN cfg: nb_global=1 chassis=32 missing=0
 FVN learned: installed=680 ic=740 not_installed=60 missing=0
+FVN tap: hosts=32 missing=1
 ```
 
-`nb_global=1` and `chassis=32` are different tables. One `NB_Global` row is the version the database has published. Each of the 32 `Chassis_Private` rows is one host. The counts are not supposed to be equal. `missing` is hosts or the global row whose `nb_cfg` / `sb_cfg` / `hv_cfg` disagree. A later read on this PC caught `hv_cfg` and three chassis one or two versions behind `nb_cfg`, which is a real lag, not the 1-versus-32 count.
+`nb_global=1` and `chassis=32` are different tables. One `NB_Global` row is the version the database has published. Each of the 32 `Chassis_Private` rows is one host. The counts are not supposed to be equal. `missing` is a row whose `nb_cfg`, `sb_cfg`, or `hv_cfg` disagrees. A later read caught a real lag, not the 1-versus-32 count. Northbound and southbound were `772424` and `hv_cfg` was still `772422`:
 
-`installed=680` and `ic=740` are also different tables. Every installed route matched its IC prefix (`missing=0`). The other 60 IC routes are `origin=connected` prefixes in `172.31.30.0/27` through `172.31.37.0/27`, nexthop `169.254.3.1`. IC advertised them and no router on this PC learned them. The script prints those 60 under `FVN learned_not_installed` and prints all 680 installed routes as a table with router, VPC, prefix, nexthop, origin, and both uuids.
+```
+table	uuid	name	nb_cfg	sb_cfg	hv_cfg	expected	match	detail
+NB_Global	9bc7b588-9d8d-4c86-b839-370f5228f2b2		772424	772424	772422	772424	no	nb_cfg=772424 sb_cfg=772424 hv_cfg=772422
+Chassis_Private	476643a2-26d2-4655-a501-f269040e12d8	8d18b494-05db-4911-9272-28bff2114e0b	772423			772424	no	nb_cfg=772423 expected=772424
+Chassis_Private	99360e88-24d6-4350-8243-e5742a6a0e45	5c350a5e-b9bc-42fa-8eaf-ff4cb98a8e66	772422			772424	no	nb_cfg=772422 expected=772424
+Chassis_Private	b9f5395d-d78e-4ccd-8b93-968a596cdc22	ef355d92-dc3b-4dc4-aaf4-7c559db792d7	772423			772424	no	nb_cfg=772423 expected=772424
+```
 
-The 210 redirect-chassis ports are 200 external gateway ports and 10 transit ports. The stale-tap pass on the same PC found one leftover, `tap291` on `flashfire02-3`.
+Those chassis names are `flashfire02-1` (`8d18b494-05db-4911-9272-28bff2114e0b`), `zadkiel04-4` (`5c350a5e-b9bc-42fa-8eaf-ff4cb98a8e66`), and `flashfire01-2` (`ef355d92-dc3b-4dc4-aaf4-7c559db792d7`). The other 29 chassis matched `772424`. The number was still moving, so a host can sit one or two versions behind for a short time.
+
+`installed=680` and `ic=740` are also different tables. Every installed route matched its IC prefix (`missing=0`). One installed row:
+
+```
+router	vpc	vpc_name	prefix	nexthop	origin	ic_route	ic_prefix	match
+router_f1a6fb6d-02a7-4225-97d4-8fc2b725022b	f1a6fb6d-02a7-4225-97d4-8fc2b725022b	VPC_California_SJ_Pheonix_Customer_41	192.168.210.190/32	169.254.3.2	loadbalancer	f18ade14-b838-4ffc-a8b1-871dcdf119cc	192.168.210.190/32	yes
+```
+
+The other 60 IC routes are printed under `FVN learned_not_installed`. All 60 are `origin=connected`, nexthop `169.254.3.1`, and a `/27` in `172.31.30.0` through `172.31.37.97`. IC advertised them and no router on this PC learned them. They are not IDF static routes, so they are not `missing`.
+
+```
+FVN learned_not_installed: count=60
+ic_route	prefix	nexthop	origin
+df43e600-c646-44c6-bc0d-92881dc7ab8e	172.31.32.161/27	169.254.3.1	connected
+71c40a03-9e5e-4cdc-8c83-ad87f90ebdc0	172.31.37.97/27	169.254.3.1	connected
+0fa5d789-f745-4a3f-8650-9ef334c6153b	172.31.30.1/27	169.254.3.1	connected
+```
+
+The 210 redirect-chassis ports are 200 external gateway ports and 10 transit ports. The tap table from the same PC is the `tap291` row in the stale-tap section.

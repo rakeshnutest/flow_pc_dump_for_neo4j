@@ -36,11 +36,16 @@ Learned routes: a Northbound Logical_Router_Static_Route with
 external_ids:ic-learned-route=<uuid> is not in the IDF route table. The
 uuid is the Route row in ovn-ic-sb, and the ip_prefix must match. Every
 learned route is printed with the router, the VPC, the prefix, the
-nexthop, the origin, and the IC route uuid.
+nexthop, the origin, and the IC route uuid. IC routes that no router
+learned are printed in a second table and are not a miss.
 
-An empty BGP or L2 gateway table is a pass. Stdout is the summary, one
-JSON object per learned route, and one JSON object per miss. Exit 0 when
-nothing is missing.
+Stale taps: a tap<N> device on a hypervisor that no VM NIC on that host
+names. CVM vnet devices are not taps. Each stale tap is a row in the
+output and a miss.
+
+An empty BGP or L2 gateway table is a pass. Stdout is the summary plus
+tables for cfg, learned routes, and stale taps. Exit 0 when nothing is
+missing.
 
   python3 validate_fvn.py
   python3 validate_fvn.py --self-test
@@ -53,8 +58,12 @@ import json
 import logging
 import os
 import re
+import ssl
 import subprocess
 import sys
+import tarfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.request import Request, urlopen
 
 LOG = logging.getLogger("validate_fvn")
 UUID_RE = re.compile(
@@ -77,6 +86,16 @@ ATLAS_BINS = (
     "/home/nutanix/bin/atlas_cli",
     "atlas_cli",
 )
+NCLI_BINS = (
+    "/home/nutanix/prism/cli/ncli",
+    "/usr/local/nutanix/bin/ncli",
+    "ncli",
+)
+AHV_PORT = 7030
+HEALTH_CERT = "/home/certs/ClusterHealthService/ClusterHealthService.crt"
+HEALTH_KEY = "/home/certs/ClusterHealthService/ClusterHealthService.key"
+GENESIS_CERT = "/home/certs/GenesisService/GenesisService.crt"
+GENESIS_KEY = "/home/certs/GenesisService/GenesisService.key"
 
 
 def _which(paths):
@@ -879,6 +898,171 @@ def write_report(label, idf_count, atlas_count, misses, handle):
     return len(misses)
 
 
+def _ssl_ctx(crt, key):
+    ctx = ssl._create_unverified_context()
+    ctx.load_cert_chain(crt, key)
+    return ctx
+
+
+def _gw_open(ip, path, crt, key, timeout, accept):
+    req = Request(
+        "https://%s:%s%s" % (ip, AHV_PORT, path),
+        headers={"Accept": accept, "Accept-Encoding": "identity"})
+    return urlopen(req, context=_ssl_ctx(crt, key), timeout=timeout)
+
+
+def _ncli_hosts(timeout):
+    binary = _which(NCLI_BINS)
+    rc, out, err = _run([binary, "host", "list"], timeout)
+    if rc != 0:
+        raise SystemExit("ncli host list failed: %s" % (err or out)[:300])
+    hosts = []
+    for block in re.split(r"\n\s*\n", out or ""):
+        def grab(key, text=block):
+            match = re.search(
+                r"^\s*%s\s*:\s*(.*)$" % re.escape(key), text, re.M)
+            return match.group(1).strip() if match else ""
+        name, ip = grab("Name"), grab("Hypervisor Address")
+        if name and re.match(r"\d+\.\d+\.\d+\.\d+$", ip):
+            hosts.append((name, ip))
+    if not hosts:
+        raise SystemExit("ncli host list returned no hypervisor addresses")
+    return hosts
+
+
+def _bugtool_member(ip, bug, suffix, crt, key, timeout):
+    resp = _gw_open(
+        ip, "/api/host/v1/bugtool/" + bug, crt, key, timeout,
+        "application/octet-stream")
+    try:
+        tar = tarfile.open(fileobj=resp, mode="r|*")
+        for info in tar:
+            if info.name.endswith(suffix) and info.isfile():
+                handle = tar.extractfile(info)
+                return handle.read().decode("utf-8", "replace") if handle else ""
+    finally:
+        resp.close()
+    return ""
+
+
+def _parse_ip_taps(text):
+    """tap name -> state and MAC from `ip -s link`."""
+    found = {}
+    lines = (text or "").splitlines()
+    for idx, line in enumerate(lines):
+        match = re.match(r"^\d+: (tap\d+): <([^>]*)>.*\bstate (\S+)", line)
+        if not match:
+            continue
+        mac = ""
+        if idx + 1 < len(lines):
+            mac_match = re.search(r"link/ether ([0-9a-f:]+)", lines[idx + 1])
+            if mac_match:
+                mac = mac_match.group(1)
+        found[match.group(1)] = {"state": match.group(3), "mac": mac}
+    return found
+
+
+def _vm_tapnames(ip, timeout):
+    resp = _gw_open(
+        ip, "/api/vmm/v1/vms", GENESIS_CERT, GENESIS_KEY, timeout,
+        "application/json")
+    vms = json.loads(resp.read().decode("utf-8", "replace") or "[]")
+    resp.close()
+    ids = [item.get("id") for item in vms if item.get("id")]
+
+    def one(vid):
+        body = _gw_open(
+            ip, "/api/vmm/v1/vms/" + vid, GENESIS_CERT, GENESIS_KEY,
+            timeout, "application/json")
+        try:
+            data = json.loads(body.read().decode("utf-8", "replace") or "{}")
+        finally:
+            body.close()
+        names = set()
+        for nic in ((data.get("devices") or {}).get("nics") or []):
+            tap = ((nic.get("status") or {}).get("backend") or {}).get("tapname") or ""
+            if str(tap).startswith("tap"):
+                names.add(str(tap))
+        return names
+
+    owned = set()
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        for names in pool.map(one, ids):
+            owned.update(names)
+    return owned
+
+
+def _bridges(text, wanted):
+    bridge = ""
+    found = {}
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Bridge "):
+            bridge = stripped.split()[-1].strip('"')
+        elif stripped.startswith("Interface ") or stripped.startswith("Port "):
+            name = stripped.split()[-1].strip('"')
+            if name in wanted:
+                found[name] = bridge
+    return found
+
+
+def _scan_host(item, timeout):
+    name, ip = item
+    link = _bugtool_member(
+        ip, "networking-lite", "commands/ip_-s_link.stdout",
+        HEALTH_CERT, HEALTH_KEY, min(timeout, 60))
+    live = _parse_ip_taps(link)
+    owned = _vm_tapnames(ip, min(timeout, 30))
+    stale = sorted(set(live) - owned)
+    bridges = {}
+    if stale:
+        show = _bugtool_member(
+            ip, "networking", "commands/ovs-vsctl_show.stdout",
+            HEALTH_CERT, HEALTH_KEY, timeout)
+        bridges = _bridges(show, set(stale))
+    rows = []
+    for tap in stale:
+        info = live.get(tap) or {}
+        rows.append({
+            "host": name,
+            "ip": ip,
+            "tap": tap,
+            "bridge": bridges.get(tap, ""),
+            "state": info.get("state", ""),
+            "mac": info.get("mac", ""),
+            "detail": "no VM NIC has tapname %s" % tap,
+        })
+    return name, ip, len(live), rows
+
+
+def scan_taps(timeout):
+    """Taps present on a host and absent from every VM NIC on that host."""
+    for path in (HEALTH_CERT, HEALTH_KEY, GENESIS_CERT, GENESIS_KEY):
+        if not os.path.isfile(path):
+            raise SystemExit("AHV Gateway cert missing: %s" % path)
+    hosts = _ncli_hosts(timeout)
+    rows = []
+    LOG.info("tap hosts=%s", len(hosts))
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futs = [pool.submit(_scan_host, host, timeout) for host in hosts]
+        for fut in as_completed(futs):
+            name, ip, count, stale = fut.result()
+            LOG.info("tap %s %s devices=%s stale=%s", name, ip, count, len(stale))
+            rows.extend(stale)
+    rows.sort(key=lambda row: (row["host"], row["tap"]))
+    return hosts, rows
+
+
+def write_tap_table(hosts, rows, handle):
+    handle.write(
+        "FVN tap: hosts=%s missing=%s\n" % (len(hosts), len(rows)))
+    handle.write(
+        "tap note: a row is a tap<N> device on the hypervisor that no VM "
+        "NIC on that host names. CVM vnet devices are not taps.\n")
+    _tsv(handle, ["host", "ip", "tap", "bridge", "state", "mac", "detail"], rows)
+    return len(rows)
+
+
 def collect(timeout):
     subnets = idf_entities("atlas_subnet", timeout)
     routers = idf_entities("atlas_virtual_network", timeout)
@@ -925,10 +1109,11 @@ def collect(timeout):
     ic_prefixes, ic_rows = _ic_routes(ovn_ic_csv(
         "_uuid,ip_prefix,nexthop,origin", "Route", timeout))
     route_owners = _route_owners(router_text)
+    tap_hosts, taps = scan_taps(timeout)
     LOG.info(
-        "rc ports=%s learned=%s ic=%s cfg=%s chassis=%s",
+        "rc ports=%s learned=%s ic=%s cfg=%s chassis=%s taps=%s",
         len(rc_by_name), len(learned), len(ic_prefixes),
-        len(cfg_rows), len(chassis_rows))
+        len(cfg_rows), len(chassis_rows), len(taps))
     nb_extra = ""
     sb_extra = sb_text
     if stretches or sessions:
@@ -961,6 +1146,8 @@ def collect(timeout):
         "ic_rows": ic_rows,
         "route_owners": route_owners,
         "vpc_names": _vpc_names(routers),
+        "tap_hosts": tap_hosts,
+        "taps": taps,
     }
 
 
@@ -1003,6 +1190,8 @@ def run_checks(data, handle):
     total += write_learned_tables(
         data["learned"], data["ic_prefixes"], data.get("ic_rows") or [],
         data.get("route_owners") or {}, data.get("vpc_names") or {}, handle)
+    total += write_tap_table(
+        data.get("tap_hosts") or [], data.get("taps") or [], handle)
     return total
 
 
@@ -1090,6 +1279,8 @@ def _sample():
             "66666666-6666-4666-8666-666666666666": "router_" + vpc,
         },
         "vpc_names": {vpc: "vpc-1"},
+        "tap_hosts": [("host-1", "10.0.0.1")],
+        "taps": [],
     }
     return data, subnet, vpc, node, learned, chassis
 
@@ -1121,10 +1312,19 @@ def self_test():
     data["cfg_rows"][0]["sb_cfg"] = 6
     data["chassis_rows"][0]["nb_cfg"] = 5
     data["ic_prefixes"] = {}
+    data["taps"] = [{
+        "host": "flashfire02-3",
+        "ip": "10.116.29.174",
+        "tap": "tap291",
+        "bridge": "brAtlas",
+        "state": "DOWN",
+        "mac": "fe:6b:8d:59:1b:81",
+        "detail": "no VM NIC has tapname tap291",
+    }]
     buf = io.StringIO()
     missing = run_checks(data, buf)
     text = buf.getvalue()
-    for token in (node, learned, "sb_cfg=6", chassis):
+    for token in (node, learned, "sb_cfg=6", chassis, "tap291", "brAtlas"):
         if token not in text:
             raise SystemExit("expected rc/cfg/learned detail %s:\n%s" % (token, text))
     if missing < 4:
