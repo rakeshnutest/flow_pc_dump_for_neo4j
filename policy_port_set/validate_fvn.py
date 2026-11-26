@@ -34,10 +34,13 @@ Chassis_Private nb_cfg equals that number.
 
 Learned routes: a Northbound Logical_Router_Static_Route with
 external_ids:ic-learned-route=<uuid> is not in the IDF route table. The
-uuid is the Route row in ovn-ic-sb, and the ip_prefix must match.
+uuid is the Route row in ovn-ic-sb, and the ip_prefix must match. Every
+learned route is printed with the router, the VPC, the prefix, the
+nexthop, the origin, and the IC route uuid.
 
-An empty BGP or L2 gateway table is a pass. Stdout is the summary plus one
-JSON object per miss. Exit 0 when nothing is missing.
+An empty BGP or L2 gateway table is a pass. Stdout is the summary, one
+JSON object per learned route, and one JSON object per miss. Exit 0 when
+nothing is missing.
 
   python3 validate_fvn.py
   python3 validate_fvn.py --self-test
@@ -61,6 +64,8 @@ RC_RE = re.compile(r"redirect-chassis=([0-9a-fA-F-]{36})")
 HOST_RE = re.compile(r"hosting-chassis=([0-9a-fA-F-]{36})")
 L3_RE = re.compile(r"l3gateway-chassis=([0-9a-fA-F-]{36})")
 LEARN_RE = re.compile(r"ic-learned-route=([0-9a-fA-F-]{36})")
+ORIGIN_RE = re.compile(r"origin=([A-Za-z0-9_]+)")
+NH_RE = re.compile(r"\d+\.\d+\.\d+\.\d+")
 IDF_BINS = (
     "/home/docker/msp_controller/bootstrap/msp_tools/cmsp-scripts/idfcli",
     "/usr/local/nutanix/bin/idfcli",
@@ -644,15 +649,31 @@ def check_cfg(rows, chassis):
     return misses
 
 
-def _learned(text):
-    """(prefix, ic route uuid) for routes OVN learned rather than configured."""
+def _learned_rows(text):
+    """NB static routes that carry ic-learned-route, with prefix and nexthop."""
     found = []
     for line in (text or "").splitlines():
         match = LEARN_RE.search(line)
         if not match:
             continue
-        prefix = line.split(",", 1)[0].strip().strip('"')
-        found.append((prefix, match.group(1).lower()))
+        fields = [item.strip().strip('"') for item in line.split(",")]
+        route_uuid = fields[0].lower() if fields and UUID_RE.match(fields[0]) else ""
+        prefix = ""
+        nexthop = ""
+        for field in fields[1:]:
+            if not prefix and "/" in field and "ic-learned" not in field and "origin" not in field:
+                prefix = field
+                continue
+            if not nexthop and NH_RE.match(field):
+                nexthop = field
+        origin = ORIGIN_RE.search(line)
+        found.append({
+            "route_uuid": route_uuid,
+            "prefix": prefix,
+            "nexthop": nexthop,
+            "origin": origin.group(1) if origin else "",
+            "ic_route": match.group(1).lower(),
+        })
     return found
 
 
@@ -666,22 +687,73 @@ def _ic_prefixes(text):
     return found
 
 
-def check_learned(learned, ic_prefixes):
-    """Each ic-learned-route uuid is that prefix in the IC southbound DB."""
-    misses = []
-    for prefix, uid in learned:
-        advertised = ic_prefixes.get(uid)
-        if advertised is None:
-            misses.append(_miss(
-                "learned", uid, prefix, "ic", prefix,
-                "ic-learned-route %s is not an IC Route" % uid))
+def _route_owners(text):
+    """Logical_Router_Static_Route uuid -> router name."""
+    owners = {}
+    for line in (text or "").splitlines():
+        if "," not in line:
             continue
-        if advertised != prefix:
-            misses.append(_miss(
-                "learned", uid, prefix, "ic", advertised,
-                "IC prefix %s does not match learned prefix %s" % (
-                    advertised, prefix)))
-    return misses
+        name, rest = line.split(",", 1)
+        name = name.strip().strip('"')
+        for uid in UUID_RE.findall(rest):
+            owners.setdefault(uid.lower(), name)
+    return owners
+
+
+def _vpc_from_router(name):
+    if name.startswith("router_") or name.startswith("gw-scale-out-router_nat_"):
+        found = UUID_RE.findall(name)
+        if found:
+            return found[0].lower()
+    return ""
+
+
+def _vpc_names(routers):
+    names = {}
+    for entity in routers or []:
+        uid = _entity_id(entity)
+        if uid:
+            names[uid] = str(_attrs(entity).get("name") or "")
+    return names
+
+
+def learned_records(learned, ic_prefixes, owners, vpc_names):
+    """One record per learned route: router, VPC, and the IC route it matched."""
+    records = []
+    misses = 0
+    for row in learned or []:
+        ic_route = row.get("ic_route") or ""
+        prefix = row.get("prefix") or ""
+        advertised = ic_prefixes.get(ic_route)
+        router = owners.get(row.get("route_uuid") or "", "")
+        vpc = _vpc_from_router(router)
+        if advertised is None:
+            matched = "no"
+            detail = "ic-learned-route %s is not an IC Route" % ic_route
+            misses += 1
+        elif advertised != prefix:
+            matched = "no"
+            detail = "IC prefix %s does not match learned prefix %s" % (
+                advertised, prefix)
+            misses += 1
+        else:
+            matched = "yes"
+            detail = ""
+        records.append({
+            "kind": "learned",
+            "router": router,
+            "vpc": vpc,
+            "vpc_name": vpc_names.get(vpc, ""),
+            "route_uuid": row.get("route_uuid") or "",
+            "prefix": prefix,
+            "nexthop": row.get("nexthop") or "",
+            "origin": row.get("origin") or "",
+            "ic_route": ic_route,
+            "ic_prefix": advertised or "",
+            "match": matched,
+            "detail": detail,
+        })
+    return records, misses
 
 
 def check_named(kind, rows, atlas, nb_blob, sb_blob, nb_expect, sb_expect):
@@ -741,7 +813,8 @@ def collect(timeout):
     switches = set(name.lower() for name in _names(ovn_csv(
         "nb", "name", "Logical_Switch", timeout)))
     prefix_text = ovn_csv(
-        "nb", "ip_prefix,external_ids", "Logical_Router_Static_Route", timeout)
+        "nb", "_uuid,ip_prefix,nexthop,options,external_ids",
+        "Logical_Router_Static_Route", timeout)
     # _route_maps still keys prefixes by route uuid. Fetch that pair too.
     route_ids = ovn_csv(
         "nb", "_uuid,ip_prefix", "Logical_Router_Static_Route", timeout)
@@ -762,8 +835,9 @@ def collect(timeout):
         "nb", "_uuid,nb_cfg,sb_cfg,hv_cfg", "NB_Global", timeout))
     chassis_rows = _chassis_rows(ovn_csv(
         "sb", "_uuid,name,nb_cfg", "Chassis_Private", timeout))
-    learned = _learned(prefix_text)
+    learned = _learned_rows(prefix_text)
     ic_prefixes = _ic_prefixes(ovn_ic_csv("_uuid,ip_prefix", "Route", timeout))
+    route_owners = _route_owners(router_text)
     LOG.info(
         "rc ports=%s learned=%s ic=%s cfg=%s chassis=%s",
         len(rc_by_name), len(learned), len(ic_prefixes),
@@ -797,6 +871,8 @@ def collect(timeout):
         "chassis_rows": chassis_rows,
         "learned": learned,
         "ic_prefixes": ic_prefixes,
+        "route_owners": route_owners,
+        "vpc_names": _vpc_names(routers),
     }
 
 
@@ -838,10 +914,15 @@ def run_checks(data, handle):
     cfg_misses = check_cfg(data["cfg_rows"], data["chassis_rows"])
     total += write_report(
         "cfg", len(data["cfg_rows"]), len(data["chassis_rows"]), cfg_misses, handle)
-    learned_misses = check_learned(data["learned"], data["ic_prefixes"])
-    total += write_report(
-        "learned", len(data["learned"]), len(data["ic_prefixes"]),
-        learned_misses, handle)
+    learned_rows, learned_misses = learned_records(
+        data["learned"], data["ic_prefixes"],
+        data.get("route_owners") or {}, data.get("vpc_names") or {})
+    handle.write(
+        "FVN learned: idf=%s atlas=%s missing=%s\n" % (
+            len(data["learned"]), len(data["ic_prefixes"]), learned_misses))
+    for rec in learned_rows:
+        handle.write(json.dumps(rec, separators=(",", ":"), sort_keys=True) + "\n")
+    total += learned_misses
     return total
 
 
@@ -917,8 +998,18 @@ def _sample():
             "nb_cfg": 7, "sb_cfg": 7, "hv_cfg": 7,
         }],
         "chassis_rows": [{"uuid": chassis, "name": "h1", "nb_cfg": 7}],
-        "learned": [("192.0.2.1/32", learned)],
+        "learned": [{
+            "route_uuid": "66666666-6666-4666-8666-666666666666",
+            "prefix": "192.0.2.1/32",
+            "nexthop": "169.254.3.2",
+            "origin": "loadbalancer",
+            "ic_route": learned,
+        }],
         "ic_prefixes": {learned: "192.0.2.1/32"},
+        "route_owners": {
+            "66666666-6666-4666-8666-666666666666": "router_" + vpc,
+        },
+        "vpc_names": {vpc: "vpc-1"},
     }
     return data, subnet, vpc, node, learned, chassis
 
@@ -929,6 +1020,10 @@ def self_test():
     buf = io.StringIO()
     if run_checks(data, buf):
         raise SystemExit("clean sample failed:\n%s" % buf.getvalue())
+    clean = buf.getvalue()
+    for token in ("vpc-1", "192.0.2.1/32", "169.254.3.2", learned, "router_" + vpc):
+        if token not in clean:
+            raise SystemExit("learned route detail missing %s:\n%s" % (token, clean))
     data["switches"] = set()
     data["sb_names"] = {"router_" + vpc}
     data["router_map"] = {"router_" + vpc: set()}

@@ -20,7 +20,8 @@ ovn-nbctl   Logical_Switch, Logical_Router, Logical_Router_Static_Route,
 ovn-sbctl   Datapath_Binding, Port_Binding, Chassis, Chassis_Private
         |
         v
-ovn-ic-sbctl Route     (ic-learned-route uuid and prefix)
+ovn-ic-sbctl Route     printed per learned route: router, VPC, prefix,
+                         nexthop, origin, ic-learned-route uuid
 ```
 
 Run it on the PC with the system `python3`:
@@ -31,7 +32,7 @@ python3 validate_fvn.py --timeout 300
 python3 validate_fvn.py --self-test
 ```
 
-Stdout is one summary line per check, then one JSON object per miss. Logging goes to stderr. Exit status is 0 when no miss is printed, and 1 when any miss is printed. An empty L2 gateway table or an empty BGP table is a pass.
+Stdout is one summary line per check, then one JSON object per learned route, then one JSON object per miss. Logging goes to stderr. Exit status is 0 when no miss is printed, and 1 when any miss is printed. Learned routes with `match` `yes` are printed and are not misses. An empty L2 gateway table or an empty BGP table is a pass.
 
 The check direction is IDF toward Atlas, Northbound, and Southbound. An Atlas or OVN object that IDF does not list is not a failure. A missing IDF entity type (`NotFound`) is an empty list. An Atlas command whose status is not 0 stops the run.
 
@@ -158,17 +159,58 @@ Every `NB_Global` row must have `nb_cfg`, `sb_cfg`, and `hv_cfg` equal to the sa
 
 A miss names the uuid and the disagreeing values, for example `nb_cfg=7 sb_cfg=6 hv_cfg=7` or `nb_cfg=5 expected=7`.
 
+## Redirect chassis, how the value is chosen
+
+IDF does not store the selected node. `external_subnet_list.gateway_node_uuid_list` is the candidate list and `external_subnet_list.active_gateway_count` is how many gateways Atlas expects. The selected node is OVN `options:redirect-chassis` on the gateway port.
+
+External gateway ports are found by walking `Logical_Router` rows named `gw-scale-out-router_nat_<vpc>_<n>`, then the `ports` uuid list, then `Logical_Router_Port` whose name is `lrp-ext_gw_port_<id>`. Transit ports are every `Logical_Router_Port` whose name starts with `lrp-transit-switch_` and ends with `_router_<vpc>`. They are not part of `active_gateway_count`.
+
+Southbound placement for an external gateway is `options:l3gateway-chassis` on `Port_Binding` `logical_port=ext_gw_port_<id>`. For a transit port it is the chassisredirect binding `logical_port=cr-lrp-transit-switch_...`. That binding's `chassis` column is an OVN chassis uuid; `Chassis.name` for that uuid is the node uuid, and that name must equal `redirect-chassis`.
+
+A redirect-chassis miss is a JSON object with `kind` `rc`, `where` `nb`, `sb`, or `idf`, and the node uuid that was expected.
+
 ## Dynamically learned routes
 
-A configured static route is an IDF `atlas_route_table` prefix. A learned route is a Northbound `Logical_Router_Static_Route` whose `external_ids` contain `ic-learned-route=<uuid>`. That uuid is not the route row's own `_uuid`. The prefix is installed on the VPC router with nexthop `169.254.3.2` (the transit link). `options:origin` is `loadbalancer`, `connected`, or `static`. The same prefix can be learned onto many VPC routers, each with its own `ic-learned-route` uuid.
+A configured static route is an IDF `atlas_route_table` prefix. A learned route is a Northbound `Logical_Router_Static_Route` whose `external_ids` contain `ic-learned-route=<uuid>`. That uuid is not the route row's own `_uuid`. It is the `_uuid` of a `Route` row in the OVN IC southbound database (`ovn-ic-sbctl list Route` on `anc-ovn-ic-db`). The prefix is installed on a VPC router with nexthop `169.254.3.2` (the transit link). `options:origin` is `loadbalancer`, `connected`, or `static`. The same prefix can be learned onto many VPC routers, each with its own `ic-learned-route` uuid.
+
+The router is the `Logical_Router` whose `static_routes` list contains the Northbound route `_uuid`. `router_<vpc>` and `gw-scale-out-router_nat_<vpc>_<n>` both yield that VPC uuid. The VPC name is the IDF `atlas_virtual_network` name for that uuid.
 
 The match is:
 
-1. Read `ip_prefix` and `ic-learned-route` from Northbound `Logical_Router_Static_Route`.
-2. Read `_uuid,ip_prefix` from IC southbound `Route` (`ovn-ic-sbctl` on `anc-ovn-ic-db`).
-3. The learned uuid must be an IC `Route` uuid, and the IC `ip_prefix` must equal the Northbound prefix.
+1. Read `_uuid`, `ip_prefix`, `nexthop`, `options:origin`, and `ic-learned-route` from Northbound `Logical_Router_Static_Route`.
+2. Join `_uuid` to `Logical_Router.static_routes` to get the router and the VPC.
+3. Read `_uuid,ip_prefix` from IC southbound `Route`.
+4. The learned uuid must be an IC `Route` uuid, and the IC `ip_prefix` must equal the Northbound prefix.
 
-The learned prefix is not required to be in the IDF route table. An IC route that no Northbound router has installed is not a failure. Origin is not compared; the uuid and the prefix are the identity.
+Every learned route is printed, including the ones that match. A row with `match` `no` is a miss and makes the process exit 1. The learned prefix is not required to be in the IDF route table. An IC route that no Northbound router has installed is not a failure. Origin is printed and is not compared.
+
+```
+FVN learned: idf=680 atlas=740 missing=0
+{"detail":"","ic_prefix":"192.168.210.190/32","ic_route":"f18ade14-b838-4ffc-a8b1-871dcdf119cc","kind":"learned","match":"yes","nexthop":"169.254.3.2","origin":"loadbalancer","prefix":"192.168.210.190/32","route_uuid":"6c647006-0415-4503-9b6d-e4cf68f0161e","router":"router_f1a6fb6d-02a7-4225-97d4-8fc2b725022b","vpc":"f1a6fb6d-02a7-4225-97d4-8fc2b725022b","vpc_name":"VPC_California_SJ_Pheonix_Customer_41"}
+```
+
+| Field | Meaning |
+|---|---|
+| `router` | Northbound `Logical_Router` name that owns the route |
+| `vpc` / `vpc_name` | VPC uuid parsed from that router name, and the IDF name |
+| `route_uuid` | Northbound `Logical_Router_Static_Route` `_uuid` |
+| `prefix` / `nexthop` / `origin` | The installed route |
+| `ic_route` / `ic_prefix` | `ovn-ic-sbctl` `Route` `_uuid` and `ip_prefix` |
+| `match` | `yes` when `ic_route` exists and `ic_prefix` equals `prefix` |
+
+## Stale tap interfaces
+
+This is a host check, separate from the IDF-to-OVN script. A tap is stale when the host still has the device and OVS still has the port, but no VM NIC on that host names it.
+
+For each of the 32 hypervisors from `ncli host list`:
+
+1. AHV Gateway `networking-lite` gives `ip -s link`. Every `tap<number>` in that output is a live netdev.
+2. The same host's full `networking` bugtool gives `ovs-vsctl show`. Every `Interface tap<number>` is an OVS port. An `error:` line on that interface is a tap whose netdev is already gone.
+3. AHV Gateway `GET /api/vmm/v1/vms` and `GET /api/vmm/v1/vms/<id>` give each NIC `status.backend.tapname`. Those names are the taps a running VM still owns.
+
+OVS tap names and `ip link` tap names were equal on all 32 hosts, and no interface had an `error:` line. The stale set is therefore `ip link` taps minus VM `tapname` values. CVM NICs are named `vnet<number>` (three per host, `vnet6`–`vnet8` or `vnet9`–`vnet11`). They are not taps and are not counted.
+
+One host failed that set difference. `flashfire02-3` (`10.116.29.174`) has `tap291` on bridge `brAtlas`. `ip -s link` shows it `DOWN`, `NO-CARRIER`, zero RX and TX packets, MAC `fe:6b:8d:59:1b:81`. No VM NIC on that host has `tapname` `tap291`. The other 31 hosts have every `tap<number>` owned by a VM NIC.
 
 ## What the check does not decide
 
@@ -193,4 +235,4 @@ FVN cfg: idf=1 atlas=32 missing=0
 FVN learned: idf=680 atlas=740 missing=0
 ```
 
-The 210 redirect-chassis ports are 200 external gateway ports and 10 transit ports. `NB_Global` and all 32 `Chassis_Private` rows shared one cfg number. All 680 learned prefixes matched an IC route. The IC database had 740 routes; the extra 60 are advertised routes that this Northbound has not installed.
+The 210 redirect-chassis ports are 200 external gateway ports and 10 transit ports. `NB_Global` and all 32 `Chassis_Private` rows shared one cfg number. All 680 learned prefixes matched an IC route, and each of those 680 rows is printed with its router, VPC name, prefix, nexthop, origin, and IC route uuid. The IC database had 740 routes; the extra 60 are advertised routes that this Northbound has not installed. The stale-tap pass on the same PC found one leftover, `tap291` on `flashfire02-3`.
