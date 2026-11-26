@@ -36,8 +36,8 @@ Learned routes: a Northbound Logical_Router_Static_Route with
 external_ids:ic-learned-route=<uuid> is not in the IDF route table. The
 uuid is the Route row in ovn-ic-sb, and the ip_prefix must match. Every
 learned route is printed with the router, the VPC, the prefix, the
-nexthop, the origin, and the IC route uuid. IC routes that no router
-learned are printed in a second table and are not a miss.
+nexthop, the origin, and the IC route uuid. An IC route that no router
+learned is a miss.
 
 Stale taps: a tap<N> device on a hypervisor that no VM NIC on that host
 names. CVM vnet devices are not taps. Each stale tap is a row in the
@@ -869,17 +869,18 @@ def write_cfg_table(rows, chassis, handle):
 
 def write_learned_tables(learned, ic_prefixes, ic_rows, owners, vpc_names, handle):
     """Print every installed learned route, then IC routes no router learned."""
-    records, misses = learned_records(learned, ic_prefixes, owners, vpc_names)
+    records, mismatches = learned_records(learned, ic_prefixes, owners, vpc_names)
     installed = set(row.get("ic_route") or "" for row in records)
     extra = [row for row in ic_rows or [] if row.get("ic_route") not in installed]
+    misses = mismatches + len(extra)
     handle.write(
         "FVN learned: installed=%s ic=%s not_installed=%s missing=%s\n" % (
             len(records), len(ic_prefixes), len(extra), misses))
     handle.write(
         "learned note: installed is Northbound routes with ic-learned-route. "
         "ic is ovn-ic-sbctl Route. not_installed means IC advertised the "
-        "prefix and no router on this PC learned it. missing counts only "
-        "an installed route whose IC prefix does not match.\n")
+        "prefix and no router on this PC learned it. missing is that count "
+        "plus any installed route whose IC prefix does not match.\n")
     _tsv(handle, [
         "router", "vpc", "vpc_name", "prefix", "nexthop", "origin",
         "route_uuid", "ic_route", "ic_prefix", "match", "detail"], records)
@@ -1295,6 +1296,16 @@ def self_test():
     for token in ("vpc-1", "192.0.2.1/32", "169.254.3.2", learned, "router_" + vpc):
         if token not in clean:
             raise SystemExit("learned route detail missing %s:\n%s" % (token, clean))
+    data, _subnet, _vpc, _node, _learned, _chassis = _sample()
+    data["ic_rows"] = [{
+        "ic_route": "77777777-7777-4777-8777-777777777777",
+        "prefix": "172.31.30.1/27",
+        "nexthop": "169.254.3.1",
+        "origin": "connected",
+    }]
+    buf = io.StringIO()
+    if run_checks(data, buf) != 1 or "172.31.30.1/27" not in buf.getvalue():
+        raise SystemExit("uninstalled IC route was not a miss:\n%s" % buf.getvalue())
     data["switches"] = set()
     data["sb_names"] = {"router_" + vpc}
     data["router_map"] = {"router_" + vpc: set()}

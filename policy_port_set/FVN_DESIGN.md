@@ -34,7 +34,7 @@ python3 validate_fvn.py --self-test
 
 Stdout is one summary line per check, then one JSON object per learned route, then one JSON object per miss. Logging goes to stderr. Exit status is 0 when no miss is printed, and 1 when any miss is printed. Learned routes with `match` `yes` are printed and are not misses. An empty L2 gateway table or an empty BGP table is a pass.
 
-The check direction is IDF toward Atlas, Northbound, and Southbound. An Atlas or OVN object that IDF does not list is not a failure. A missing IDF entity type (`NotFound`) is an empty list. An Atlas command whose status is not 0 stops the run.
+The check direction for subnets, routers, and static routes is IDF toward Atlas, Northbound, and Southbound. An Atlas object that IDF does not list is not a failure. An IC route that no router learned is a failure. A missing IDF entity type (`NotFound`) is an empty list. An Atlas command whose status is not 0 stops the run.
 
 ## Where the commands run
 
@@ -62,7 +62,7 @@ FVN <label>: idf=<n> atlas=<n> missing=<n>
 | `bgp` | `bgp_session` rows | `bgp_session.list` uuids |
 | `rc` | redirect-chassis ports checked | same count |
 | `cfg` | printed as `nb_global` and `chassis`, not as `idf` and `atlas` | a row is missing only when its cfg number disagrees |
-| `learned` | printed as `installed` and `ic` | `not_installed` is an IC route no router learned; `missing` is an installed route whose IC prefix disagrees |
+| `learned` | printed as `installed` and `ic` | `missing` is every IC route no router learned, plus any installed route whose IC prefix disagrees |
 
 A miss is one JSON object:
 
@@ -181,11 +181,12 @@ The match is:
 2. Join `_uuid` to `Logical_Router.static_routes` to get the router and the VPC.
 3. Read `_uuid,ip_prefix` from IC southbound `Route`.
 4. The learned uuid must be an IC `Route` uuid, and the IC `ip_prefix` must equal the Northbound prefix.
+5. Every IC `Route` uuid must appear as `ic-learned-route` on some Northbound router. A route IC advertised and no router learned is a miss.
 
-Every learned route is printed, including the ones that match. A row with `match` `no` is a miss and makes the process exit 1. The learned prefix is not required to be in the IDF route table. An IC route that no Northbound router has installed is not a failure. Origin is printed and is not compared.
+Every learned route is printed, including the ones that match. A row with `match` `no` is a miss. Each IC route in `learned_not_installed` is also a miss. The learned prefix is not required to be in the IDF route table. Origin is printed and is not compared.
 
 ```
-FVN learned: installed=680 ic=740 not_installed=60 missing=0
+FVN learned: installed=680 ic=740 not_installed=60 missing=60
 router	vpc	vpc_name	prefix	nexthop	origin	route_uuid	ic_route	ic_prefix	match	detail
 router_f1a6fb6d-02a7-4225-97d4-8fc2b725022b	f1a6fb6d-02a7-4225-97d4-8fc2b725022b	VPC_California_SJ_Pheonix_Customer_41	192.168.210.190/32	169.254.3.2	loadbalancer	6c647006-0415-4503-9b6d-e4cf68f0161e	f18ade14-b838-4ffc-a8b1-871dcdf119cc	192.168.210.190/32	yes
 ```
@@ -227,7 +228,7 @@ flashfire02-3	10.116.29.174	tap291	brAtlas	DOWN	fe:6b:8d:59:1b:81	no VM NIC has 
 
 ## Result on one CMSP PC
 
-Subnet, router, route, L2 gateway, BGP, and redirect chassis had nothing missing. Cfg was even on that read (`missing=0`). Learned routes matched (`missing=0`) with 60 IC routes not installed. The tap table had one miss, so the process exited 1.
+Subnet, router, route, L2 gateway, BGP, and redirect chassis had nothing missing. Cfg was even on that read (`missing=0`). The 680 installed routes matched their IC prefixes. The 60 IC routes no router learned are `missing=60`. The tap table had one more miss, so the process exited 1.
 
 ```
 FVN subnet: idf=1883 atlas=1883 missing=0
@@ -237,7 +238,7 @@ FVN l2gw: idf=0 atlas=0 missing=0
 FVN bgp: idf=0 atlas=0 missing=0
 FVN rc: idf=210 atlas=210 missing=0
 FVN cfg: nb_global=1 chassis=32 missing=0
-FVN learned: installed=680 ic=740 not_installed=60 missing=0
+FVN learned: installed=680 ic=740 not_installed=60 missing=60
 FVN tap: hosts=32 missing=1
 ```
 
@@ -253,14 +254,14 @@ Chassis_Private	b9f5395d-d78e-4ccd-8b93-968a596cdc22	ef355d92-dc3b-4dc4-aaf4-7c5
 
 Those chassis names are `flashfire02-1` (`8d18b494-05db-4911-9272-28bff2114e0b`), `zadkiel04-4` (`5c350a5e-b9bc-42fa-8eaf-ff4cb98a8e66`), and `flashfire01-2` (`ef355d92-dc3b-4dc4-aaf4-7c559db792d7`). The other 29 chassis matched `772424`. The number was still moving, so a host can sit one or two versions behind for a short time.
 
-`installed=680` and `ic=740` are also different tables. Every installed route matched its IC prefix (`missing=0`). One installed row:
+`installed=680` and `ic=740` are different tables. Every installed route matched its IC prefix. The 60 IC routes no router learned are the miss, so `missing=60`. One installed row:
 
 ```
 router	vpc	vpc_name	prefix	nexthop	origin	ic_route	ic_prefix	match
 router_f1a6fb6d-02a7-4225-97d4-8fc2b725022b	f1a6fb6d-02a7-4225-97d4-8fc2b725022b	VPC_California_SJ_Pheonix_Customer_41	192.168.210.190/32	169.254.3.2	loadbalancer	f18ade14-b838-4ffc-a8b1-871dcdf119cc	192.168.210.190/32	yes
 ```
 
-The other 60 IC routes are printed under `FVN learned_not_installed`. All 60 are `origin=connected`, nexthop `169.254.3.1`, and a `/27` in `172.31.30.0` through `172.31.37.97`. IC advertised them and no router on this PC learned them. They are not IDF static routes, so they are not `missing`.
+The other 60 IC routes are printed under `FVN learned_not_installed` and counted in `missing`. All 60 are `origin=connected`, nexthop `169.254.3.1`, and a `/27` in `172.31.30.0` through `172.31.37.97`. IC advertised them and no router on this PC learned them.
 
 ```
 FVN learned_not_installed: count=60
