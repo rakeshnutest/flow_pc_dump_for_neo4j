@@ -61,8 +61,8 @@ FVN <label>: idf=<n> atlas=<n> missing=<n>
 | `l2gw` | `layer2_stretch` rows | `layer2_stretch.list` uuids |
 | `bgp` | `bgp_session` rows | `bgp_session.list` uuids |
 | `rc` | redirect-chassis ports checked | same count |
-| `cfg` | `NB_Global` rows | `Chassis_Private` rows |
-| `learned` | Northbound routes with `ic-learned-route` | IC `Route` rows |
+| `cfg` | printed as `nb_global` and `chassis`, not as `idf` and `atlas` | a row is missing only when its cfg number disagrees |
+| `learned` | printed as `installed` and `ic` | `not_installed` is an IC route no router learned; `missing` is an installed route whose IC prefix disagrees |
 
 A miss is one JSON object:
 
@@ -231,8 +231,12 @@ FVN route: idf=100 atlas=100 missing=0
 FVN l2gw: idf=0 atlas=0 missing=0
 FVN bgp: idf=0 atlas=0 missing=0
 FVN rc: idf=210 atlas=210 missing=0
-FVN cfg: idf=1 atlas=32 missing=0
-FVN learned: idf=680 atlas=740 missing=0
+FVN cfg: nb_global=1 chassis=32 missing=0
+FVN learned: installed=680 ic=740 not_installed=60 missing=0
 ```
 
-The 210 redirect-chassis ports are 200 external gateway ports and 10 transit ports. `NB_Global` and all 32 `Chassis_Private` rows shared one cfg number. All 680 learned prefixes matched an IC route, and each of those 680 rows is printed with its router, VPC name, prefix, nexthop, origin, and IC route uuid. The IC database had 740 routes; the extra 60 are advertised routes that this Northbound has not installed. The stale-tap pass on the same PC found one leftover, `tap291` on `flashfire02-3`.
+`nb_global=1` and `chassis=32` are different tables. One `NB_Global` row is the version the database has published. Each of the 32 `Chassis_Private` rows is one host. The counts are not supposed to be equal. `missing` is hosts or the global row whose `nb_cfg` / `sb_cfg` / `hv_cfg` disagree. A later read on this PC caught `hv_cfg` and three chassis one or two versions behind `nb_cfg`, which is a real lag, not the 1-versus-32 count.
+
+`installed=680` and `ic=740` are also different tables. Every installed route matched its IC prefix (`missing=0`). The other 60 IC routes are `origin=connected` prefixes in `172.31.30.0/27` through `172.31.37.0/27`, nexthop `169.254.3.1`. IC advertised them and no router on this PC learned them. The script prints those 60 under `FVN learned_not_installed` and prints all 680 installed routes as a table with router, VPC, prefix, nexthop, origin, and both uuids.
+
+The 210 redirect-chassis ports are 200 external gateway ports and 10 transit ports. The stale-tap pass on the same PC found one leftover, `tap291` on `flashfire02-3`.

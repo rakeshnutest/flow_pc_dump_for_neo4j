@@ -677,14 +677,24 @@ def _learned_rows(text):
     return found
 
 
-def _ic_prefixes(text):
-    found = {}
+def _ic_routes(text):
+    """IC Route uuid -> prefix, plus nexthop and origin for the extra rows."""
+    prefixes = {}
+    rows = []
     for line in (text or "").splitlines():
         if "," not in line:
             continue
-        uid, prefix = line.split(",", 1)
-        found[uid.strip().lower()] = prefix.strip().strip('"')
-    return found
+        parts = [item.strip().strip('"') for item in line.split(",")]
+        uid = parts[0].lower()
+        prefix = parts[1] if len(parts) > 1 else ""
+        prefixes[uid] = prefix
+        rows.append({
+            "ic_route": uid,
+            "prefix": prefix,
+            "nexthop": parts[2] if len(parts) > 2 else "",
+            "origin": parts[3] if len(parts) > 3 else "",
+        })
+    return prefixes, rows
 
 
 def _route_owners(text):
@@ -784,6 +794,82 @@ def _count(rows):
     return len([entity for entity in rows if _entity_id(entity)])
 
 
+def _tsv(handle, headers, rows):
+    handle.write("\t".join(headers) + "\n")
+    for row in rows:
+        handle.write("\t".join(str(row.get(key, "")) for key in headers) + "\n")
+
+
+def write_cfg_table(rows, chassis, handle):
+    """Print NB_Global and every chassis. missing is rows that disagree."""
+    misses = check_cfg(rows, chassis)
+    expected = rows[0]["nb_cfg"] if rows else ""
+    handle.write(
+        "FVN cfg: nb_global=%s chassis=%s missing=%s\n" % (
+            len(rows), len(chassis), len(misses)))
+    if rows and chassis and len(misses) == 0:
+        handle.write(
+            "cfg note: one NB_Global row and %s chassis rows carry nb_cfg=%s. "
+            "The counts differ because they are different tables.\n" % (
+                len(chassis), expected))
+    table = []
+    for row in rows:
+        same = row["nb_cfg"] == row["sb_cfg"] == row["hv_cfg"] == expected
+        detail = "" if same else "nb_cfg=%s sb_cfg=%s hv_cfg=%s" % (
+            row["nb_cfg"], row["sb_cfg"], row["hv_cfg"])
+        table.append({
+            "table": "NB_Global",
+            "uuid": row["uuid"],
+            "name": "",
+            "nb_cfg": row["nb_cfg"],
+            "sb_cfg": row["sb_cfg"],
+            "hv_cfg": row["hv_cfg"],
+            "expected": expected,
+            "match": "yes" if same else "no",
+            "detail": detail,
+        })
+    for row in chassis:
+        same = bool(rows) and row["nb_cfg"] == expected
+        table.append({
+            "table": "Chassis_Private",
+            "uuid": row["uuid"],
+            "name": row["name"],
+            "nb_cfg": row["nb_cfg"],
+            "sb_cfg": "",
+            "hv_cfg": "",
+            "expected": expected,
+            "match": "yes" if same else "no",
+            "detail": "" if same else "nb_cfg=%s expected=%s" % (
+                row["nb_cfg"], expected),
+        })
+    _tsv(handle, [
+        "table", "uuid", "name", "nb_cfg", "sb_cfg", "hv_cfg",
+        "expected", "match", "detail"], table)
+    return len(misses)
+
+
+def write_learned_tables(learned, ic_prefixes, ic_rows, owners, vpc_names, handle):
+    """Print every installed learned route, then IC routes no router learned."""
+    records, misses = learned_records(learned, ic_prefixes, owners, vpc_names)
+    installed = set(row.get("ic_route") or "" for row in records)
+    extra = [row for row in ic_rows or [] if row.get("ic_route") not in installed]
+    handle.write(
+        "FVN learned: installed=%s ic=%s not_installed=%s missing=%s\n" % (
+            len(records), len(ic_prefixes), len(extra), misses))
+    handle.write(
+        "learned note: installed is Northbound routes with ic-learned-route. "
+        "ic is ovn-ic-sbctl Route. not_installed means IC advertised the "
+        "prefix and no router on this PC learned it. missing counts only "
+        "an installed route whose IC prefix does not match.\n")
+    _tsv(handle, [
+        "router", "vpc", "vpc_name", "prefix", "nexthop", "origin",
+        "route_uuid", "ic_route", "ic_prefix", "match", "detail"], records)
+    if extra:
+        handle.write("FVN learned_not_installed: count=%s\n" % len(extra))
+        _tsv(handle, ["ic_route", "prefix", "nexthop", "origin"], extra)
+    return misses
+
+
 def write_report(label, idf_count, atlas_count, misses, handle):
     handle.write(
         "FVN %s: idf=%s atlas=%s missing=%s\n" % (
@@ -836,7 +922,8 @@ def collect(timeout):
     chassis_rows = _chassis_rows(ovn_csv(
         "sb", "_uuid,name,nb_cfg", "Chassis_Private", timeout))
     learned = _learned_rows(prefix_text)
-    ic_prefixes = _ic_prefixes(ovn_ic_csv("_uuid,ip_prefix", "Route", timeout))
+    ic_prefixes, ic_rows = _ic_routes(ovn_ic_csv(
+        "_uuid,ip_prefix,nexthop,origin", "Route", timeout))
     route_owners = _route_owners(router_text)
     LOG.info(
         "rc ports=%s learned=%s ic=%s cfg=%s chassis=%s",
@@ -871,6 +958,7 @@ def collect(timeout):
         "chassis_rows": chassis_rows,
         "learned": learned,
         "ic_prefixes": ic_prefixes,
+        "ic_rows": ic_rows,
         "route_owners": route_owners,
         "vpc_names": _vpc_names(routers),
     }
@@ -911,18 +999,10 @@ def run_checks(data, handle):
     rc_misses.extend(transit_misses)
     rc_checked += transit_checked
     total += write_report("rc", rc_checked, rc_checked, rc_misses, handle)
-    cfg_misses = check_cfg(data["cfg_rows"], data["chassis_rows"])
-    total += write_report(
-        "cfg", len(data["cfg_rows"]), len(data["chassis_rows"]), cfg_misses, handle)
-    learned_rows, learned_misses = learned_records(
-        data["learned"], data["ic_prefixes"],
-        data.get("route_owners") or {}, data.get("vpc_names") or {})
-    handle.write(
-        "FVN learned: idf=%s atlas=%s missing=%s\n" % (
-            len(data["learned"]), len(data["ic_prefixes"]), learned_misses))
-    for rec in learned_rows:
-        handle.write(json.dumps(rec, separators=(",", ":"), sort_keys=True) + "\n")
-    total += learned_misses
+    total += write_cfg_table(data["cfg_rows"], data["chassis_rows"], handle)
+    total += write_learned_tables(
+        data["learned"], data["ic_prefixes"], data.get("ic_rows") or [],
+        data.get("route_owners") or {}, data.get("vpc_names") or {}, handle)
     return total
 
 
