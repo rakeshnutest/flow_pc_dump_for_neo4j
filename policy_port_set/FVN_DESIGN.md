@@ -175,7 +175,7 @@ A configured static route is an IDF `atlas_route_table` prefix. A learned route 
 
 `ovn-ic` writes four origins (`ovn/lib/ovn-util.h`): `static` from a non-learned static route, `connected` from a router-port network, `loadbalancer` from a `Load_Balancer` `vips` key when `NB_Global.options:ic-route-adv-lb` is set, and `connected-dynamic` from a Southbound `Learned_Route`. This PC has `loadbalancer`, `connected`, and `static`. It has no `connected-dynamic`. `origin=loadbalancer` is a remote VIP prefix (`/32` or `/128`). It is not a local `Load_Balancer` row. This PC has none.
 
-`ovn-ic` does not learn its own advertisements. It skips an IC route whose `external_ids:lr-id` is the local router, and a legacy route with no `lr-id` whose `availability_zone` is the local zone. It also skips filtered prefixes, a prefix that already has a local static route, a prefix covered by a local load balancer VIP, and a prefix already in Southbound `Learned_Route`. The 60 IC routes with origin `connected` and nexthop `169.254.3.1` are this zone's own advertisements. They are not misses. The script currently counts them in `missing`. That does not match `sync_learned_routes`.
+`ovn-ic` does not learn its own advertisements. It skips an IC route whose `external_ids:lr-id` is the local router, and a legacy route with no `lr-id` whose `availability_zone` is the local zone. It also skips filtered prefixes, a prefix that already has a local static route, a prefix covered by a local load balancer VIP, and a prefix already in Southbound `Learned_Route`. The 60 IC routes with origin `connected` and nexthop `169.254.3.1` are this zone's own advertisements. They are not misses. The checker skips an IC route whose `lr-id` is a local `Logical_Router` uuid.
 
 The same prefix can be learned onto many VPC routers, each with its own `ic-learned-route` uuid. The IC row also carries `external_ids:nb-id`, which is the advertised `Load_Balancer`, static route, or router port.
 
@@ -234,7 +234,7 @@ flashfire02-3	10.116.29.174	tap291	brAtlas	DOWN	fe:6b:8d:59:1b:81	no VM NIC has 
 
 ## Result on one CMSP PC
 
-Subnet, router, route, L2 gateway, BGP, and redirect chassis had nothing missing. Cfg was even on that read (`missing=0`). The 680 installed routes matched their IC prefixes. The script counted the 60 own-zone IC routes as `missing=60`. `ovn-ic` does not install those. The tap table had one more miss, so the process exited 1.
+Subnet, router, route, L2 gateway, BGP, and redirect chassis had nothing missing. Cfg was even on that read (`missing=0`). The 680 installed routes matched their IC prefixes. That run counted the 60 own-zone IC routes as `missing=60`. `ovn-ic` does not install those, and the checker now skips them. The tap table had one more miss, so the process exited 1.
 
 ```
 FVN subnet: idf=1883 atlas=1883 missing=0
@@ -260,7 +260,7 @@ Chassis_Private	b9f5395d-d78e-4ccd-8b93-968a596cdc22	ef355d92-dc3b-4dc4-aaf4-7c5
 
 Those chassis names are `flashfire02-1` (`8d18b494-05db-4911-9272-28bff2114e0b`), `zadkiel04-4` (`5c350a5e-b9bc-42fa-8eaf-ff4cb98a8e66`), and `flashfire01-2` (`ef355d92-dc3b-4dc4-aaf4-7c559db792d7`). The other 29 chassis matched `772424`. The number was still moving, so a host can sit one or two versions behind for a short time.
 
-`installed=680` and `ic=740` are different tables. Every installed route matched its IC prefix. The 60 routes with nexthop `169.254.3.1` are this zone's own IC advertisements, which `ovn-ic` does not learn back. The script still prints them as `missing=60`. One installed row:
+`installed=680` and `ic=740` are different tables. Every installed route matched its IC prefix. The 60 routes with nexthop `169.254.3.1` are this zone's own IC advertisements, which `ovn-ic` does not learn back. The checker skips them. One installed row:
 
 ```
 router	vpc	vpc_name	prefix	nexthop	origin	ic_route	ic_prefix	match

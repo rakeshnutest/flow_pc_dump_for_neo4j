@@ -45,7 +45,7 @@ The IC nexthop is not the route's original nexthop. While advertising, `get_next
 | a local `Load_Balancer` VIP covers this prefix | `route_matches_local_lb` |
 | Southbound `Learned_Route` already has this prefix | dynamic route already present |
 
-A skipped IC route is not a miss. The 60 IC routes on this PC with origin `connected` and nexthop `169.254.3.1` are the routes this zone advertised. `ovn-ic` is required not to install them. The checker prints them as `skipped=own_az`. The current script counts them in `missing`. That count does not match `sync_learned_routes`.
+A skipped IC route is not a miss. The 60 IC routes on this PC with origin `connected` and nexthop `169.254.3.1` are the routes this zone advertised. `ovn-ic` is required not to install them. The checker skips an IC route whose `lr-id` is a local `Logical_Router` uuid, and a route with no `lr-id` whose zone is this zone. Those routes are not in `missing`.
 
 A miss is an IC route that none of those skips apply to, and no Northbound route has `ic-learned-route` equal to that IC uuid. A Northbound learned route whose `ic-learned-route` uuid is not an IC `Route`, or whose prefix differs from that IC prefix, is still a miss.
 
