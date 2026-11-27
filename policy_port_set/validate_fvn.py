@@ -709,21 +709,28 @@ def _ic_routes(text):
     for line in (text or "").splitlines():
         if "," not in line:
             continue
-        parts = [item.strip().strip('"') for item in line.split(",")]
+        parts = [item.strip().strip('"') for item in line.split(",", 5)]
         uid = parts[0].lower()
         prefix = parts[1] if len(parts) > 1 else ""
         nexthop = parts[2] if len(parts) > 2 else ""
         origin = parts[3] if len(parts) > 3 else ""
         zone = parts[4] if len(parts) > 4 else ""
         external = parts[5] if len(parts) > 5 else ""
+        # external_ids may itself contain commas; rejoin if needed
+        # (split with maxsplit=5 already keeps the rest intact)
         lr_id = ""
         nb_id = ""
+        # external_ids is "lr-id=...,nb-id=..." possibly space or comma separated
+        for sep in (" ", ","):
+            external = external.replace(sep, " ")
         for token in (external or "").split():
+            token = token.strip().strip('"')
             if token.startswith("lr-id="):
                 lr_id = token[len("lr-id="):].strip().lower()
             elif token.startswith("nb-id="):
                 nb_id = token[len("nb-id="):].strip().lower()
         if not lr_id:
+            # fallback: first uuid in external_ids
             for match in UUID_RE.findall(external or ""):
                 if not lr_id:
                     lr_id = match.lower()
@@ -786,9 +793,13 @@ def _own_az(route, owners, vpc_names, this_zone):
     """True when the IC route belongs to this availability zone."""
     lr_id = (route.get("lr_id") or "").lower()
     zone = (route.get("zone") or "").strip()
-    if lr_id:
-        return _is_local_router(lr_id, owners, vpc_names)
+    # Zone comparison is the reliable indicator (lr-id is an OVN router uuid,
+    # not an IDF router/vpc uuid, so the owner/vpc maps never match it).
     if zone and this_zone and zone == this_zone:
+        return True
+    if lr_id and lr_id in (owners or {}):
+        return True
+    if lr_id and lr_id in (vpc_names or {}):
         return True
     return False
 
@@ -924,7 +935,7 @@ def write_learned_tables(learned, ic_prefixes, ic_rows, owners, vpc_names, handl
     if ic_error:
         handle.write(
             "FVN learned: installed=%s ic=0 not_installed=0 missing=1\\n" % len(learned or []))
-        handle.write("learned note: IC fetch failed: %s\\n" % ic_error)
+        handle.write("learned note: IC fetch failed: %s\n" % ic_error)
         skipped = []
         for row in learned or []:
             router = owners.get(row.get("route_uuid") or "", "")
@@ -964,8 +975,8 @@ def write_learned_tables(learned, ic_prefixes, ic_rows, owners, vpc_names, handl
             continue
         lr_id = (row.get("lr_id") or "").lower()
         zone = (row.get("zone") or "").strip()
-        local_router = _is_local_router(lr_id, owners, vpc_names)
-        own_zone = local_router or (not lr_id and this_zone != "" and zone == this_zone)
+        route = {"lr_id": lr_id, "zone": zone}
+        own_zone = _own_az(route, owners, vpc_names, this_zone)
         if own_zone:
             continue
         foreign_extra.append(row)
@@ -1313,6 +1324,14 @@ def collect(timeout):
         "nb_router_lb",
         lambda: ovn_csv("nb", "name,load_balancer,load_balancer_group", "Logical_Router", timeout),
         "")
+    router_policy_text = grab(
+        "nb_router_policy",
+        lambda: ovn_csv("nb", "name,policies", "Logical_Router", timeout),
+        "")
+    policy_detail_text = grab(
+        "nb_policy_detail",
+        lambda: ovn_csv("nb", "_uuid,priority,action,nexthop,match", "Logical_Router_Policy", timeout),
+        "")
     if stretches or sessions or lb_sessions:
         sb_extra += "\n" + grab(
             "sb_port",
@@ -1334,6 +1353,8 @@ def collect(timeout):
         "sb_extra": sb_extra,
         "lb_text": lb_text,
         "router_lb_text": router_lb_text,
+        "router_policy_text": router_policy_text,
+        "policy_detail_text": policy_detail_text,
         "lrp_names": lrp_names,
         "rc_by_name": rc_by_name,
         "sb_gateway": sb_gateway,
@@ -1427,9 +1448,15 @@ def write_lb_table(sessions, atlas, nb_text, lb_text, router_lb_text, handle):
                 separators=(",", ":"), sort_keys=True) + "\n")
             continue
         attrs = _attrs(entity)
-        # listener VIP
-        vip = str(attrs.get("vip") or attrs.get("listener_vip") or
-                  attrs.get("virtual_ip") or "").strip()
+        # listener VIP: IDF column is listener.virtual_ip_address
+        vip = ""
+        if "listener.virtual_ip_address" in attrs:
+            vip = str(attrs.get("listener.virtual_ip_address") or "").strip()
+        elif isinstance(attrs.get("listener"), dict):
+            vip = str((attrs.get("listener") or {}).get("virtual_ip_address") or "").strip()
+        if not vip:
+            vip = str(attrs.get("vip") or attrs.get("listener_vip") or
+                      attrs.get("virtual_ip") or attrs.get("virtual_ip_address") or "").strip()
         if uid in attached_lbs:
             # passes if a vips key starts with the listener VIP
             lb_vip = router_vips.get(uid, "")
@@ -1451,9 +1478,43 @@ def write_lb_table(sessions, atlas, nb_text, lb_text, router_lb_text, handle):
     return misses
 
 
-def write_pbr_table(policies, atlas, nb_text, router_map, handle):
+def write_pbr_table(policies, atlas, nb_text, router_map, router_policy_text, policy_detail_text, handle):
     """Policy routing. Each IDF policy must match a Logical_Router_Policy."""
     misses = 0
+    # Parse OVN Logical_Router_Policy rows: uuid -> (priority, action, nexthop)
+    ovn_policy = {}
+    for line in (policy_detail_text or "").splitlines():
+        parts = [x.strip().strip('"') for x in line.split(",")]
+        if len(parts) < 3:
+            continue
+        pid = parts[0].lower()
+        prio = parts[1]
+        action = parts[2].lower()
+        nexthop = parts[3] if len(parts) > 3 else ""
+        ovn_policy[pid] = (prio, action, nexthop)
+    # Map router name -> set of (priority, action) from its policies list
+    router_ovn_policies = {}
+    for line in (router_policy_text or "").splitlines():
+        parts = [x.strip().strip('"') for x in line.split(",", 1)]
+        if len(parts) < 2:
+            continue
+        rname = parts[0]
+        rest = parts[1]
+        for pid in UUID_RE.findall(rest):
+            info = ovn_policy.get(pid.lower())
+            if info:
+                router_ovn_policies.setdefault(rname, set()).add(info)
+    # Build set of (vpc, priority, action) available in OVN
+    ovn_keys = set()
+    for rname, infos in router_ovn_policies.items():
+        vpc = ""
+        for tok in UUID_RE.findall(rname):
+            vpc = tok.lower()
+            break
+        if not vpc:
+            vpc = rname.lower()
+        for (prio, action, nexthop) in infos:
+            ovn_keys.add((vpc, action))
     if not policies:
         handle.write("FVN pbr: idf=0 atlas=0 missing=0\n")
         handle.write("pbr note: no routing policies on this PC.\n")
@@ -1467,14 +1528,21 @@ def write_pbr_table(policies, atlas, nb_text, router_map, handle):
         attrs = _attrs(entity)
         vpc = str(attrs.get("virtual_network_uuid") or "").strip().lower()
         priority = str(attrs.get("priority") or "").strip()
-        action = str(attrs.get("action") or "").strip().lower()
+        # action may be a list with numeric code: 0=allow, 1=drop
+        raw_action = attrs.get("action")
+        if isinstance(raw_action, list) and raw_action:
+            raw_action = raw_action[0]
+        action_code = str(raw_action).strip().lower()
+        action_map = {"0": "allow", "1": "drop", "allow": "allow", "drop": "drop",
+                      "reroute": "reroute", "jump": "jump"}
+        action = action_map.get(action_code, action_code)
         nexthop = str(attrs.get("nexthop") or attrs.get("reroute_nexthop") or "").strip()
         if uid not in (atlas or set()):
             misses += 1
             handle.write(json.dumps(_miss(
                 "pbr", uid, vpc, "atlas", uid,
                 "atlas routing_policy.list has no %s" % uid),
-                separators=(",", ":"), sort_keys=True) + "\\n")
+                separators=(",", ":"), sort_keys=True) + "\n")
             continue
         known_vpc = any(vpc and vpc in name.lower() for name in (router_map or {}))
         # also accept vpc present in vpc_names if passed; router_map keys are router names
@@ -1490,14 +1558,31 @@ def write_pbr_table(policies, atlas, nb_text, router_map, handle):
                 handle.write(json.dumps(_miss(
                     "pbr", uid, vpc, "nb", "router",
                     "drop policy %s is on wrong VPC %s" % (uid, vpc)),
-                    separators=(",", ":"), sort_keys=True) + "\\n")
+                    separators=(",", ":"), sort_keys=True) + "\n")
+                continue
+        # OVN Logical_Router_Policy match
+        ovn_match = (vpc, action) in ovn_keys
+        if not ovn_match and ovn_keys:
+            # also try matching by any router name containing vpc
+            found = False
+            for (ov, oa) in ovn_keys:
+                if vpc and vpc in ov and oa == action:
+                    found = True
+                    break
+            if not found:
+                misses += 1
+                handle.write(json.dumps(_miss(
+                    "pbr", uid, vpc, "nb", "Logical_Router_Policy",
+                    "no OVN policy matches vpc=%s action=%s" % (
+                        vpc, action)),
+                    separators=(",", ":"), sort_keys=True) + "\n")
                 continue
         if action == "reroute" and not nexthop:
             misses += 1
             handle.write(json.dumps(_miss(
                 "pbr", uid, vpc, "nb", "nexthop",
                 "reroute policy %s has no nexthop" % uid),
-                separators=(",", ":"), sort_keys=True) + "\\n")
+                separators=(",", ":"), sort_keys=True) + "\n")
     handle.write("FVN pbr: idf=%s atlas=%s missing=%s\n" % (
         count, atlas_count, misses))
     return misses
@@ -1532,22 +1617,37 @@ def write_bgp_table(sessions, atlas, router_map, ic_rows, handle):
             continue
         attrs = _attrs(entity)
         vpc = str(attrs.get("virtual_network_uuid") or "").strip().lower()
-        # received prefix list: try several attribute names
+        # received prefixes: IDF column is received_route_list with
+        # network_address and prefix_length per entry.
         received = []
-        for key in ("received_prefix_list", "received_prefixes",
-                    "bgp_session.received_prefix_list", "received"):
-            val = attrs.get(key)
-            if val is not None:
-                received = _as_list(val)
-                break
+        rrl = attrs.get("received_route_list")
+        if rrl is None:
+            rrl = attrs.get("received_route_list.network_address")
+        if isinstance(rrl, list):
+            for item in rrl:
+                if isinstance(item, dict):
+                    na = str(item.get("network_address") or item.get("network") or "").strip()
+                    pl = str(item.get("prefix_length") or item.get("prefix") or "").strip()
+                    if na and pl:
+                        received.append("%s/%s" % (na, pl))
+                    elif na:
+                        received.append(na)
+                else:
+                    received.append(str(item).strip())
+        elif isinstance(rrl, dict):
+            na = str(rrl.get("network_address") or "").strip()
+            pl = str(rrl.get("prefix_length") or "").strip()
+            if na and pl:
+                received.append("%s/%s" % (na, pl))
+            elif na:
+                received.append(na)
         if not received:
-            # maybe nested under status
-            st = attrs.get("status") or attrs.get("bgp_session.status") or {}
-            if isinstance(st, dict):
-                for key in ("received_prefix_list", "received_prefixes", "received"):
-                    if key in st:
-                        received = _as_list(st.get(key))
-                        break
+            # fallback: try flat attribute names
+            for key in ("received_prefix_list", "received_prefixes", "received"):
+                val = attrs.get(key)
+                if val is not None:
+                    received = _as_list(val)
+                    break
         # static routes for this VPC
         static = set()
         for name, prefixes in (router_map or {}).items():
@@ -1704,11 +1804,19 @@ def run_checks(data, handle):
             handle.write("FVN learned fetch: error=%s\n" % errors["nb_learned"])
             return 1
         this_zone = ""
+        # Determine this zone: prefer the zone that has connected-origin routes
+        # (connected routes are only advertised by the local zone's routers).
         for row in (data.get("ic_rows") or []):
-            lr_id = (row.get("lr_id") or "").lower()
-            if lr_id and _is_local_router(lr_id, data.get("route_owners") or {}, data.get("vpc_names") or {}):
+            if (row.get("origin") or "").lower() == "connected":
                 this_zone = (row.get("zone") or "").strip()
                 break
+        if not this_zone:
+            # fallback: zone with the fewest routes (own zone advertises fewer
+            # than the foreign zone learns)
+            from collections import Counter
+            c = Counter((r.get("zone") or "").strip() for r in (data.get("ic_rows") or []))
+            if c:
+                this_zone = min(c, key=lambda z: c[z])
         return write_learned_tables(
             data["learned"], data["ic_prefixes"], data.get("ic_rows") or [],
             data.get("route_owners") or {}, data.get("vpc_names") or {}, handle,
@@ -1735,6 +1843,7 @@ def run_checks(data, handle):
     total += _safe(handle, "pbr", lambda: write_pbr_table(
         data.get("pbr_policies") or [], atlas.get("pbr") or set(),
         data.get("nb_extra") or "", data.get("router_map") or {},
+        data.get("router_policy_text") or "", data.get("policy_detail_text") or "",
         handle))
     total += _safe(handle, "rc", rc)
     total += _safe(handle, "cfg", cfg)
