@@ -1166,9 +1166,26 @@ def _scan_host_ok(item, timeout):
 def scan_taps(timeout):
     """Taps present on a host and absent from every VM NIC on that host.
 
-    Host-level tap scanning is disabled (no host check). Return empty.
+    A missing cert or a failed host list is an error string. One host
+    that fails is one row. The other hosts are still checked.
     """
-    return [], [], ""
+    for path in (HEALTH_CERT, HEALTH_KEY, GENESIS_CERT, GENESIS_KEY):
+        if not os.path.isfile(path):
+            return [], [], "AHV Gateway cert missing: %s" % path
+    try:
+        hosts = _ncli_hosts(timeout)
+    except (Exception, SystemExit) as err:
+        return [], [], str(err).split("\n", 1)[0][:300]
+    rows = []
+    LOG.info("tap hosts=%s", len(hosts))
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futs = [pool.submit(_scan_host, host, timeout) for host in hosts]
+        for fut in as_completed(futs):
+            name, ip, count, stale = fut.result()
+            LOG.info("tap %s %s devices=%s stale=%s", name, ip, count, len(stale))
+            rows.extend(stale)
+    rows.sort(key=lambda row: (row["host"], row["tap"]))
+    return hosts, rows, ""
 
 
 def write_tap_table(hosts, rows, handle, error=""):
