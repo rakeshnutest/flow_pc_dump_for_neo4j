@@ -34,7 +34,7 @@ python3 validate_fvn.py --self-test
 
 Stdout is one summary line per check, then one JSON object per learned route, then one JSON object per miss. Logging goes to stderr. Exit status is 0 when no miss is printed, and 1 when any miss is printed. Learned routes with `match` `yes` are printed and are not misses. An empty L2 gateway table or an empty BGP table is a pass.
 
-The check direction for subnets, routers, and static routes is IDF toward Atlas, Northbound, and Southbound. An Atlas object that IDF does not list is not a failure. An IC route that no router learned is a failure. A missing IDF entity type (`NotFound`) is an empty list. A failed command is one error on the check that needed it. That check does not turn the failed fetch into a miss for every object, and the other checks still print. One hypervisor that fails the tap scan is one tap row. The other hosts are still checked.
+The check direction for subnets, routers, and static routes is IDF toward Atlas, Northbound, and Southbound. An Atlas object that IDF does not list is not a failure. An IC route that `ovn-ic` should have installed, and no router learned, is a failure. An IC route `ovn-ic` skips on purpose is not a failure. A missing IDF entity type (`NotFound`) is an empty list. A failed command is one error on the check that needed it. That check does not turn the failed fetch into a miss for every object, and the other checks still print. One hypervisor that fails the tap scan is one tap row. The other hosts are still checked.
 
 ## Where the commands run
 
@@ -62,7 +62,7 @@ FVN <label>: idf=<n> atlas=<n> missing=<n>
 | `bgp` | `bgp_session` rows | `bgp_session.list` uuids |
 | `rc` | redirect-chassis ports checked | same count |
 | `cfg` | printed as `nb_global` and `chassis`, not as `idf` and `atlas` | a row is missing only when its cfg number disagrees |
-| `learned` | printed as `installed` and `ic` | `missing` is every IC route no router learned, plus any installed route whose IC prefix disagrees |
+| `learned` | printed as `installed` and `ic` | `missing` is an IC route `ovn-ic` should install and no router learned, plus an installed route whose IC prefix disagrees. The script still counts every uninstalled IC route, including this zone's own advertisements |
 
 A miss is one JSON object:
 
@@ -123,9 +123,9 @@ When the table has rows, the stretch uuid must appear in Northbound `Logical_Swi
 
 ## BGP
 
-IDF entity type `bgp_session`. If that type is absent, the script reads `atlas_bgp_session`. Atlas command is `bgp_session.list`.
+The script today reads IDF `bgp_session` (this type exists on this PC; `atlas_bgp_session` does not) and Atlas `bgp_session.list`. With rows, it only checks that the session uuid appears somewhere in Northbound router text and Southbound datapath text. That join is not how BGP is stored. OVN has no BGP table. On this PC the session list is empty, and none of the 300 routers or 4,634 static routes contain `bgp`.
 
-When the table has rows, the session uuid must appear in the Northbound router and switch-port text, and in the Southbound datapath and port-binding text. Zero rows is a pass. This PC had no BGP sessions. BGP-learned prefixes that OVN has already installed are covered by the learned-route check, not by this empty table.
+The verification spec is `BGP_LB_DESIGN.md`. Session state and the advertised, received, and ignored prefix lists live on the IDF session. The local and remote gateways are `vpn_gateway` rows. A received prefix is a Northbound static route on that gateway's VPC, matched by prefix, not by the session uuid.
 
 ## Redirect chassis
 
@@ -171,7 +171,13 @@ A redirect-chassis miss is a JSON object with `kind` `rc`, `where` `nb`, `sb`, o
 
 ## Dynamically learned routes
 
-A configured static route is an IDF `atlas_route_table` prefix. A learned route is a Northbound `Logical_Router_Static_Route` whose `external_ids` contain `ic-learned-route=<uuid>`. That uuid is not the route row's own `_uuid`. It is the `_uuid` of a `Route` row in the OVN IC southbound database (`ovn-ic-sbctl list Route` on `anc-ovn-ic-db`). The prefix is installed on a VPC router with nexthop `169.254.3.2` (the transit link). `options:origin` is `loadbalancer`, `connected`, or `static`. The same prefix can be learned onto many VPC routers, each with its own `ic-learned-route` uuid.
+A configured static route is an IDF `atlas_route_table` prefix. A learned route is created by `ovn-ic` (`sync_learned_routes` in `ovn/ic/ovn-ic.c`). It copies an IC southbound `Route` onto a Northbound `Logical_Router_Static_Route`: `ip_prefix` and `nexthop` are copied, `external_ids:ic-learned-route` is set to the IC `Route` `_uuid`, and `options:origin` is set to the IC origin. That uuid is not the Northbound route's own `_uuid`. The nexthop is the advertising zone's transit-switch address, not the original nexthop. On this PC the installed rows use `169.254.3.2`.
+
+`ovn-ic` writes four origins (`ovn/lib/ovn-util.h`): `static` from a non-learned static route, `connected` from a router-port network, `loadbalancer` from a `Load_Balancer` `vips` key when `NB_Global.options:ic-route-adv-lb` is set, and `connected-dynamic` from a Southbound `Learned_Route`. This PC has `loadbalancer`, `connected`, and `static`. It has no `connected-dynamic`. `origin=loadbalancer` is a remote VIP prefix (`/32` or `/128`). It is not a local `Load_Balancer` row. This PC has none.
+
+`ovn-ic` does not learn its own advertisements. It skips an IC route whose `external_ids:lr-id` is the local router, and a legacy route with no `lr-id` whose `availability_zone` is the local zone. It also skips filtered prefixes, a prefix that already has a local static route, a prefix covered by a local load balancer VIP, and a prefix already in Southbound `Learned_Route`. The 60 IC routes with origin `connected` and nexthop `169.254.3.1` are this zone's own advertisements. They are not misses. The checker skips an IC route whose `lr-id` is a local `Logical_Router` uuid.
+
+The same prefix can be learned onto many VPC routers, each with its own `ic-learned-route` uuid. The IC row also carries `external_ids:nb-id`, which is the advertised `Load_Balancer`, static route, or router port.
 
 The router is the `Logical_Router` whose `static_routes` list contains the Northbound route `_uuid`. `router_<vpc>` and `gw-scale-out-router_nat_<vpc>_<n>` both yield that VPC uuid. The VPC name is the IDF `atlas_virtual_network` name for that uuid.
 
@@ -181,7 +187,7 @@ The match is:
 2. Join `_uuid` to `Logical_Router.static_routes` to get the router and the VPC.
 3. Read `_uuid,ip_prefix` from IC southbound `Route`.
 4. The learned uuid must be an IC `Route` uuid, and the IC `ip_prefix` must equal the Northbound prefix.
-5. Every IC `Route` uuid must appear as `ic-learned-route` on some Northbound router. A route IC advertised and no router learned is a miss.
+5. An IC `Route` is a miss only when `sync_learned_routes` would install it and no Northbound route has that uuid. A route this zone advertised (`lr-id` is a local router, or there is no `lr-id` and the availability zone is local) is not a miss.
 
 Every learned route is printed, including the ones that match. A row with `match` `no` is a miss. Each IC route in `learned_not_installed` is also a miss. The learned prefix is not required to be in the IDF route table. Origin is printed and is not compared.
 
@@ -228,7 +234,7 @@ flashfire02-3	10.116.29.174	tap291	brAtlas	DOWN	fe:6b:8d:59:1b:81	no VM NIC has 
 
 ## Result on one CMSP PC
 
-Subnet, router, route, L2 gateway, BGP, and redirect chassis had nothing missing. Cfg was even on that read (`missing=0`). The 680 installed routes matched their IC prefixes. The 60 IC routes no router learned are `missing=60`. The tap table had one more miss, so the process exited 1.
+Subnet, router, route, L2 gateway, BGP, and redirect chassis had nothing missing. Cfg was even on that read (`missing=0`). The 680 installed routes matched their IC prefixes. That run counted the 60 own-zone IC routes as `missing=60`. `ovn-ic` does not install those, and the checker now skips them. The tap table had one more miss, so the process exited 1.
 
 ```
 FVN subnet: idf=1883 atlas=1883 missing=0
@@ -254,7 +260,7 @@ Chassis_Private	b9f5395d-d78e-4ccd-8b93-968a596cdc22	ef355d92-dc3b-4dc4-aaf4-7c5
 
 Those chassis names are `flashfire02-1` (`8d18b494-05db-4911-9272-28bff2114e0b`), `zadkiel04-4` (`5c350a5e-b9bc-42fa-8eaf-ff4cb98a8e66`), and `flashfire01-2` (`ef355d92-dc3b-4dc4-aaf4-7c559db792d7`). The other 29 chassis matched `772424`. The number was still moving, so a host can sit one or two versions behind for a short time.
 
-`installed=680` and `ic=740` are different tables. Every installed route matched its IC prefix. The 60 IC routes no router learned are the miss, so `missing=60`. One installed row:
+`installed=680` and `ic=740` are different tables. Every installed route matched its IC prefix. The 60 routes with nexthop `169.254.3.1` are this zone's own IC advertisements, which `ovn-ic` does not learn back. The checker skips them. One installed row:
 
 ```
 router	vpc	vpc_name	prefix	nexthop	origin	ic_route	ic_prefix	match
