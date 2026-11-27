@@ -930,7 +930,7 @@ def write_learned_tables(learned, ic_prefixes, ic_rows, owners, vpc_names, handl
     """
     if ic_error:
         handle.write(
-            "FVN learned: installed=%s ic=0 not_installed=0 missing=1\\n" % len(learned or []))
+            "FVN learned: installed=%s ic=0 not_installed=0 missing=1\n" % len(learned or []))
         handle.write("learned note: IC fetch failed: %s\n" % ic_error)
         skipped = []
         for row in learned or []:
@@ -1477,22 +1477,36 @@ def write_lb_table(sessions, atlas, nb_text, lb_text, router_lb_text, handle):
         if not vip:
             vip = str(attrs.get("vip") or attrs.get("listener_vip") or
                       attrs.get("virtual_ip") or attrs.get("virtual_ip_address") or "").strip()
-        if uid in attached_lbs:
-            # passes if a vips key starts with the listener VIP
-            lb_vip = router_vips.get(uid, "")
-            if vip and lb_vip and not lb_vip.startswith(vip):
+        # Find an OVN Load_Balancer whose vips start with the IDF VIP and
+        # which is attached to a router. Match by VIP, not by uuid.
+        matched_lb = None
+        for lb_uuid, lb_vip in router_vips.items():
+            if vip and lb_vip.startswith(vip):
+                matched_lb = lb_uuid
+                break
+        if matched_lb:
+            pass  # attached + VIP matches
+        elif vip and any(lb_vip.startswith(vip) for lb_vip in router_vips.values()):
+            pass
+        else:
+            # fallback: uuid match (legacy)
+            if uid in attached_lbs:
+                lb_vip = router_vips.get(uid, "")
+                if vip and lb_vip and not lb_vip.startswith(vip):
+                    misses += 1
+                    handle.write(json.dumps(_miss(
+                        "lb", uid, "", "nb", vip,
+                        "Load_Balancer vips %s does not start with VIP %s" % (
+                            lb_vip, vip)),
+                        separators=(",", ":"), sort_keys=True) + "\n")
+                    continue
+            else:
                 misses += 1
                 handle.write(json.dumps(_miss(
-                    "lb", uid, "", "nb", vip,
-                    "Load_Balancer vips %s does not start with VIP %s" % (
-                        lb_vip, vip)),
+                    "lb", uid, "", "nb", vip or uid,
+                    "Load_Balancer with VIP %s is not on a VPC router" % (vip or uid)),
                     separators=(",", ":"), sort_keys=True) + "\n")
-        else:
-            misses += 1
-            handle.write(json.dumps(_miss(
-                "lb", uid, "", "nb", uid,
-                "Load_Balancer %s is not on a VPC router" % uid),
-                separators=(",", ":"), sort_keys=True) + "\n")
+                continue
     handle.write("FVN lb: idf=%s atlas=%s missing=%s\n" % (
         count, atlas_count, misses))
     return misses
@@ -1608,7 +1622,7 @@ def write_pbr_table(policies, atlas, nb_text, router_map, router_policy_text, po
     return misses
 
 
-def write_bgp_table(sessions, atlas, router_map, ic_rows, handle):
+def write_bgp_table(sessions, atlas, router_map, learned_prefixes, handle):
     """BGP. Each received prefix must be a static route or a Southbound Learned_Route."""
     if not sessions:
         handle.write("FVN bgp: idf=0 atlas=0 missing=0\n")
@@ -1617,11 +1631,15 @@ def write_bgp_table(sessions, atlas, router_map, ic_rows, handle):
     misses = 0
     count = len([e for e in sessions if _entity_id(e)])
     atlas_count = len(atlas or set())
+    # Southbound Learned_Route: use installed learned routes, not IC prefixes.
     sb_learned = set()
-    for row in (ic_rows or []):
-        pfx = (row.get("prefix") or "").strip()
-        if pfx:
-            sb_learned.add(pfx)
+    for pfx in (learned_prefixes or []):
+        if isinstance(pfx, str):
+            sb_learned.add(pfx.strip())
+        elif isinstance(pfx, dict):
+            p = pfx.get("prefix") or pfx.get("ip_prefix") or ""
+            if p:
+                sb_learned.add(str(p).strip())
     for entity in sessions:
         uid = _entity_id(entity)
         if not uid:
@@ -1842,10 +1860,10 @@ def run_checks(data, handle):
                 this_zone = (row.get("zone") or "").strip()
                 break
         if not this_zone:
-            for row in (data.get("ic_rows") or []):
-                if (row.get("origin") or "").lower() == "connected":
-                    this_zone = (row.get("zone") or "").strip()
-                    break
+            # Do not fall back to the first connected route's zone: both zones
+            # advertise connected routes, so that can mark the remote zone as
+            # local. Leave this_zone empty instead.
+            pass
         return write_learned_tables(
             data["learned"], data["ic_prefixes"], data.get("ic_rows") or [],
             data.get("route_owners") or {}, data.get("vpc_names") or {}, handle,
@@ -1865,7 +1883,9 @@ def run_checks(data, handle):
         data.get("nb_extra") or "", data.get("sb_extra") or "", handle))
     total += _safe(handle, "bgp", lambda: write_bgp_table(
         data.get("sessions") or [], atlas.get("bgp") or set(),
-        data.get("router_map") or {}, data.get("ic_rows") or [], handle))
+        data.get("router_map") or {},
+        [r.get("prefix") or r.get("ip_prefix") or "" for r in (data.get("learned") or [])],
+        handle))
     total += _safe(handle, "lb", lambda: write_lb_table(
         data.get("lb_sessions") or [], atlas.get("lb") or set(),
         data.get("nb_extra") or "", data.get("lb_text") or "",
