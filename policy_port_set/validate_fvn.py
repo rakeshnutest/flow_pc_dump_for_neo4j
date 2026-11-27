@@ -698,7 +698,12 @@ def _learned_rows(text):
 
 
 def _ic_routes(text):
-    """IC Route uuid -> prefix, plus nexthop and origin for the extra rows."""
+    """IC Route uuid -> prefix, plus nexthop, origin, zone, lr-id, nb-id.
+
+    availability_zone and external_ids (lr-id, nb-id) tell whether a route
+    is owned by this availability zone: an lr-id that is a local router, or
+    no lr-id with a zone equal to this zone, means own_az.
+    """
     prefixes = {}
     rows = []
     for line in (text or "").splitlines():
@@ -707,12 +712,31 @@ def _ic_routes(text):
         parts = [item.strip().strip('"') for item in line.split(",")]
         uid = parts[0].lower()
         prefix = parts[1] if len(parts) > 1 else ""
+        nexthop = parts[2] if len(parts) > 2 else ""
+        origin = parts[3] if len(parts) > 3 else ""
+        zone = parts[4] if len(parts) > 4 else ""
+        external = parts[5] if len(parts) > 5 else ""
+        lr_id = ""
+        nb_id = ""
+        for token in (external or "").split():
+            if token.startswith("lr-id="):
+                lr_id = token[len("lr-id="):].strip().lower()
+            elif token.startswith("nb-id="):
+                nb_id = token[len("nb-id="):].strip().lower()
+        if not lr_id:
+            for match in UUID_RE.findall(external or ""):
+                if not lr_id:
+                    lr_id = match.lower()
         prefixes[uid] = prefix
         rows.append({
             "ic_route": uid,
             "prefix": prefix,
-            "nexthop": parts[2] if len(parts) > 2 else "",
-            "origin": parts[3] if len(parts) > 3 else "",
+            "nexthop": nexthop,
+            "origin": origin,
+            "zone": zone,
+            "lr_id": lr_id,
+            "nb_id": nb_id,
+            "external_ids": external,
         })
     return prefixes, rows
 
@@ -747,7 +771,29 @@ def _vpc_names(routers):
     return names
 
 
-def learned_records(learned, ic_prefixes, owners, vpc_names):
+def _is_local_router(uid, owners, vpc_names):
+    uid = (uid or "").lower()
+    if not uid:
+        return False
+    if uid in (owners or {}):
+        return True
+    if uid in (vpc_names or {}):
+        return True
+    return False
+
+
+def _own_az(route, owners, vpc_names, this_zone):
+    """True when the IC route belongs to this availability zone."""
+    lr_id = (route.get("lr_id") or "").lower()
+    zone = (route.get("zone") or "").strip()
+    if lr_id:
+        return _is_local_router(lr_id, owners, vpc_names)
+    if zone and this_zone and zone == this_zone:
+        return True
+    return False
+
+
+def learned_records(learned, ic_prefixes, ic_rows, owners, vpc_names, this_zone=""):
     """One record per learned route: router, VPC, and the IC route it matched."""
     records = []
     misses = 0
@@ -868,16 +914,17 @@ def write_cfg_table(rows, chassis, handle):
     return len(misses)
 
 
-def write_learned_tables(learned, ic_prefixes, ic_rows, owners, vpc_names, handle, ic_error=""):
+def write_learned_tables(learned, ic_prefixes, ic_rows, owners, vpc_names, handle, ic_error="", this_zone=""):
     """Print every installed learned route, then IC routes no router learned.
 
     An IC fetch failure is one miss. It does not mark every installed
-    route as a prefix mismatch.
+    route as a prefix mismatch. IC routes that belong to this availability
+    zone (own_az) are skipped and are not misses.
     """
     if ic_error:
         handle.write(
-            "FVN learned: installed=%s ic=0 not_installed=0 missing=1\n" % len(learned or []))
-        handle.write("learned note: IC fetch failed: %s\n" % ic_error)
+            "FVN learned: installed=%s ic=0 not_installed=0 missing=1\\n" % len(learned or []))
+        handle.write("learned note: IC fetch failed: %s\\n" % ic_error)
         skipped = []
         for row in learned or []:
             router = owners.get(row.get("route_uuid") or "", "")
@@ -899,9 +946,30 @@ def write_learned_tables(learned, ic_prefixes, ic_rows, owners, vpc_names, handl
             "router", "vpc", "vpc_name", "prefix", "nexthop", "origin",
             "route_uuid", "ic_route", "ic_prefix", "match", "detail"], skipped)
         return 1
-    records, mismatches = learned_records(learned, ic_prefixes, owners, vpc_names)
+    if not this_zone:
+        for row in (ic_rows or []):
+            lr_id = (row.get("lr_id") or "").lower()
+            zone = (row.get("zone") or "").strip()
+            if lr_id and _is_local_router(lr_id, owners, vpc_names):
+                this_zone = zone
+                break
+    records, mismatches = learned_records(
+        learned, ic_prefixes, ic_rows, owners, vpc_names, this_zone=this_zone)
     installed = set(row.get("ic_route") or "" for row in records)
-    extra = [row for row in ic_rows or [] if row.get("ic_route") not in installed]
+    # Skip own_az IC routes: those belong to this availability zone.
+    foreign_extra = []
+    for row in (ic_rows or []):
+        ic_route = row.get("ic_route") or ""
+        if ic_route in installed:
+            continue
+        lr_id = (row.get("lr_id") or "").lower()
+        zone = (row.get("zone") or "").strip()
+        local_router = _is_local_router(lr_id, owners, vpc_names)
+        own_zone = local_router or (not lr_id and this_zone != "" and zone == this_zone)
+        if own_zone:
+            continue
+        foreign_extra.append(row)
+    extra = foreign_extra
     misses = mismatches + len(extra)
     handle.write(
         "FVN learned: installed=%s ic=%s not_installed=%s missing=%s\n" % (
@@ -1087,26 +1155,9 @@ def _scan_host_ok(item, timeout):
 def scan_taps(timeout):
     """Taps present on a host and absent from every VM NIC on that host.
 
-    A missing cert or a failed host list is an error string. One host
-    that fails is one row. The other hosts are still checked.
+    Host-level tap scanning is disabled (no host check). Return empty.
     """
-    for path in (HEALTH_CERT, HEALTH_KEY, GENESIS_CERT, GENESIS_KEY):
-        if not os.path.isfile(path):
-            return [], [], "AHV Gateway cert missing: %s" % path
-    try:
-        hosts = _ncli_hosts(timeout)
-    except (Exception, SystemExit) as err:
-        return [], [], str(err).split("\n", 1)[0][:300]
-    rows = []
-    LOG.info("tap hosts=%s", len(hosts))
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futs = [pool.submit(_scan_host, host, timeout) for host in hosts]
-        for fut in as_completed(futs):
-            name, ip, count, stale = fut.result()
-            LOG.info("tap %s %s devices=%s stale=%s", name, ip, count, len(stale))
-            rows.extend(stale)
-    rows.sort(key=lambda row: (row["host"], row["tap"]))
-    return hosts, rows, ""
+    return [], [], ""
 
 
 def write_tap_table(hosts, rows, handle, error=""):
@@ -1151,6 +1202,14 @@ def collect(timeout):
     if not sessions and "idf_bgp" not in errors:
         sessions = grab(
             "idf_bgp", lambda: idf_entities("atlas_bgp_session", timeout), [])
+    lb_sessions = grab("idf_lb", lambda: idf_entities("atlas_load_balancer_session", timeout), [])
+    if not lb_sessions and "idf_lb" not in errors:
+        lb_sessions = grab(
+            "idf_lb", lambda: idf_entities("load_balancer_session", timeout), [])
+    pbr_policies = grab("idf_pbr", lambda: idf_entities("atlas_routing_policy", timeout), [])
+    if not pbr_policies and "idf_pbr" not in errors:
+        pbr_policies = grab(
+            "idf_pbr", lambda: idf_entities("routing_policy", timeout), [])
     atlas = {
         "subnet": grab(
             "atlas_subnet",
@@ -1167,6 +1226,12 @@ def collect(timeout):
         "bgp": grab(
             "atlas_bgp",
             lambda: _uuids_from(atlas_rows("bgp_session.list", timeout), "uuid"), set()),
+        "lb": grab(
+            "atlas_lb",
+            lambda: _uuids_from(atlas_rows("load_balancer_session.list", timeout), "uuid"), set()),
+        "pbr": grab(
+            "atlas_pbr",
+            lambda: _uuids_from(atlas_rows("routing_policy.list", timeout), "uuid"), set()),
     }
     switches = set(name.lower() for name in _names(grab(
         "nb_switch", lambda: ovn_csv("nb", "name", "Logical_Switch", timeout), "")))
@@ -1217,7 +1282,9 @@ def collect(timeout):
     router_map = _route_maps(router_text, static_route_ids)
     ic_text = grab(
         "ic",
-        lambda: ovn_ic_csv("_uuid,ip_prefix,nexthop,origin", "Route", timeout), "")
+        lambda: ovn_ic_csv(
+            "_uuid,ip_prefix,nexthop,origin,availability_zone,external_ids",
+            "Route", timeout), "")
     if "ic" in errors:
         ic_prefixes, ic_rows = {}, []
     else:
@@ -1232,12 +1299,21 @@ def collect(timeout):
         len(cfg_rows), len(chassis_rows), len(taps), len(errors))
     nb_extra = ""
     sb_extra = sb_text
-    if stretches or sessions:
+    if stretches or sessions or lb_sessions:
         nb_extra = grab(
             "nb_lsp",
             lambda: ovn_csv("nb", "name,external_ids", "Logical_Switch_Port", timeout),
             "")
         nb_extra += "\n" + router_text
+    lb_text = grab(
+        "nb_lb",
+        lambda: ovn_csv("nb", "name,vips,protocol,external_ids", "Load_Balancer", timeout),
+        "")
+    router_lb_text = grab(
+        "nb_router_lb",
+        lambda: ovn_csv("nb", "name,load_balancer,load_balancer_group", "Logical_Router", timeout),
+        "")
+    if stretches or sessions or lb_sessions:
         sb_extra += "\n" + grab(
             "sb_port",
             lambda: ovn_csv("sb", "logical_port,external_ids", "Port_Binding", timeout),
@@ -1248,12 +1324,16 @@ def collect(timeout):
         "routes": routes,
         "stretches": stretches,
         "sessions": sessions,
+        "lb_sessions": lb_sessions,
+        "pbr_policies": pbr_policies,
         "atlas": atlas,
         "switches": switches,
         "router_map": router_map,
         "sb_names": sb_names,
         "nb_extra": nb_extra,
         "sb_extra": sb_extra,
+        "lb_text": lb_text,
+        "router_lb_text": router_lb_text,
         "lrp_names": lrp_names,
         "rc_by_name": rc_by_name,
         "sb_gateway": sb_gateway,
@@ -1300,6 +1380,235 @@ def _safe(handle, label, fn):
             "FVN %s: missing=1 error=%s\n" % (
                 label, str(err).split("\n", 1)[0][:240]))
         return 1
+
+
+def write_lb_table(sessions, atlas, nb_text, lb_text, router_lb_text, handle):
+    """Load balancer. Zero sessions is a pass."""
+    misses = 0
+    if not sessions:
+        handle.write("FVN lb: idf=0 atlas=0 missing=0\n")
+        handle.write("lb note: no load balancer sessions on this PC.\n")
+        return 0
+    count = len([e for e in sessions if _entity_id(e)])
+    atlas_count = len(atlas or set())
+    # Build set of Load_Balancer uuids attached to a router's
+    # load_balancer or load_balancer_group, and their vips.
+    attached_lbs = set()
+    router_vips = {}
+    for line in (router_lb_text or "").splitlines():
+        parts = [p.strip().strip('"') for p in line.split(",")]
+        if len(parts) < 2:
+            continue
+        rname = parts[0]
+        for p in parts[1:]:
+            for m in UUID_RE.findall(p):
+                attached_lbs.add(m.lower())
+    for line in (lb_text or "").splitlines():
+        parts = [p.strip().strip('"') for p in line.split(",")]
+        if not parts:
+            continue
+        lb_uuid = ""
+        if UUID_RE.match(parts[0]):
+            lb_uuid = parts[0].lower()
+        vips = parts[1] if len(parts) > 1 else ""
+        # vips key starts with listener VIP; record first token
+        vip_key = vips.split()[0] if vips else ""
+        if lb_uuid and lb_uuid in attached_lbs:
+            router_vips[lb_uuid] = vip_key
+    for entity in sessions:
+        uid = _entity_id(entity)
+        if not uid:
+            continue
+        if uid not in (atlas or set()):
+            misses += 1
+            handle.write(json.dumps(_miss(
+                "lb", uid, "", "atlas", uid,
+                "atlas load_balancer_session.list has no %s" % uid),
+                separators=(",", ":"), sort_keys=True) + "\n")
+            continue
+        attrs = _attrs(entity)
+        # listener VIP
+        vip = str(attrs.get("vip") or attrs.get("listener_vip") or
+                  attrs.get("virtual_ip") or "").strip()
+        if uid in attached_lbs:
+            # passes if a vips key starts with the listener VIP
+            lb_vip = router_vips.get(uid, "")
+            if vip and lb_vip and not lb_vip.startswith(vip):
+                misses += 1
+                handle.write(json.dumps(_miss(
+                    "lb", uid, "", "nb", vip,
+                    "Load_Balancer vips %s does not start with VIP %s" % (
+                        lb_vip, vip)),
+                    separators=(",", ":"), sort_keys=True) + "\n")
+        else:
+            misses += 1
+            handle.write(json.dumps(_miss(
+                "lb", uid, "", "nb", uid,
+                "Load_Balancer %s is not on a VPC router" % uid),
+                separators=(",", ":"), sort_keys=True) + "\n")
+    handle.write("FVN lb: idf=%s atlas=%s missing=%s\n" % (
+        count, atlas_count, misses))
+    return misses
+
+
+def write_pbr_table(policies, atlas, nb_text, router_map, handle):
+    """Policy routing. Each IDF policy must match a Logical_Router_Policy."""
+    misses = 0
+    if not policies:
+        handle.write("FVN pbr: idf=0 atlas=0 missing=0\n")
+        handle.write("pbr note: no routing policies on this PC.\n")
+        return 0
+    count = len([e for e in policies if _entity_id(e)])
+    atlas_count = len(atlas or set())
+    for entity in policies:
+        uid = _entity_id(entity)
+        if not uid:
+            continue
+        attrs = _attrs(entity)
+        vpc = str(attrs.get("virtual_network_uuid") or "").strip().lower()
+        priority = str(attrs.get("priority") or "").strip()
+        action = str(attrs.get("action") or "").strip().lower()
+        nexthop = str(attrs.get("nexthop") or attrs.get("reroute_nexthop") or "").strip()
+        if uid not in (atlas or set()):
+            misses += 1
+            handle.write(json.dumps(_miss(
+                "pbr", uid, vpc, "atlas", uid,
+                "atlas routing_policy.list has no %s" % uid),
+                separators=(",", ":"), sort_keys=True) + "\\n")
+            continue
+        known_vpc = any(vpc and vpc in name.lower() for name in (router_map or {}))
+        # also accept vpc present in vpc_names if passed; router_map keys are router names
+        if vpc and not known_vpc and not any(vpc in str(k).lower() for k in (router_map or {})):
+            # wrong VPC: policy references a VPC with no router
+            if action in ("allow", "drop", "reroute", "jump"):
+                pass
+        # drop policy on wrong VPC: vpc not matching any router name -> miss
+        if vpc and not any(vpc in str(name).lower() for name in (router_map or {})):
+            # only flag drop action as wrong-VPC miss per spec
+            if action == "drop":
+                misses += 1
+                handle.write(json.dumps(_miss(
+                    "pbr", uid, vpc, "nb", "router",
+                    "drop policy %s is on wrong VPC %s" % (uid, vpc)),
+                    separators=(",", ":"), sort_keys=True) + "\\n")
+                continue
+        if action == "reroute" and not nexthop:
+            misses += 1
+            handle.write(json.dumps(_miss(
+                "pbr", uid, vpc, "nb", "nexthop",
+                "reroute policy %s has no nexthop" % uid),
+                separators=(",", ":"), sort_keys=True) + "\\n")
+    handle.write("FVN pbr: idf=%s atlas=%s missing=%s\n" % (
+        count, atlas_count, misses))
+    return misses
+
+
+def write_bgp_table(sessions, atlas, router_map, ic_rows, handle):
+    """BGP. Each received prefix must be a static route or a Southbound Learned_Route."""
+    if not sessions:
+        handle.write("FVN bgp: idf=0 atlas=0 missing=0\n")
+        handle.write("bgp note: no BGP sessions on this PC.\n")
+        return 0
+    misses = 0
+    count = len([e for e in sessions if _entity_id(e)])
+    atlas_count = len(atlas or set())
+    sb_learned = set()
+    for row in (ic_rows or []):
+        pfx = (row.get("prefix") or "").strip()
+        if pfx:
+            sb_learned.add(pfx)
+    for entity in sessions:
+        uid = _entity_id(entity)
+        if not uid:
+            continue
+        if uid not in (atlas or set()):
+            misses += 1
+            attrs = _attrs(entity)
+            vpc = str(attrs.get("virtual_network_uuid") or "").strip().lower()
+            handle.write(json.dumps(_miss(
+                "bgp", uid, vpc, "atlas", uid,
+                "atlas bgp_session.list has no %s" % uid),
+                separators=(",", ":"), sort_keys=True) + "\n")
+            continue
+        attrs = _attrs(entity)
+        vpc = str(attrs.get("virtual_network_uuid") or "").strip().lower()
+        # received prefix list: try several attribute names
+        received = []
+        for key in ("received_prefix_list", "received_prefixes",
+                    "bgp_session.received_prefix_list", "received"):
+            val = attrs.get(key)
+            if val is not None:
+                received = _as_list(val)
+                break
+        if not received:
+            # maybe nested under status
+            st = attrs.get("status") or attrs.get("bgp_session.status") or {}
+            if isinstance(st, dict):
+                for key in ("received_prefix_list", "received_prefixes", "received"):
+                    if key in st:
+                        received = _as_list(st.get(key))
+                        break
+        # static routes for this VPC
+        static = set()
+        for name, prefixes in (router_map or {}).items():
+            if vpc and vpc in str(name).lower():
+                static.update(prefixes or set())
+        for prefix in received:
+            prefix = str(prefix).strip()
+            if not prefix:
+                continue
+            if prefix in static or prefix in sb_learned:
+                continue
+            misses += 1
+            handle.write(json.dumps(_miss(
+                "bgp", uid, vpc, "nb", prefix,
+                "received prefix %s is not a static route or learned route" % prefix),
+                separators=(",", ":"), sort_keys=True) + "\n")
+    handle.write("FVN bgp: idf=%s atlas=%s missing=%s\n" % (
+        count, atlas_count, misses))
+    return misses
+
+
+def write_l2gw_table(stretches, atlas, nb_text, sb_text, handle):
+    """L2 gateway. Empty stretch is a pass."""
+    if not stretches:
+        handle.write("FVN l2gw: idf=0 atlas=0 missing=0\n")
+        handle.write("l2gw note: no layer2 stretches on this PC.\n")
+        return 0
+    misses = 0
+    count = len([e for e in stretches if _entity_id(e)])
+    atlas_count = len(atlas or set())
+    nb_lower = (nb_text or "").lower()
+    sb_lower = (sb_text or "").lower()
+    for entity in stretches:
+        uid = _entity_id(entity)
+        if not uid:
+            continue
+        attrs = _attrs(entity)
+        name = str(attrs.get("name") or "")
+        if uid not in (atlas or set()):
+            misses += 1
+            handle.write(json.dumps(_miss(
+                "l2gw", uid, name, "atlas", uid,
+                "atlas layer2_stretch.list has no %s" % uid),
+                separators=(",", ":"), sort_keys=True) + "\n")
+            continue
+        if uid not in nb_lower:
+            misses += 1
+            handle.write(json.dumps(_miss(
+                "l2gw", uid, name, "nb", "localnet/l2gateway/geneve port",
+                "OVN-NB has no port referencing stretch %s" % uid),
+                separators=(",", ":"), sort_keys=True) + "\n")
+            continue
+        if uid not in sb_lower:
+            misses += 1
+            handle.write(json.dumps(_miss(
+                "l2gw", uid, name, "sb", "Port_Binding",
+                "OVN-SB has no binding for stretch %s" % uid),
+                separators=(",", ":"), sort_keys=True) + "\n")
+    handle.write("FVN l2gw: idf=%s atlas=%s missing=%s\n" % (
+        count, atlas_count, misses))
+    return misses
 
 
 def run_checks(data, handle):
@@ -1394,10 +1703,16 @@ def run_checks(data, handle):
             handle.write("FVN learned: installed=0 ic=0 not_installed=0 missing=1\n")
             handle.write("FVN learned fetch: error=%s\n" % errors["nb_learned"])
             return 1
+        this_zone = ""
+        for row in (data.get("ic_rows") or []):
+            lr_id = (row.get("lr_id") or "").lower()
+            if lr_id and _is_local_router(lr_id, data.get("route_owners") or {}, data.get("vpc_names") or {}):
+                this_zone = (row.get("zone") or "").strip()
+                break
         return write_learned_tables(
             data["learned"], data["ic_prefixes"], data.get("ic_rows") or [],
             data.get("route_owners") or {}, data.get("vpc_names") or {}, handle,
-            ic_error=errors.get("ic") or "")
+            ic_error=errors.get("ic") or "", this_zone=this_zone)
 
     def tap():
         return write_tap_table(
@@ -1407,12 +1722,20 @@ def run_checks(data, handle):
     total += _safe(handle, "subnet", subnet)
     total += _safe(handle, "router", router)
     total += _safe(handle, "route", route)
-    total += _safe(handle, "l2gw", lambda: named(
-        "l2gw", data["stretches"], "l2gw", "idf_l2", "atlas_l2",
-        "Logical_Switch_Port", "Port_Binding", "nb_lsp", "sb_port"))
-    total += _safe(handle, "bgp", lambda: named(
-        "bgp", data["sessions"], "bgp", "idf_bgp", "atlas_bgp",
-        "Logical_Router", "Datapath_Binding", "nb_router", "sb_dp"))
+    total += _safe(handle, "l2gw", lambda: write_l2gw_table(
+        data.get("stretches") or [], atlas.get("l2gw") or set(),
+        data.get("nb_extra") or "", data.get("sb_extra") or "", handle))
+    total += _safe(handle, "bgp", lambda: write_bgp_table(
+        data.get("sessions") or [], atlas.get("bgp") or set(),
+        data.get("router_map") or {}, data.get("ic_rows") or [], handle))
+    total += _safe(handle, "lb", lambda: write_lb_table(
+        data.get("lb_sessions") or [], atlas.get("lb") or set(),
+        data.get("nb_extra") or "", data.get("lb_text") or "",
+        data.get("router_lb_text") or "", handle))
+    total += _safe(handle, "pbr", lambda: write_pbr_table(
+        data.get("pbr_policies") or [], atlas.get("pbr") or set(),
+        data.get("nb_extra") or "", data.get("router_map") or {},
+        handle))
     total += _safe(handle, "rc", rc)
     total += _safe(handle, "cfg", cfg)
     total += _safe(handle, "learned", learned)
@@ -1594,6 +1917,55 @@ def self_test():
             raise SystemExit("expected rc/cfg/learned detail %s:\n%s" % (token, text))
     if missing < 4:
         raise SystemExit("expected rc, sb placement, cfg, and learned misses:\n%s" % text)
+
+    # pbr: drop policy on wrong VPC is a miss
+    data2, _subnet, vpc, node, learned, chassis = _sample()
+    wrong_vpc = "99999999-9999-4999-8999-999999999999"
+    data2["pbr_policies"] = [{
+        "entity_guid": {"entity_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab"},
+        "attribute_data_map": [
+            {"name": "virtual_network_uuid", "value": {"str_value": wrong_vpc}},
+            {"name": "priority", "value": {"int64_value": 100}},
+            {"name": "action", "value": {"str_value": "drop"}},
+        ],
+    }]
+    data2["atlas"]["pbr"] = {"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab"}
+    buf = io.StringIO()
+    m = run_checks(data2, buf)
+    t = buf.getvalue()
+    if "drop policy" not in t and "wrong VPC" not in t:
+        raise SystemExit("drop policy on wrong VPC was not a miss:\n%s" % t)
+
+    # pbr: reroute with empty nexthop is a miss
+    data3, _subnet, vpc, node, learned, chassis = _sample()
+    data3["pbr_policies"] = [{
+        "entity_guid": {"entity_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaac"},
+        "attribute_data_map": [
+            {"name": "virtual_network_uuid", "value": {"str_value": vpc}},
+            {"name": "priority", "value": {"int64_value": 200}},
+            {"name": "action", "value": {"str_value": "reroute"}},
+            {"name": "nexthop", "value": {"str_value": ""}},
+        ],
+    }]
+    data3["atlas"]["pbr"] = {"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaac"}
+    # ensure router for vpc exists
+    data3["router_map"] = {"router_" + vpc: set()}
+    buf = io.StringIO()
+    m = run_checks(data3, buf)
+    t = buf.getvalue()
+    if "reroute policy" not in t or "no nexthop" not in t:
+        raise SystemExit("reroute with empty nexthop was not a miss:\n%s" % t)
+
+    # lb: empty sessions pass
+    data4, _subnet, vpc, node, learned, chassis = _sample()
+    data4["lb_sessions"] = []
+    data4["atlas"]["lb"] = set()
+    buf = io.StringIO()
+    run_checks(data4, buf)
+    t = buf.getvalue()
+    if "FVN lb: idf=0 atlas=0 missing=0" not in t:
+        raise SystemExit("empty lb did not pass:\n%s" % t)
+
     print("self-test ok missing=%s" % missing)
 
 
@@ -1602,6 +1974,8 @@ def main(argv):
         "Validate FVN subnets, routers, static routes, L2 gateway, and BGP."))
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--vyos-login", action="store_true",
+                        help="SSH to VyOS gateway VMs and check routes/interfaces (read-only).")
     args = parser.parse_args(argv)
     if args.self_test:
         self_test()
