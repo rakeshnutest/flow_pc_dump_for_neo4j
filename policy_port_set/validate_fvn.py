@@ -789,17 +789,13 @@ def _is_local_router(uid, owners, vpc_names):
     return False
 
 
-def _own_az(route, owners, vpc_names, this_zone):
+def _own_az(route, owners, vpc_names, this_zone, local_router_uuids=None):
     """True when the IC route belongs to this availability zone."""
     lr_id = (route.get("lr_id") or "").lower()
     zone = (route.get("zone") or "").strip()
-    # Zone comparison is the reliable indicator (lr-id is an OVN router uuid,
-    # not an IDF router/vpc uuid, so the owner/vpc maps never match it).
+    if lr_id and local_router_uuids and lr_id in local_router_uuids:
+        return True
     if zone and this_zone and zone == this_zone:
-        return True
-    if lr_id and lr_id in (owners or {}):
-        return True
-    if lr_id and lr_id in (vpc_names or {}):
         return True
     return False
 
@@ -925,7 +921,7 @@ def write_cfg_table(rows, chassis, handle):
     return len(misses)
 
 
-def write_learned_tables(learned, ic_prefixes, ic_rows, owners, vpc_names, handle, ic_error="", this_zone=""):
+def write_learned_tables(learned, ic_prefixes, ic_rows, owners, vpc_names, handle, ic_error="", this_zone="", local_router_uuids=None):
     """Print every installed learned route, then IC routes no router learned.
 
     An IC fetch failure is one miss. It does not mark every installed
@@ -976,7 +972,8 @@ def write_learned_tables(learned, ic_prefixes, ic_rows, owners, vpc_names, handl
         lr_id = (row.get("lr_id") or "").lower()
         zone = (row.get("zone") or "").strip()
         route = {"lr_id": lr_id, "zone": zone}
-        own_zone = _own_az(route, owners, vpc_names, this_zone)
+        own_zone = _own_az(route, owners, vpc_names, this_zone,
+                           local_router_uuids=local_router_uuids)
         if own_zone:
             continue
         foreign_extra.append(row)
@@ -1276,6 +1273,9 @@ def collect(timeout):
     router_text = grab(
         "nb_router",
         lambda: ovn_csv("nb", "name,static_routes", "Logical_Router", timeout), "")
+    router_uuid_text = grab(
+        "nb_router_uuid",
+        lambda: ovn_csv("nb", "_uuid,name", "Logical_Router", timeout), "")
     scaleout = _scaleout_ports(grab(
         "nb_router_ports",
         lambda: ovn_csv("nb", "name,ports", "Logical_Router", timeout), ""))
@@ -1384,6 +1384,9 @@ def collect(timeout):
         "ic_prefixes": ic_prefixes,
         "ic_rows": ic_rows,
         "route_owners": route_owners,
+        "router_uuids": set(__import__("re").findall(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            router_uuid_text or "")),
         "vpc_names": _vpc_names(routers),
         "tap_hosts": tap_hosts,
         "taps": taps,
@@ -1531,7 +1534,7 @@ def write_pbr_table(policies, atlas, nb_text, router_map, router_policy_text, po
         if not vpc:
             vpc = rname.lower()
         for (prio, action, nexthop) in infos:
-            ovn_keys.add((vpc, action))
+            ovn_keys.add((vpc, str(prio), action))
     if not policies:
         handle.write("FVN pbr: idf=0 atlas=0 missing=0\n")
         handle.write("pbr note: no routing policies on this PC.\n")
@@ -1578,20 +1581,20 @@ def write_pbr_table(policies, atlas, nb_text, router_map, router_policy_text, po
                     separators=(",", ":"), sort_keys=True) + "\n")
                 continue
         # OVN Logical_Router_Policy match
-        ovn_match = (vpc, action) in ovn_keys
+        ovn_match = (vpc, str(priority), action) in ovn_keys
         if not ovn_match and ovn_keys:
             # also try matching by any router name containing vpc
             found = False
-            for (ov, oa) in ovn_keys:
-                if vpc and vpc in ov and oa == action:
+            for (ov, op, oa) in ovn_keys:
+                if vpc and vpc in ov and op == str(priority) and oa == action:
                     found = True
                     break
             if not found:
                 misses += 1
                 handle.write(json.dumps(_miss(
                     "pbr", uid, vpc, "nb", "Logical_Router_Policy",
-                    "no OVN policy matches vpc=%s action=%s" % (
-                        vpc, action)),
+                    "no OVN policy matches vpc=%s priority=%s action=%s" % (
+                        vpc, priority, action)),
                     separators=(",", ":"), sort_keys=True) + "\n")
                 continue
         if action == "reroute" and not nexthop:
@@ -1634,30 +1637,41 @@ def write_bgp_table(sessions, atlas, router_map, ic_rows, handle):
             continue
         attrs = _attrs(entity)
         vpc = str(attrs.get("virtual_network_uuid") or "").strip().lower()
-        # received prefixes: IDF column is received_route_list with
-        # network_address and prefix_length per entry.
+        # received prefixes: IDF column is received_route_list, which may be
+        # a list of dicts (network_address, prefix_length) or two parallel
+        # lists (received_route_list.network_address, .prefix_length).
         received = []
         rrl = attrs.get("received_route_list")
-        if rrl is None:
-            rrl = attrs.get("received_route_list.network_address")
-        if isinstance(rrl, list):
+        na_list = None
+        pl_list = None
+        if isinstance(rrl, dict):
+            na_list = rrl.get("network_address")
+            pl_list = rrl.get("prefix_length")
+        if na_list is None:
+            na_list = attrs.get("received_route_list.network_address")
+        if pl_list is None:
+            pl_list = attrs.get("received_route_list.prefix_length")
+        if isinstance(rrl, list) and rrl and isinstance(rrl[0], dict):
             for item in rrl:
-                if isinstance(item, dict):
-                    na = str(item.get("network_address") or item.get("network") or "").strip()
-                    pl = str(item.get("prefix_length") or item.get("prefix") or "").strip()
-                    if na and pl:
-                        received.append("%s/%s" % (na, pl))
-                    elif na:
-                        received.append(na)
-                else:
-                    received.append(str(item).strip())
-        elif isinstance(rrl, dict):
-            na = str(rrl.get("network_address") or "").strip()
-            pl = str(rrl.get("prefix_length") or "").strip()
-            if na and pl:
-                received.append("%s/%s" % (na, pl))
-            elif na:
-                received.append(na)
+                na = str(item.get("network_address") or item.get("network") or "").strip()
+                pl = str(item.get("prefix_length") or item.get("prefix") or "").strip()
+                if na and pl:
+                    received.append("%s/%s" % (na, pl))
+                elif na:
+                    received.append(na)
+        elif na_list is not None:
+            na_list = _as_list(na_list)
+            pl_list = _as_list(pl_list) if pl_list is not None else []
+            for i, na in enumerate(na_list):
+                na = str(na).strip()
+                pl = str(pl_list[i]).strip() if i < len(pl_list) else ""
+                if na and pl:
+                    received.append("%s/%s" % (na, pl))
+                elif na:
+                    received.append(na)
+        if not received and isinstance(rrl, list):
+            for item in rrl:
+                received.append(str(item).strip())
         if not received:
             # fallback: try flat attribute names
             for key in ("received_prefix_list", "received_prefixes", "received"):
@@ -1820,24 +1834,23 @@ def run_checks(data, handle):
             handle.write("FVN learned: installed=0 ic=0 not_installed=0 missing=1\n")
             handle.write("FVN learned fetch: error=%s\n" % errors["nb_learned"])
             return 1
+        local_uuids = data.get("router_uuids") or set()
         this_zone = ""
-        # Determine this zone: prefer the zone that has connected-origin routes
-        # (connected routes are only advertised by the local zone's routers).
         for row in (data.get("ic_rows") or []):
-            if (row.get("origin") or "").lower() == "connected":
+            lr_id = (row.get("lr_id") or "").lower()
+            if lr_id and lr_id in local_uuids:
                 this_zone = (row.get("zone") or "").strip()
                 break
         if not this_zone:
-            # fallback: zone with the fewest routes (own zone advertises fewer
-            # than the foreign zone learns)
-            from collections import Counter
-            c = Counter((r.get("zone") or "").strip() for r in (data.get("ic_rows") or []))
-            if c:
-                this_zone = min(c, key=lambda z: c[z])
+            for row in (data.get("ic_rows") or []):
+                if (row.get("origin") or "").lower() == "connected":
+                    this_zone = (row.get("zone") or "").strip()
+                    break
         return write_learned_tables(
             data["learned"], data["ic_prefixes"], data.get("ic_rows") or [],
             data.get("route_owners") or {}, data.get("vpc_names") or {}, handle,
-            ic_error=errors.get("ic") or "", this_zone=this_zone)
+            ic_error=errors.get("ic") or "", this_zone=this_zone,
+            local_router_uuids=data.get("router_uuids") or set())
 
     def tap():
         return write_tap_table(
