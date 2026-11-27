@@ -862,14 +862,44 @@ def _count(rows):
     return len([entity for entity in rows if _entity_id(entity)])
 
 
+def _cell(value):
+    return str("" if value is None else value).replace("\t", " ").replace("\n", " ")
+
+
+def _table(handle, headers, rows):
+    """Aligned columns with a header rule. Empty input prints the header only."""
+    body = [[_cell(row.get(key, "")) for key in headers] for row in rows or []]
+    widths = [len(header) for header in headers]
+    for line in body:
+        for index, cell in enumerate(line):
+            if len(cell) > widths[index]:
+                widths[index] = len(cell)
+
+    def emit(cells):
+        handle.write("  ".join(
+            cells[index].ljust(widths[index]) for index in range(len(headers))
+        ).rstrip() + "\n")
+
+    emit(list(headers))
+    handle.write("  ".join("-" * width for width in widths).rstrip() + "\n")
+    for line in body:
+        emit(line)
+
+
 def _tsv(handle, headers, rows):
-    handle.write("\t".join(headers) + "\n")
-    for row in rows:
-        handle.write("\t".join(str(row.get(key, "")) for key in headers) + "\n")
+    _table(handle, headers, rows)
 
 
-def write_cfg_table(rows, chassis, handle):
-    """Print NB_Global and every chassis. missing is rows that disagree."""
+_MISS_COLUMNS = ["kind", "uuid", "name", "where", "expected", "detail"]
+
+
+def _write_misses(handle, rows):
+    if rows:
+        _table(handle, _MISS_COLUMNS, rows)
+
+
+def write_cfg_table(rows, chassis, handle, failed=None):
+    """Print cfg rows that disagree. missing is that count."""
     misses = check_cfg(rows, chassis)
     expected = rows[0]["nb_cfg"] if rows else ""
     handle.write(
@@ -883,8 +913,8 @@ def write_cfg_table(rows, chassis, handle):
     table = []
     for row in rows:
         same = row["nb_cfg"] == row["sb_cfg"] == row["hv_cfg"] == expected
-        detail = "" if same else "nb_cfg=%s sb_cfg=%s hv_cfg=%s" % (
-            row["nb_cfg"], row["sb_cfg"], row["hv_cfg"])
+        if same:
+            continue
         table.append({
             "table": "NB_Global",
             "uuid": row["uuid"],
@@ -893,11 +923,13 @@ def write_cfg_table(rows, chassis, handle):
             "sb_cfg": row["sb_cfg"],
             "hv_cfg": row["hv_cfg"],
             "expected": expected,
-            "match": "yes" if same else "no",
-            "detail": detail,
+            "match": "no",
+            "detail": "nb_cfg=%s sb_cfg=%s hv_cfg=%s" % (
+                row["nb_cfg"], row["sb_cfg"], row["hv_cfg"]),
         })
     for row in chassis:
-        same = bool(rows) and row["nb_cfg"] == expected
+        if bool(rows) and row["nb_cfg"] == expected:
+            continue
         table.append({
             "table": "Chassis_Private",
             "uuid": row["uuid"],
@@ -906,17 +938,19 @@ def write_cfg_table(rows, chassis, handle):
             "sb_cfg": "",
             "hv_cfg": "",
             "expected": expected,
-            "match": "yes" if same else "no",
-            "detail": "" if same else "nb_cfg=%s expected=%s" % (
-                row["nb_cfg"], expected),
+            "match": "no",
+            "detail": "nb_cfg=%s expected=%s" % (row["nb_cfg"], expected),
         })
-    _tsv(handle, [
-        "table", "uuid", "name", "nb_cfg", "sb_cfg", "hv_cfg",
-        "expected", "match", "detail"], table)
+    if table:
+        _table(handle, [
+            "table", "uuid", "name", "nb_cfg", "sb_cfg", "hv_cfg",
+            "expected", "match", "detail"], table)
+    if failed is not None:
+        failed.extend(misses)
     return len(misses)
 
 
-def write_learned_tables(learned, ic_prefixes, ic_rows, owners, vpc_names, handle, ic_error="", this_zone="", local_router_uuids=None):
+def write_learned_tables(learned, ic_prefixes, ic_rows, owners, vpc_names, handle, ic_error="", this_zone="", local_router_uuids=None, failed=None):
     """Print every installed learned route, then IC routes no router learned.
 
     An IC fetch failure is one miss. It does not mark every installed
@@ -944,9 +978,12 @@ def write_learned_tables(learned, ic_prefixes, ic_rows, owners, vpc_names, handl
                 "match": "not_checked",
                 "detail": ic_error,
             })
-        _tsv(handle, [
+        _table(handle, [
             "router", "vpc", "vpc_name", "prefix", "nexthop", "origin",
             "route_uuid", "ic_route", "ic_prefix", "match", "detail"], skipped)
+        if failed is not None:
+            failed.append(_miss(
+                "learned", "", "", "ic", "", ic_error))
         return 1
     records, mismatches = learned_records(
         learned, ic_prefixes, ic_rows, owners, vpc_names, this_zone=this_zone)
@@ -978,21 +1015,34 @@ def write_learned_tables(learned, ic_prefixes, ic_rows, owners, vpc_names, handl
         "zone is this zone, is this zone's own advertisement and is not a miss. "
         "missing is not_installed plus any installed route whose IC prefix "
         "does not match.\n")
-    _tsv(handle, [
+    bad = [row for row in records if row.get("match") != "yes"]
+    _table(handle, [
         "router", "vpc", "vpc_name", "prefix", "nexthop", "origin",
         "route_uuid", "ic_route", "ic_prefix", "match", "detail"], records)
     if extra:
         handle.write("FVN learned_not_installed: count=%s\n" % len(extra))
-        _tsv(handle, ["ic_route", "prefix", "nexthop", "origin"], extra)
+        _table(handle, ["ic_route", "prefix", "nexthop", "origin"], extra)
+    if failed is not None:
+        for row in bad:
+            failed.append(_miss(
+                "learned", row.get("route_uuid") or "", row.get("router") or "",
+                "nb", row.get("prefix") or "", row.get("detail") or row.get("match") or ""))
+        for row in extra:
+            failed.append(_miss(
+                "learned", row.get("ic_route") or "", "", "ic",
+                row.get("prefix") or "",
+                "not installed origin=%s nexthop=%s" % (
+                    row.get("origin") or "", row.get("nexthop") or "")))
     return misses
 
 
-def write_report(label, idf_count, atlas_count, misses, handle):
+def write_report(label, idf_count, atlas_count, misses, handle, failed=None):
     handle.write(
         "FVN %s: idf=%s atlas=%s missing=%s\n" % (
             label, idf_count, atlas_count, len(misses)))
-    for rec in misses:
-        handle.write(json.dumps(rec, separators=(",", ":"), sort_keys=True) + "\n")
+    _write_misses(handle, misses)
+    if failed is not None:
+        failed.extend(misses)
     return len(misses)
 
 
@@ -1176,17 +1226,24 @@ def scan_taps(timeout):
     return hosts, rows, ""
 
 
-def write_tap_table(hosts, rows, handle, error=""):
+def write_tap_table(hosts, rows, handle, error="", failed=None):
     if error:
         handle.write("FVN tap: hosts=%s missing=1\n" % len(hosts))
         handle.write("tap note: %s\n" % error)
+        if failed is not None:
+            failed.append(_miss("tap", "", "", "host", "", error))
         return 1
     handle.write(
         "FVN tap: hosts=%s missing=%s\n" % (len(hosts), len(rows)))
     handle.write(
         "tap note: a row is a tap<N> device on the hypervisor that no VM "
         "NIC on that host names. CVM vnet devices are not taps.\n")
-    _tsv(handle, ["host", "ip", "tap", "bridge", "state", "mac", "detail"], rows)
+    _table(handle, ["host", "ip", "tap", "bridge", "state", "mac", "detail"], rows)
+    if failed is not None:
+        for row in rows or []:
+            failed.append(_miss(
+                "tap", "", row.get("host") or "", "host", row.get("tap") or "",
+                row.get("detail") or ""))
     return len(rows)
 
 
@@ -1410,13 +1467,15 @@ def _limit(misses, kind, errors, mapping):
     return out
 
 
-def _safe(handle, label, fn):
+def _safe(handle, label, fn, failed=None):
     try:
         return fn()
     except (Exception, SystemExit) as err:
+        detail = str(err).split("\n", 1)[0][:240]
         handle.write(
-            "FVN %s: missing=1 error=%s\n" % (
-                label, str(err).split("\n", 1)[0][:240]))
+            "FVN %s: missing=1 error=%s\n" % (label, detail))
+        if failed is not None:
+            failed.append(_miss(label, "", "", "error", "", detail))
         return 1
 
 
@@ -1462,14 +1521,14 @@ def _scaled_priority(priority):
         return str(priority).strip()
 
 
-def write_lb_table(sessions, atlas, nb_text, lb_text, router_lb_text, handle):
+def write_lb_table(sessions, atlas, nb_text, lb_text, router_lb_text, handle, failed=None):
     """Load balancer. Zero sessions is a pass.
 
     A session matches a Load_Balancer that is attached to its VPC router
     and whose vips map has a key for the listener VIP. The session uuid is
     not the Load_Balancer uuid.
     """
-    misses = 0
+    miss_rows = []
     if not sessions:
         handle.write("FVN lb: idf=0 atlas=0 missing=0\n")
         handle.write("lb note: no load balancer sessions on this PC.\n")
@@ -1496,11 +1555,9 @@ def write_lb_table(sessions, atlas, nb_text, lb_text, router_lb_text, handle):
         if not uid:
             continue
         if uid not in (atlas or set()):
-            misses += 1
-            handle.write(json.dumps(_miss(
+            miss_rows.append(_miss(
                 "lb", uid, "", "atlas", uid,
-                "atlas load_balancer_session.list has no %s" % uid),
-                separators=(",", ":"), sort_keys=True) + "\n")
+                "atlas load_balancer_session.list has no %s" % uid))
             continue
         attrs = _attrs(entity)
         vip = ""
@@ -1515,11 +1572,9 @@ def write_lb_table(sessions, atlas, nb_text, lb_text, router_lb_text, handle):
                       attrs.get("virtual_ip_address") or "").strip()
         vpc = str(attrs.get("virtual_network_uuid") or "").strip().lower()
         if not vip:
-            misses += 1
-            handle.write(json.dumps(_miss(
+            miss_rows.append(_miss(
                 "lb", uid, vpc, "idf", "listener.virtual_ip_address",
-                "load balancer session %s has no VIP" % uid),
-                separators=(",", ":"), sort_keys=True) + "\n")
+                "load balancer session %s has no VIP" % uid))
             continue
         attached = set()
         for name, lbs in router_lbs.items():
@@ -1527,24 +1582,25 @@ def write_lb_table(sessions, atlas, nb_text, lb_text, router_lb_text, handle):
                 attached.update(lbs)
         if any(vip.lower() in lb_vips.get(lb, ()) for lb in attached):
             continue
-        misses += 1
-        handle.write(json.dumps(_miss(
+        miss_rows.append(_miss(
             "lb", uid, vpc, "nb", vip,
-            "no Load_Balancer on the VPC router has vips key %s" % vip),
-            separators=(",", ":"), sort_keys=True) + "\n")
+            "no Load_Balancer on the VPC router has vips key %s" % vip))
     handle.write("FVN lb: idf=%s atlas=%s missing=%s\n" % (
-        count, atlas_count, misses))
-    return misses
+        count, atlas_count, len(miss_rows)))
+    _write_misses(handle, miss_rows)
+    if failed is not None:
+        failed.extend(miss_rows)
+    return len(miss_rows)
 
 
-def write_pbr_table(policies, atlas, nb_text, router_map, router_policy_text, policy_detail_text, handle):
+def write_pbr_table(policies, atlas, nb_text, router_map, router_policy_text, policy_detail_text, handle, failed=None):
     """Policy routing. Each IDF policy must match a Logical_Router_Policy.
 
     Hermes installs the user priority as OVN priority times 10. A default
     drop at OVN priority 1 and gateway reroutes at priority 1000 are not
     IDF policies.
     """
-    misses = 0
+    miss_rows = []
     # uuid,priority,action,nexthop,match. Match is last and may contain commas.
     ovn_policy = {}
     for line in (policy_detail_text or "").splitlines():
@@ -1605,11 +1661,9 @@ def write_pbr_table(policies, atlas, nb_text, router_map, router_policy_text, po
         else:
             nexthop = str(raw_nh).strip()
         if uid not in (atlas or set()):
-            misses += 1
-            handle.write(json.dumps(_miss(
+            miss_rows.append(_miss(
                 "pbr", uid, vpc, "atlas", uid,
-                "atlas routing_policy.list has no %s" % uid),
-                separators=(",", ":"), sort_keys=True) + "\n")
+                "atlas routing_policy.list has no %s" % uid))
             continue
         known_vpc = any(vpc and vpc in name.lower() for name in (router_map or {}))
         # also accept vpc present in vpc_names if passed; router_map keys are router names
@@ -1621,11 +1675,9 @@ def write_pbr_table(policies, atlas, nb_text, router_map, router_policy_text, po
         if vpc and not any(vpc in str(name).lower() for name in (router_map or {})):
             # only flag drop action as wrong-VPC miss per spec
             if action == "drop":
-                misses += 1
-                handle.write(json.dumps(_miss(
+                miss_rows.append(_miss(
                     "pbr", uid, vpc, "nb", "router",
-                    "drop policy %s is on wrong VPC %s" % (uid, vpc)),
-                    separators=(",", ":"), sort_keys=True) + "\n")
+                    "drop policy %s is on wrong VPC %s" % (uid, vpc)))
                 continue
         # OVN priority is the IDF priority times 10.
         ovn_key = (vpc, scaled, action)
@@ -1638,25 +1690,24 @@ def write_pbr_table(policies, atlas, nb_text, router_map, router_policy_text, po
                     ovn_key = (ov, op, oa)
                     break
             if not found:
-                misses += 1
-                handle.write(json.dumps(_miss(
+                miss_rows.append(_miss(
                     "pbr", uid, vpc, "nb", "Logical_Router_Policy",
                     "no OVN policy matches vpc=%s priority=%s action=%s" % (
-                        vpc, scaled, action)),
-                    separators=(",", ":"), sort_keys=True) + "\n")
+                        vpc, scaled, action)))
                 continue
         if action == "reroute" and not nexthop and not ovn_nexthop.get(ovn_key):
-            misses += 1
-            handle.write(json.dumps(_miss(
+            miss_rows.append(_miss(
                 "pbr", uid, vpc, "nb", "nexthop",
-                "reroute policy %s has no nexthop" % uid),
-                separators=(",", ":"), sort_keys=True) + "\n")
+                "reroute policy %s has no nexthop" % uid))
     handle.write("FVN pbr: idf=%s atlas=%s missing=%s\n" % (
-        count, atlas_count, misses))
-    return misses
+        count, atlas_count, len(miss_rows)))
+    _write_misses(handle, miss_rows)
+    if failed is not None:
+        failed.extend(miss_rows)
+    return len(miss_rows)
 
 
-def write_bgp_table(sessions, atlas, router_map, learned_prefixes, handle):
+def write_bgp_table(sessions, atlas, router_map, learned_prefixes, handle, failed=None):
     """BGP. Each received prefix must be a static route or a Southbound Learned_Route.
 
     IC routes and Northbound ic-learned routes are not Learned_Route rows.
@@ -1665,7 +1716,7 @@ def write_bgp_table(sessions, atlas, router_map, learned_prefixes, handle):
         handle.write("FVN bgp: idf=0 atlas=0 missing=0\n")
         handle.write("bgp note: no BGP sessions on this PC.\n")
         return 0
-    misses = 0
+    miss_rows = []
     count = len([e for e in sessions if _entity_id(e)])
     atlas_count = len(atlas or set())
     sb_learned = set()
@@ -1681,13 +1732,11 @@ def write_bgp_table(sessions, atlas, router_map, learned_prefixes, handle):
         if not uid:
             continue
         if uid not in (atlas or set()):
-            misses += 1
             attrs = _attrs(entity)
             vpc = str(attrs.get("virtual_network_uuid") or "").strip().lower()
-            handle.write(json.dumps(_miss(
+            miss_rows.append(_miss(
                 "bgp", uid, vpc, "atlas", uid,
-                "atlas bgp_session.list has no %s" % uid),
-                separators=(",", ":"), sort_keys=True) + "\n")
+                "atlas bgp_session.list has no %s" % uid))
             continue
         attrs = _attrs(entity)
         vpc = str(attrs.get("virtual_network_uuid") or "").strip().lower()
@@ -1744,23 +1793,24 @@ def write_bgp_table(sessions, atlas, router_map, learned_prefixes, handle):
                 continue
             if prefix in static or prefix in sb_learned:
                 continue
-            misses += 1
-            handle.write(json.dumps(_miss(
+            miss_rows.append(_miss(
                 "bgp", uid, vpc, "nb", prefix,
-                "received prefix %s is not a static route or learned route" % prefix),
-                separators=(",", ":"), sort_keys=True) + "\n")
+                "received prefix %s is not a static route or learned route" % prefix))
     handle.write("FVN bgp: idf=%s atlas=%s missing=%s\n" % (
-        count, atlas_count, misses))
-    return misses
+        count, atlas_count, len(miss_rows)))
+    _write_misses(handle, miss_rows)
+    if failed is not None:
+        failed.extend(miss_rows)
+    return len(miss_rows)
 
 
-def write_l2gw_table(stretches, atlas, nb_text, sb_text, handle):
+def write_l2gw_table(stretches, atlas, nb_text, sb_text, handle, failed=None):
     """L2 gateway. Empty stretch is a pass."""
     if not stretches:
         handle.write("FVN l2gw: idf=0 atlas=0 missing=0\n")
         handle.write("l2gw note: no layer2 stretches on this PC.\n")
         return 0
-    misses = 0
+    miss_rows = []
     count = len([e for e in stretches if _entity_id(e)])
     atlas_count = len(atlas or set())
     nb_lower = (nb_text or "").lower()
@@ -1772,39 +1822,41 @@ def write_l2gw_table(stretches, atlas, nb_text, sb_text, handle):
         attrs = _attrs(entity)
         name = str(attrs.get("name") or "")
         if uid not in (atlas or set()):
-            misses += 1
-            handle.write(json.dumps(_miss(
+            miss_rows.append(_miss(
                 "l2gw", uid, name, "atlas", uid,
-                "atlas layer2_stretch.list has no %s" % uid),
-                separators=(",", ":"), sort_keys=True) + "\n")
+                "atlas layer2_stretch.list has no %s" % uid))
             continue
         if uid not in nb_lower:
-            misses += 1
-            handle.write(json.dumps(_miss(
+            miss_rows.append(_miss(
                 "l2gw", uid, name, "nb", "localnet/l2gateway/geneve port",
-                "OVN-NB has no port referencing stretch %s" % uid),
-                separators=(",", ":"), sort_keys=True) + "\n")
+                "OVN-NB has no port referencing stretch %s" % uid))
             continue
         if uid not in sb_lower:
-            misses += 1
-            handle.write(json.dumps(_miss(
+            miss_rows.append(_miss(
                 "l2gw", uid, name, "sb", "Port_Binding",
-                "OVN-SB has no binding for stretch %s" % uid),
-                separators=(",", ":"), sort_keys=True) + "\n")
+                "OVN-SB has no binding for stretch %s" % uid))
     handle.write("FVN l2gw: idf=%s atlas=%s missing=%s\n" % (
-        count, atlas_count, misses))
-    return misses
+        count, atlas_count, len(miss_rows)))
+    _write_misses(handle, miss_rows)
+    if failed is not None:
+        failed.extend(miss_rows)
+    return len(miss_rows)
 
 
 def run_checks(data, handle):
     atlas = data["atlas"]
     errors = data.get("errors") or {}
+    failed = []
     total = 0
+
+    def fetch_miss(kind, detail):
+        failed.append(_miss(kind, "", "", "fetch", "", detail))
 
     def subnet():
         if errors.get("idf_subnet"):
             handle.write("FVN subnet: idf=0 atlas=0 missing=1\n")
             handle.write("FVN subnet fetch: error=%s\n" % errors["idf_subnet"])
+            fetch_miss("subnet", errors["idf_subnet"])
             return 1
         misses = _limit(
             check_subnets(
@@ -1812,12 +1864,13 @@ def run_checks(data, handle):
             "subnet", errors,
             {"atlas": "atlas_subnet", "nb": "nb_switch", "sb": "sb_dp"})
         return write_report(
-            "subnet", _count(data["subnets"]), len(atlas["subnet"]), misses, handle)
+            "subnet", _count(data["subnets"]), len(atlas["subnet"]), misses, handle, failed)
 
     def router():
         if errors.get("idf_router"):
             handle.write("FVN router: idf=0 atlas=0 missing=1\n")
             handle.write("FVN router fetch: error=%s\n" % errors["idf_router"])
+            fetch_miss("router", errors["idf_router"])
             return 1
         misses = _limit(
             check_routers(
@@ -1825,12 +1878,13 @@ def run_checks(data, handle):
             "router", errors,
             {"atlas": "atlas_router", "nb": "nb_router", "sb": "sb_dp"})
         return write_report(
-            "router", _count(data["routers"]), len(atlas["router"]), misses, handle)
+            "router", _count(data["routers"]), len(atlas["router"]), misses, handle, failed)
 
     def route():
         if errors.get("idf_route"):
             handle.write("FVN route: idf=0 atlas=0 missing=1\n")
             handle.write("FVN route fetch: error=%s\n" % errors["idf_route"])
+            fetch_miss("route", errors["idf_route"])
             return 1
         nb_key = "nb_route_id" if errors.get("nb_route_id") else "nb_router"
         misses = _limit(
@@ -1839,19 +1893,21 @@ def run_checks(data, handle):
             "route", errors,
             {"atlas": "atlas_route", "nb": nb_key, "sb": "sb_dp"})
         return write_report(
-            "route", _count(data["routes"]), len(atlas["route"]), misses, handle)
+            "route", _count(data["routes"]), len(atlas["route"]), misses, handle, failed)
 
     def named(label, rows, atlas_key, idf_key, atlas_err, nb_expect, sb_expect, nb_key, sb_key):
         if errors.get(idf_key):
             handle.write("FVN %s: idf=0 atlas=0 missing=1\n" % label)
             handle.write("FVN %s fetch: error=%s\n" % (label, errors[idf_key]))
+            fetch_miss(label, errors[idf_key])
             return 1
         misses = _limit(
             check_named(
                 label, rows, atlas[atlas_key], data["nb_extra"], data["sb_extra"],
                 nb_expect, sb_expect),
             label, errors, {"atlas": atlas_err, "nb": nb_key, "sb": sb_key})
-        return write_report(label, _count(rows), len(atlas[atlas_key]), misses, handle)
+        return write_report(
+            label, _count(rows), len(atlas[atlas_key]), misses, handle, failed)
 
     def rc():
         blocked = [errors[key] for key in (
@@ -1860,6 +1916,7 @@ def run_checks(data, handle):
         if blocked:
             handle.write("FVN rc: idf=0 atlas=0 missing=1\n")
             handle.write("FVN rc fetch: error=%s\n" % blocked[0])
+            fetch_miss("rc", blocked[0])
             return 1
         misses, checked = check_rc(
             data["routers"], data["lrp_names"], data["rc_by_name"],
@@ -1873,20 +1930,23 @@ def run_checks(data, handle):
         if errors.get("sb_chassis"):
             misses = [m for m in misses if "cr-lrp chassis" not in m.get("detail", "")]
             misses.append(_miss("rc", "", "", "sb", "", errors["sb_chassis"]))
-        return write_report("rc", checked + transit_checked, checked + transit_checked, misses, handle)
+        return write_report(
+            "rc", checked + transit_checked, checked + transit_checked, misses, handle, failed)
 
     def cfg():
         blocked = [errors[key] for key in ("nb_global", "sb_private") if errors.get(key)]
         if blocked:
             handle.write("FVN cfg: nb_global=0 chassis=0 missing=1\n")
             handle.write("FVN cfg fetch: error=%s\n" % blocked[0])
+            fetch_miss("cfg", blocked[0])
             return 1
-        return write_cfg_table(data["cfg_rows"], data["chassis_rows"], handle)
+        return write_cfg_table(data["cfg_rows"], data["chassis_rows"], handle, failed)
 
     def learned():
         if errors.get("nb_learned"):
             handle.write("FVN learned: installed=0 ic=0 not_installed=0 missing=1\n")
             handle.write("FVN learned fetch: error=%s\n" % errors["nb_learned"])
+            fetch_miss("learned", errors["nb_learned"])
             return 1
         local_uuids = data.get("router_uuids") or set()
         this_zone = ""
@@ -1895,46 +1955,43 @@ def run_checks(data, handle):
             if lr_id and lr_id in local_uuids:
                 this_zone = (row.get("zone") or "").strip()
                 break
-        if not this_zone:
-            # Do not fall back to the first connected route's zone: both zones
-            # advertise connected routes, so that can mark the remote zone as
-            # local. Leave this_zone empty instead.
-            pass
         return write_learned_tables(
             data["learned"], data["ic_prefixes"], data.get("ic_rows") or [],
             data.get("route_owners") or {}, data.get("vpc_names") or {}, handle,
             ic_error=errors.get("ic") or "", this_zone=this_zone,
-            local_router_uuids=data.get("router_uuids") or set())
+            local_router_uuids=data.get("router_uuids") or set(), failed=failed)
 
     def tap():
         return write_tap_table(
             data.get("tap_hosts") or [], data.get("taps") or [], handle,
-            error=errors.get("tap") or "")
+            error=errors.get("tap") or "", failed=failed)
 
-    total += _safe(handle, "subnet", subnet)
-    total += _safe(handle, "router", router)
-    total += _safe(handle, "route", route)
+    total += _safe(handle, "subnet", subnet, failed)
+    total += _safe(handle, "router", router, failed)
+    total += _safe(handle, "route", route, failed)
     total += _safe(handle, "l2gw", lambda: write_l2gw_table(
         data.get("stretches") or [], atlas.get("l2gw") or set(),
-        data.get("nb_extra") or "", data.get("sb_extra") or "", handle))
+        data.get("nb_extra") or "", data.get("sb_extra") or "", handle, failed), failed)
     total += _safe(handle, "bgp", lambda: write_bgp_table(
         data.get("sessions") or [], atlas.get("bgp") or set(),
         data.get("router_map") or {},
         data.get("sb_learned_prefixes") or [],
-        handle))
+        handle, failed), failed)
     total += _safe(handle, "lb", lambda: write_lb_table(
         data.get("lb_sessions") or [], atlas.get("lb") or set(),
         data.get("nb_extra") or "", data.get("lb_text") or "",
-        data.get("router_lb_text") or "", handle))
+        data.get("router_lb_text") or "", handle, failed), failed)
     total += _safe(handle, "pbr", lambda: write_pbr_table(
         data.get("pbr_policies") or [], atlas.get("pbr") or set(),
         data.get("nb_extra") or "", data.get("router_map") or {},
         data.get("router_policy_text") or "", data.get("policy_detail_text") or "",
-        handle))
-    total += _safe(handle, "rc", rc)
-    total += _safe(handle, "cfg", cfg)
-    total += _safe(handle, "learned", learned)
-    total += _safe(handle, "tap", tap)
+        handle, failed), failed)
+    total += _safe(handle, "rc", rc, failed)
+    total += _safe(handle, "cfg", cfg, failed)
+    total += _safe(handle, "learned", learned, failed)
+    total += _safe(handle, "tap", tap, failed)
+    handle.write("FVN failed: count=%s\n" % len(failed))
+    _write_misses(handle, failed)
     return total
 
 
